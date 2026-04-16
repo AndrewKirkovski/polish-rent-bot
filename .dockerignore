@@ -1,0 +1,9 @@
+node_modules
+dist
+.local
+.env
+.git
+.github
+.claude
+deploy
+*.md

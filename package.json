@@ -10,14 +10,18 @@
     "test:login": "tsx src/experiments/test-login.ts"
   },
   "dependencies": {
+    "better-sqlite3": "^12.9.0",
     "crawlee": "^3.12.0",
+    "dotenv": "^16.4.0",
+    "node-telegram-bot-api": "^0.67.0",
     "playwright": "^1.50.0",
     "playwright-extra": "^4.3.0",
-    "puppeteer-extra-plugin-stealth": "^2.11.0",
-    "dotenv": "^16.4.0"
+    "puppeteer-extra-plugin-stealth": "^2.11.0"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^22.0.0",
+    "@types/node-telegram-bot-api": "^0.64.14",
     "tsx": "^4.7.0",
     "typescript": "^5.4.0"
   }
