@@ -89,7 +89,7 @@ export async function parseRentalListing(listing: Listing): Promise<ParsedRental
   // Check cache
   const cached = getParsedListing(listing.platform, listing.platformId);
   if (cached && cached.description_hash === descHash) {
-    return JSON.parse(cached.parsed_data);
+    try { return JSON.parse(cached.parsed_data); } catch { /* re-parse below */ }
   }
 
   const userMessage = `Title: ${listing.title}
@@ -122,13 +122,22 @@ ${listing.description || 'No description provided'}`;
     throw new Error('No text in Claude response');
   }
 
-  // Clean potential markdown fences
+  // Clean potential markdown fences and robustly extract JSON
   let jsonStr = textBlock.text.trim();
   if (jsonStr.startsWith('```')) {
     jsonStr = jsonStr.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '');
   }
+  // Robustly extract first JSON object if there's surrounding text
+  const jsonMatch = jsonStr.match(/\{[\s\S]*\}/);
+  if (jsonMatch) jsonStr = jsonMatch[0];
 
-  const parsed = JSON.parse(jsonStr) as ParsedRentalData;
+  let parsed: ParsedRentalData;
+  try {
+    parsed = JSON.parse(jsonStr);
+  } catch (parseErr) {
+    console.error('[parse-listing] Failed to parse AI JSON:', jsonStr.slice(0, 200));
+    throw new Error('AI returned invalid JSON');
+  }
 
   saveParsedListing(
     listing.platform,
@@ -173,7 +182,7 @@ export async function parseItemListing(item: ItemListing): Promise<ParsedItemDat
 
   const cached = getParsedListing(item.platform, item.platformId);
   if (cached && cached.description_hash === descHash) {
-    return JSON.parse(cached.parsed_data);
+    try { return JSON.parse(cached.parsed_data); } catch { /* re-parse below */ }
   }
 
   const userMessage = `Title: ${item.title}
@@ -203,8 +212,16 @@ ${item.description || 'No description provided'}`;
   if (jsonStr.startsWith('```')) {
     jsonStr = jsonStr.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '');
   }
+  const itemJsonMatch = jsonStr.match(/\{[\s\S]*\}/);
+  if (itemJsonMatch) jsonStr = itemJsonMatch[0];
 
-  const parsed = JSON.parse(jsonStr) as ParsedItemData;
+  let parsed: ParsedItemData;
+  try {
+    parsed = JSON.parse(jsonStr);
+  } catch (parseErr) {
+    console.error('[parse-listing] Failed to parse AI item JSON:', jsonStr.slice(0, 200));
+    throw new Error('AI returned invalid JSON');
+  }
 
   saveParsedListing(
     item.platform,

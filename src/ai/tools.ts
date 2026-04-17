@@ -2,7 +2,7 @@
 // Deep pipeline tools: find_rentals, find_items, create_monitor, update_monitor, delete_monitor, list_monitors
 import type { Tool } from '@anthropic-ai/sdk/resources/messages.js';
 
-import { searchOlx, fetchOlxPhone, OLX_CATEGORIES, OLX_CITIES } from '../crawlers/olx.js';
+import { searchOlx, fetchOlxPhone, OLX_CATEGORIES, OLX_CITIES, OLX_DISTRICTS } from '../crawlers/olx.js';
 import { searchItems, fetchItemPhone } from '../crawlers/olx-items.js';
 import type { ItemListing } from '../crawlers/olx-items.js';
 import { searchOtodom, fetchOtodomDetail } from '../crawlers/otodom.js';
@@ -77,7 +77,7 @@ function resolveCityId(name: string): number | undefined {
 // Send function types
 // ---------------------------------------------------------------------------
 
-type SendFn = (chatId: number, text: string) => Promise<void>;
+type SendFn = (chatId: number, text: string, opts?: Record<string, unknown>) => Promise<void>;
 type SendPhotosFn = (chatId: number, urls: string[]) => Promise<void>;
 
 // ---------------------------------------------------------------------------
@@ -312,16 +312,37 @@ async function execFindRentals(
 
   if (doOlx) {
     const cityId = resolveCityId(city);
+
+    // Resolve OLX district ID from first district name
+    let olxDistrictId: number | undefined;
+    if (districts.length > 0 && city) {
+      const cityDistricts = OLX_DISTRICTS[stripDiacritics(city)];
+      if (cityDistricts) olxDistrictId = cityDistricts[stripDiacritics(districts[0])];
+    }
+
     // Don't pass priceTo to OLX — user budget is TOTAL but API filters RENT only.
     // Don't pre-filter price at all — let AI parse determine total and filter after.
     // Fetch multiple pages to get enough results.
     searchPromises.push(
       (async () => {
-        const page1 = await searchOlx({ categoryId: OLX_CATEGORIES.MIESZKANIA_WYNAJEM, cityId, limit: 40 });
+        const page1 = await searchOlx({
+          categoryId: OLX_CATEGORIES.MIESZKANIA_WYNAJEM,
+          cityId,
+          rooms: roomsFrom,
+          districtId: olxDistrictId,
+          limit: 40,
+        });
         const results = [...page1.listings];
         // Fetch page 2 if available
         if (page1.hasNextPage) {
-          const page2 = await searchOlx({ categoryId: OLX_CATEGORIES.MIESZKANIA_WYNAJEM, cityId, limit: 40, offset: 40 });
+          const page2 = await searchOlx({
+            categoryId: OLX_CATEGORIES.MIESZKANIA_WYNAJEM,
+            cityId,
+            rooms: roomsFrom,
+            districtId: olxDistrictId,
+            limit: 40,
+            offset: 40,
+          });
           results.push(...page2.listings);
         }
         return results;
@@ -410,14 +431,16 @@ async function execFindRentals(
   }
 
   // ---- Step B: Send progress message ----
-  const candidateCount = Math.min(deduped.length, 25);
+  const debugLimit = process.env.DEBUG_LIMIT ? parseInt(process.env.DEBUG_LIMIT, 10) : 0;
+  const candidateCount = debugLimit > 0 ? Math.min(deduped.length, debugLimit) : Math.min(deduped.length, 25);
   await sendFn(
     ctx.chatId,
     `Found ${deduped.length} listings. Analyzing top ${candidateCount}...`,
+    { parse_mode: undefined },
   );
 
   // ---- Step C: Analyze top candidates ----
-  const candidates = deduped.slice(0, 25);
+  const candidates = deduped.slice(0, candidateCount);
   const accepted: Array<{
     listing: Listing;
     parsedData: ParsedRentalData | null;
@@ -428,14 +451,17 @@ async function execFindRentals(
   // Store all candidates in context for later reference
   ctx.lastSearchResults = candidates;
 
+  let actualAnalyzed = 0;
   for (let i = 0; i < candidates.length; i++) {
     const listing = candidates[i];
+    actualAnalyzed++;
 
     // Send progress update every 3-4 listings
     if (i > 0 && i % 3 === 0) {
       await sendFn(
         ctx.chatId,
         `Analyzing listing ${i + 1}/${candidateCount}...`,
+        { parse_mode: undefined },
       );
     }
 
@@ -564,7 +590,20 @@ async function execFindRentals(
   for (let i = 0; i < accepted.length; i++) {
     const { listing, parsedData, locationScore } = accepted[i];
 
-    // Send photos first (if available)
+    // Send card first
+    const card = formatRichRentalNotification(
+      listing,
+      parsedData ?? undefined,
+      locationScore ?? undefined,
+    );
+    try {
+      await sendFn(ctx.chatId, card);
+    } catch (cardErr) {
+      // fallback: send minimal plain text
+      try { await sendFn(ctx.chatId, `${listing.title}\n${listing.url}\nPrice: ${listing.price} PLN`, { parse_mode: undefined }); } catch {}
+    }
+
+    // Then photos
     if (listing.photos.length > 0) {
       try {
         await sendPhotosFn(ctx.chatId, listing.photos.slice(0, 10));
@@ -572,14 +611,6 @@ async function execFindRentals(
         console.error(`[find_rentals] Photo send error for ${listing.url}:`, photoErr);
       }
     }
-
-    // Send the rich card
-    const card = formatRichRentalNotification(
-      listing,
-      parsedData ?? undefined,
-      locationScore ?? undefined,
-    );
-    await sendFn(ctx.chatId, card);
   }
 
   // Update context with the accepted listings for later reference
@@ -593,7 +624,7 @@ async function execFindRentals(
     ? `\nRejected ${rejected.length}: ${rejected.map((r) => r.reason).join('; ')}`
     : '';
 
-  return `Showed ${accepted.length} listing(s) to the user with photos and rich cards. Analyzed ${candidateCount} candidates total.${rejectionBreakdown}`;
+  return `Showed ${accepted.length} listing(s) to the user with photos and detailed evaluation cards. Analyzed ${actualAnalyzed} of ${deduped.length} candidates. ${rejectionBreakdown}\n\nIMPORTANT: The user has ALREADY seen full details, photos, prices, and cards. Do NOT repeat listing details. Just offer next steps (monitor, adjust search, etc.).`;
 }
 
 // ---------------------------------------------------------------------------
@@ -625,10 +656,12 @@ async function execFindItems(
     return 'No items found matching your search. Try different keywords or remove the city filter.';
   }
 
-  const candidates = result.items.slice(0, maxResults * 2); // get extra for potential filtering
+  const debugLimit = process.env.DEBUG_LIMIT ? parseInt(process.env.DEBUG_LIMIT, 10) : 0;
+  const candidateLimit = debugLimit > 0 ? Math.min(result.items.length, debugLimit) : maxResults * 2;
+  const candidates = result.items.slice(0, candidateLimit); // get extra for potential filtering
   ctx.lastSearchResults = candidates;
 
-  await sendFn(ctx.chatId, `Found ${result.totalAvailable} items. Analyzing top ${Math.min(candidates.length, maxResults)}...`);
+  await sendFn(ctx.chatId, `Found ${result.totalAvailable} items. Analyzing top ${Math.min(candidates.length, maxResults)}...`, { parse_mode: undefined });
 
   const shown: ItemListing[] = [];
 
@@ -645,35 +678,41 @@ async function execFindItems(
       }
     }
 
-    // Fetch phone if not available
+    // Fetch phone if not available — don't mutate original item
+    let enrichedItem = item;
     if (!item.phone) {
       try {
         const phone = await fetchItemPhone(item.platformId);
-        if (phone) item.phone = phone;
+        if (phone) enrichedItem = { ...item, phone };
       } catch {
         // ignore phone fetch errors
       }
     }
 
-    // Send photos
-    if (item.photos.length > 0) {
+    // Send card first
+    const card = formatRichItemNotification(enrichedItem, parsedData ?? undefined);
+    try {
+      await sendFn(ctx.chatId, card);
+    } catch (cardErr) {
+      // fallback: send minimal plain text
+      try { await sendFn(ctx.chatId, `${enrichedItem.title}\n${enrichedItem.url}\nPrice: ${enrichedItem.price} PLN`, { parse_mode: undefined }); } catch {}
+    }
+
+    // Then photos
+    if (enrichedItem.photos.length > 0) {
       try {
-        await sendPhotosFn(ctx.chatId, item.photos.slice(0, 10));
+        await sendPhotosFn(ctx.chatId, enrichedItem.photos.slice(0, 10));
       } catch (photoErr) {
-        console.error(`[find_items] Photo send error for ${item.url}:`, photoErr);
+        console.error(`[find_items] Photo send error for ${enrichedItem.url}:`, photoErr);
       }
     }
 
-    // Send the rich card
-    const card = formatRichItemNotification(item, parsedData ?? undefined);
-    await sendFn(ctx.chatId, card);
-
-    shown.push(item);
+    shown.push(enrichedItem);
   }
 
   ctx.lastSearchResults = shown;
 
-  return `Showed ${shown.length} item(s) to the user with photos and condition analysis. Total available: ${result.totalAvailable}.`;
+  return `Showed ${shown.length} item(s) to the user with photos and detailed condition analysis cards. Total available: ${result.totalAvailable}.\n\nIMPORTANT: The user has ALREADY seen full details, photos, prices, and cards. Do NOT repeat listing details. Just offer next steps.`;
 }
 
 // ---------------------------------------------------------------------------
@@ -823,10 +862,10 @@ async function execListMonitors(
 export async function executeTool(
   name: string,
   input: Record<string, unknown>,
-  userId: number,
-  chatId: number,
+  _userId: number,
+  _chatId: number,
   context: UserContext,
-  sendFn: (chatId: number, text: string) => Promise<void>,
+  sendFn: (chatId: number, text: string, opts?: Record<string, unknown>) => Promise<void>,
   sendPhotosFn: (chatId: number, urls: string[]) => Promise<void>,
 ): Promise<string> {
   try {
