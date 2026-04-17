@@ -1,5 +1,5 @@
-// AI-powered listing data extraction using Claude
-// Parses rental and item listings to extract structured data with caching
+// AI-powered comprehensive listing analysis using Claude
+// Produces deep, human-readable assessments — not just field extraction
 
 import Anthropic from '@anthropic-ai/sdk';
 import { createHash } from 'node:crypto';
@@ -7,210 +7,211 @@ import type { Listing, ParsedRentalData, ParsedItemData } from '../types.js';
 import type { ItemListing } from '../crawlers/olx-items.js';
 import { getParsedListing, saveParsedListing } from '../storage/db.js';
 
-// Re-export types for convenience
 export type { ParsedRentalData, ParsedItemData } from '../types.js';
 
-// ---------------------------------------------------------------------------
-// Client singleton
-// ---------------------------------------------------------------------------
-
 let _client: Anthropic | null = null;
-
 function getClient(): Anthropic {
-  if (_client === null) {
-    _client = new Anthropic();
-  }
+  if (!_client) _client = new Anthropic();
   return _client;
 }
 
 const MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-6';
-
-// ---------------------------------------------------------------------------
-// Hash helper
-// ---------------------------------------------------------------------------
 
 function hashText(text: string): string {
   return createHash('sha256').update(text, 'utf-8').digest('hex');
 }
 
 // ---------------------------------------------------------------------------
-// Rental listing parser
+// Rental listing — comprehensive AI analysis
 // ---------------------------------------------------------------------------
 
-const RENTAL_SYSTEM_PROMPT = `You are a Polish real estate listing data extractor. Given a rental listing's title, description, and metadata, extract structured information. Return ONLY valid JSON — no markdown fences, no explanation.
+const RENTAL_PROMPT = `You are an expert Polish real estate analyst helping an English-speaking renter evaluate apartments in Poland.
 
-The JSON must match this schema exactly:
+Given the listing data below, produce a COMPREHENSIVE analysis in JSON. Read the Polish description carefully — landlords hide crucial details there.
+
+CRITICAL fields to extract from the description:
+- Kaucja (deposit): Look for "kaucja", "depozyt", "zabezpieczenie", "kaucja zwrotna", amounts like "2x czynsz"
+- Contract type: "najem okazjonalny", "umowa najmu okazjonalnego", "najem instytucjonalny" — if not mentioned assume najem zwykły
+- Total monthly cost: rent + czynsz administracyjny + estimated utilities. Calculate this explicitly.
+- What's included in czynsz: often includes heating, garbage, water — extract this
+- What tenant pays separately: gas, electricity, internet — extract this
+
+DEEP analysis to produce:
+- Translate and summarize the entire description into English — preserve ALL useful details
+- Assess the apartment's vibe/style (modern? renovated? old? communist-era?)
+- List ALL furniture and equipment mentioned
+- Note landlord's personality/flexibility from the text
+- Identify restrictions (pets, smoking, couples, ID requirements)
+- Red flags or positive signals
+- Who this apartment is best suited for
+
+Return ONLY valid JSON (no markdown fences):
 {
-  "deposit": number | null,
-  "adminFee": number | null,
+  "deposit": number or null,
+  "depositNote": "e.g. 2600 PLN (1.3x monthly rent), refundable",
+  "adminFee": number or null,
+  "adminFeeIncludes": "what's covered in czynsz admin — heating, water, garbage, etc.",
+  "tenantPays": "what tenant pays on top — gas, electricity, internet, etc.",
   "estimatedMedia": {
-    "water": number | null,
-    "electricity": number | null,
-    "gas": number | null,
-    "internet": number | null,
-    "heating": number | null
+    "water": number or null,
+    "electricity": number or null,
+    "gas": number or null,
+    "internet": number or null,
+    "heating": number or null
   },
-  "totalMonthlyCost": number | null,
+  "totalMonthlyCost": number or null,
+  "totalBreakdown": "e.g. 2000 rent + 544 czynsz + ~200 utilities = ~2744 PLN",
   "contractType": "najem_okazjonalny" | "najem_zwykly" | "najem_instytucjonalny" | null,
-  "availableFrom": string | null,
-  "minimumLease": string | null,
-  "petFriendly": boolean | null,
-  "smokingAllowed": boolean | null,
+  "contractNote": "any details about the contract mentioned",
+  "availableFrom": "date string or 'immediately' or null",
+  "minimumLease": "e.g. '12 months' or null",
+  "petFriendly": true | false | null,
+  "smokingAllowed": true | false | null,
   "furnished": "full" | "partial" | "none" | null,
-  "parkingIncluded": boolean | null,
-  "balcony": boolean | null,
-  "additionalNotes": string[]
-}
+  "parkingIncluded": true | false | null,
+  "balcony": true | false | null,
+  "descriptionSummary": "2-4 sentence English summary of the apartment — vibe, style, key features",
+  "furnitureAndEquipment": ["list every item mentioned: bed type, desk, wardrobe, appliances, etc."],
+  "kitchenDetails": "what's in the kitchen",
+  "bathroomDetails": "what's in the bathroom",
+  "internetReady": "e.g. 'PLAY/ORANGE cable ready, bring own contract'",
+  "landlordNotes": "landlord personality, flexibility, restrictions, tone of the listing",
+  "bestSuitedFor": "e.g. 'single professional working remotely'",
+  "redFlags": ["any concerning things"],
+  "positives": ["strong points of this listing"],
+  "restrictions": ["no pets", "no smoking", "Polish ID required", etc.],
+  "additionalNotes": ["anything else noteworthy"]
+}`;
 
-Rules:
-- "deposit" is "kaucja" in PLN. If described as "2x czynsz", multiply the rent amount.
-- "adminFee" is "czynsz administracyjny" or "czynsz do spółdzielni" — only if it differs from the main rent field.
-- "estimatedMedia" — extract monthly utility estimates if mentioned. Values in PLN.
-- "totalMonthlyCost" = rent + adminFee + sum of all estimated media. If any component is unknown, set to null.
-- "contractType" — look for "najem okazjonalny", "umowa najmu okazjonalnego", etc.
-- "availableFrom" — ISO date string (YYYY-MM-DD) or descriptive string like "od zaraz".
-- "minimumLease" — e.g. "12 miesięcy", "1 rok".
-- "petFriendly" — look for "zwierzęta", "pies", "kot" mentions.
-- "smokingAllowed" — look for "palenie", "niepalący".
-- "furnished" — "full" if fully furnished ("umeblowane"), "partial" if partially, "none" if empty.
-- "parkingIncluded" — look for "parking", "garaż", "miejsce postojowe".
-- "balcony" — look for "balkon", "taras", "loggia".
-- "additionalNotes" — any important info not captured above (max 5 items, each max 100 chars).
-- Use null for unknown/unmentioned fields. Never guess.`;
+export async function parseRentalListing(listing: Listing): Promise<ParsedRentalData> {
+  const descHash = hashText(listing.description || listing.title);
 
-export async function parseRentalListing(
-  listing: Listing,
-): Promise<ParsedRentalData> {
-  // Check cache first
-  const descriptionHash = hashText(listing.description);
+  // Check cache
   const cached = getParsedListing(listing.platform, listing.platformId);
-
-  if (cached !== undefined && cached.description_hash === descriptionHash) {
-    return JSON.parse(cached.parsed_data) as ParsedRentalData;
+  if (cached && cached.description_hash === descHash) {
+    return JSON.parse(cached.parsed_data);
   }
 
-  // Build input for Claude
-  const inputText = [
-    `Title: ${listing.title}`,
-    `Price (rent): ${listing.price} ${listing.currency}`,
-    listing.rent != null ? `Czynsz (admin fee from listing): ${listing.rent} PLN` : '',
-    listing.deposit != null ? `Deposit from listing fields: ${listing.deposit} PLN` : '',
-    listing.area != null ? `Area: ${listing.area} m²` : '',
-    listing.rooms != null ? `Rooms: ${listing.rooms}` : '',
-    listing.floor != null ? `Floor: ${listing.floor}` : '',
-    listing.heating ? `Heating: ${listing.heating}` : '',
-    listing.furniture != null ? `Furniture field: ${listing.furniture}` : '',
-    listing.parking ? `Parking field: ${listing.parking}` : '',
-    '',
-    `Description:`,
-    listing.description,
-  ]
-    .filter(Boolean)
-    .join('\n');
+  const userMessage = `Title: ${listing.title}
+Rent price: ${listing.price} PLN/month
+Czynsz admin (from structured data): ${listing.rent ?? 'not specified'} PLN
+Deposit (from structured data): ${listing.deposit ?? 'not specified'} PLN
+Area: ${listing.area ?? 'unknown'} m²
+Rooms: ${listing.rooms ?? 'unknown'}
+Floor: ${listing.floor ?? 'unknown'}
+Building type: ${listing.buildingType ?? 'unknown'}
+Heating: ${listing.heating ?? 'unknown'}
+City: ${listing.city}, District: ${listing.district ?? 'unknown'}
+Street: ${listing.street ?? 'unknown'}
+Advertiser: ${listing.advertiserType ?? 'unknown'}
+Coordinates: ${listing.lat ?? 'unknown'}, ${listing.lng ?? 'unknown'}
 
-  const client = getClient();
-  const response = await client.messages.create({
+Full description (Polish):
+${listing.description || 'No description provided'}`;
+
+  const response = await getClient().messages.create({
     model: MODEL,
-    max_tokens: 1024,
+    max_tokens: 2048,
     temperature: 0,
-    system: RENTAL_SYSTEM_PROMPT,
-    messages: [{ role: 'user', content: inputText }],
+    system: RENTAL_PROMPT,
+    messages: [{ role: 'user', content: userMessage }],
   });
 
-  const textBlock = response.content.find((block) => block.type === 'text');
+  const textBlock = response.content.find((b) => b.type === 'text');
   if (!textBlock || textBlock.type !== 'text') {
-    throw new Error('No text response from Claude for rental listing parse');
+    throw new Error('No text in Claude response');
   }
 
-  const parsed = JSON.parse(textBlock.text) as ParsedRentalData;
+  // Clean potential markdown fences
+  let jsonStr = textBlock.text.trim();
+  if (jsonStr.startsWith('```')) {
+    jsonStr = jsonStr.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '');
+  }
 
-  // Save to cache
+  const parsed = JSON.parse(jsonStr) as ParsedRentalData;
+
   saveParsedListing(
     listing.platform,
     listing.platformId,
     'rental',
     JSON.stringify(parsed),
-    descriptionHash,
+    descHash,
   );
 
   return parsed;
 }
 
 // ---------------------------------------------------------------------------
-// Item listing parser
+// Item listing — condition and value analysis
 // ---------------------------------------------------------------------------
 
-const ITEM_SYSTEM_PROMPT = `You are a Polish marketplace listing data extractor. Given an item listing's title, description, and metadata, extract structured information. Return ONLY valid JSON — no markdown fences, no explanation.
+const ITEM_PROMPT = `You are an expert at evaluating used items for sale. Given a Polish item listing, produce a comprehensive analysis in English.
 
-The JSON must match this schema exactly:
+Read the Polish description carefully. Extract:
+- Real condition (not just the tag — what does the seller actually say?)
+- Why they're selling (if mentioned)
+- Any defects, scratches, issues
+- What's included (accessories, original box, charger, etc.)
+- Whether the price seems fair
+- Who should buy this
+
+Return ONLY valid JSON (no markdown fences):
 {
-  "actualCondition": string,
-  "whySelling": string | null,
-  "defects": string[],
-  "includedAccessories": string[],
-  "additionalNotes": string[]
-}
+  "actualCondition": "detailed English assessment from description",
+  "whySelling": "reason if mentioned, null otherwise",
+  "defects": ["list of any issues mentioned"],
+  "includedAccessories": ["charger", "original box", etc.],
+  "priceAssessment": "seems fair / overpriced / good deal — brief note",
+  "descriptionSummary": "1-2 sentence English summary",
+  "bestFor": "who should buy this",
+  "redFlags": ["any concerns"],
+  "additionalNotes": ["anything else noteworthy"]
+}`;
 
-Rules:
-- "actualCondition" — your assessment of the real condition based on description. Be honest — e.g. "Good, light wear" not just repeating the category label.
-- "whySelling" — reason for selling if mentioned.
-- "defects" — list of specific defects, scratches, damage mentioned. Empty array if none.
-- "includedAccessories" — what comes with the item (charger, box, cables, etc.). Empty array if not mentioned.
-- "additionalNotes" — any important info not captured above (max 5 items, each max 100 chars).
-- Use null for unknown/unmentioned fields. Never guess.`;
+export async function parseItemListing(item: ItemListing): Promise<ParsedItemData> {
+  const descHash = hashText(item.description || item.title);
 
-export async function parseItemListing(
-  item: ItemListing,
-): Promise<ParsedItemData> {
-  // Check cache first
-  const descriptionHash = hashText(item.description);
   const cached = getParsedListing(item.platform, item.platformId);
-
-  if (cached !== undefined && cached.description_hash === descriptionHash) {
-    return JSON.parse(cached.parsed_data) as ParsedItemData;
+  if (cached && cached.description_hash === descHash) {
+    return JSON.parse(cached.parsed_data);
   }
 
-  // Build input for Claude
-  const paramLines = Object.entries(item.params)
-    .map(([k, v]) => `  ${k}: ${v}`)
-    .join('\n');
+  const userMessage = `Title: ${item.title}
+Price: ${item.price} ${item.currency}${item.negotiable ? ' (negotiable)' : ''}
+Condition tag: ${item.condition ?? 'not specified'}
+City: ${item.city}
+Seller: ${item.contactName ?? 'unknown'}${item.isBusiness ? ' (business)' : ' (private)'}
+Category params: ${Object.entries(item.params).filter(([k]) => k !== 'price').map(([k, v]) => `${k}: ${v}`).join(', ')}
 
-  const inputText = [
-    `Title: ${item.title}`,
-    `Price: ${item.price} ${item.currency}${item.negotiable ? ' (negotiable)' : ''}`,
-    item.condition ? `Listed condition: ${item.condition}` : '',
-    item.categoryName ? `Category: ${item.categoryName}` : '',
-    paramLines ? `Parameters:\n${paramLines}` : '',
-    '',
-    `Description:`,
-    item.description,
-  ]
-    .filter(Boolean)
-    .join('\n');
+Full description (Polish):
+${item.description || 'No description provided'}`;
 
-  const client = getClient();
-  const response = await client.messages.create({
+  const response = await getClient().messages.create({
     model: MODEL,
     max_tokens: 1024,
     temperature: 0,
-    system: ITEM_SYSTEM_PROMPT,
-    messages: [{ role: 'user', content: inputText }],
+    system: ITEM_PROMPT,
+    messages: [{ role: 'user', content: userMessage }],
   });
 
-  const textBlock = response.content.find((block) => block.type === 'text');
+  const textBlock = response.content.find((b) => b.type === 'text');
   if (!textBlock || textBlock.type !== 'text') {
-    throw new Error('No text response from Claude for item listing parse');
+    throw new Error('No text in Claude response');
   }
 
-  const parsed = JSON.parse(textBlock.text) as ParsedItemData;
+  let jsonStr = textBlock.text.trim();
+  if (jsonStr.startsWith('```')) {
+    jsonStr = jsonStr.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '');
+  }
 
-  // Save to cache
+  const parsed = JSON.parse(jsonStr) as ParsedItemData;
+
   saveParsedListing(
     item.platform,
     item.platformId,
     'item',
     JSON.stringify(parsed),
-    descriptionHash,
+    descHash,
   );
 
   return parsed;

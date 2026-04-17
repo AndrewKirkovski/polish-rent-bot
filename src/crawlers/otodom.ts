@@ -49,7 +49,6 @@ export function buildOtodomUrl(params: OtodomSearchParams): string {
   if (params.city) {
     parts.push(params.city);
     parts.push(params.city); // otodom duplicates city in the path
-    if (params.district) parts.push(params.district);
   }
 
   const qs = new URLSearchParams();
@@ -64,7 +63,25 @@ export function buildOtodomUrl(params: OtodomSearchParams): string {
   if (params.priceTo) qs.set('priceMax', String(params.priceTo));
   if (params.areaFrom) qs.set('areaMin', String(params.areaFrom));
   if (params.areaTo) qs.set('areaMax', String(params.areaTo));
-  if (params.roomsFrom) qs.set('roomsNumber', `[${params.roomsFrom},${params.roomsTo ?? params.roomsFrom}]`);
+
+  // Room filter — VERIFIED: Otodom uses enum strings, not numeric ranges
+  const ROOM_ENUM_OTODOM: Record<number, string> = { 1: 'ONE', 2: 'TWO', 3: 'THREE', 4: 'FOUR', 5: 'FIVE', 6: 'SIX' };
+  if (params.roomsFrom) {
+    const values: string[] = [];
+    const from = params.roomsFrom;
+    const to = params.roomsTo ?? params.roomsFrom;
+    for (let i = from; i <= to && i <= 6; i++) {
+      if (ROOM_ENUM_OTODOM[i]) values.push(ROOM_ENUM_OTODOM[i]);
+    }
+    if (values.length > 0) qs.set('roomsNumber', `[${values.join(',')}]`);
+  }
+
+  // District filter — VERIFIED: uses locations query param, not URL path
+  if (params.district && params.city) {
+    const province = params.province ?? 'mazowieckie';
+    const city = params.city;
+    qs.set('locations', `[${province}/${city}/${city}/${city}/${params.district}]`);
+  }
 
   return `${parts.join('/')}?${qs.toString()}`;
 }

@@ -71,7 +71,10 @@ export interface SessionState {
 
 export interface ParsedRentalData {
   deposit: number | null;
+  depositNote: string | null;
   adminFee: number | null;
+  adminFeeIncludes: string | null;
+  tenantPays: string | null;
   estimatedMedia: {
     water: number | null;
     electricity: number | null;
@@ -80,7 +83,9 @@ export interface ParsedRentalData {
     heating: number | null;
   };
   totalMonthlyCost: number | null;
+  totalBreakdown: string | null;
   contractType: 'najem_okazjonalny' | 'najem_zwykly' | 'najem_instytucjonalny' | null;
+  contractNote: string | null;
   availableFrom: string | null;
   minimumLease: string | null;
   petFriendly: boolean | null;
@@ -88,6 +93,16 @@ export interface ParsedRentalData {
   furnished: 'full' | 'partial' | 'none' | null;
   parkingIncluded: boolean | null;
   balcony: boolean | null;
+  descriptionSummary: string | null;
+  furnitureAndEquipment: string[];
+  kitchenDetails: string | null;
+  bathroomDetails: string | null;
+  internetReady: string | null;
+  landlordNotes: string | null;
+  bestSuitedFor: string | null;
+  redFlags: string[];
+  positives: string[];
+  restrictions: string[];
   additionalNotes: string[];
 }
 
@@ -96,6 +111,10 @@ export interface ParsedItemData {
   whySelling: string | null;
   defects: string[];
   includedAccessories: string[];
+  priceAssessment: string | null;
+  descriptionSummary: string | null;
+  bestFor: string | null;
+  redFlags: string[];
   additionalNotes: string[];
 }
 
@@ -103,10 +122,17 @@ export interface ParsedItemData {
 // Location scoring
 // ---------------------------------------------------------------------------
 
+export interface NearbyPlace {
+  name: string;
+  walkingMinutes: number;
+  distance: string;
+}
+
 export interface AmenityResult {
   type: string;
-  nearest: { name: string; walkingMinutes: number; distance: string } | null;
-  withinLimit: boolean;
+  places: NearbyPlace[];          // top 3 closest, sorted by distance
+  nearest: NearbyPlace | null;    // shortcut to places[0]
+  withinLimit: boolean;           // true if nearest <= maxMinutes
 }
 
 export interface CommuteResult {

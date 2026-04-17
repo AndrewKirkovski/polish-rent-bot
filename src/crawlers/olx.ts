@@ -30,6 +30,15 @@ export const OLX_CITIES = {
   KATOWICE: 8671,
 } as const;
 
+export const OLX_DISTRICTS: Record<string, Record<string, number>> = {
+  warszawa: {
+    bemowo: 367, bialoleka: 365, bielany: 369, mokotow: 353,
+    ochota: 355, 'praga-poludnie': 381, 'praga-polnoc': 379, rembertow: 361,
+    srodmiescie: 351, targowek: 377, ursus: 371, ursynow: 373,
+    wawer: 383, wesola: 533, wilanow: 375, wlochy: 357, wola: 359, zoliborz: 363,
+  },
+};
+
 interface OlxSearchParams {
   categoryId: number;
   cityId?: number;
@@ -40,6 +49,8 @@ interface OlxSearchParams {
   priceFrom?: number;
   priceTo?: number;
   query?: string;
+  rooms?: number;       // 1,2,3,4 — mapped to filter_enum_rooms
+  districtId?: number;  // OLX district ID
 }
 
 async function fetchJson<T>(url: string): Promise<T | null> {
@@ -70,6 +81,13 @@ function buildSearchUrl(params: OlxSearchParams): string {
   if (params.priceTo) qs.set('filter_float_price:to', String(params.priceTo));
   if (params.query) qs.set('query', params.query);
 
+  // Room filter — VERIFIED working with live API
+  const ROOM_ENUM: Record<number, string> = { 1: 'one', 2: 'two', 3: 'three', 4: 'four' };
+  if (params.rooms && ROOM_ENUM[params.rooms]) {
+    qs.set('filter_enum_rooms[0]', ROOM_ENUM[params.rooms]);
+  }
+  if (params.districtId) qs.set('district_id', String(params.districtId));
+
   return `${OLX_API}/offers/?${qs.toString()}`;
 }
 
@@ -78,7 +96,7 @@ function getParamValue(params: any[], key: string): any {
   if (!param) return null;
 
   if (key === 'price') return param.value?.value ?? null;
-  if (key === 'rent') return param.value?.value ?? null;
+  if (key === 'rent') return param.value?.key ?? param.value?.value ?? null;
   if (key === 'm') return param.value?.key ?? null;
 
   // For label-based params (floor_select, builttype, rooms, etc.)
@@ -91,7 +109,9 @@ function parseOlxOffer(raw: any): Listing {
   const priceVal = getParamValue(params, 'price');
   const rentVal = getParamValue(params, 'rent');
   const areaStr = getParamValue(params, 'm');
-  const roomsStr = getParamValue(params, 'rooms');
+  const ROOM_KEY_MAP: Record<string, number> = { one: 1, two: 2, three: 3, four: 4 };
+  const roomsParam = params?.find((p: any) => p.key === 'rooms');
+  const roomsKey = roomsParam?.value?.key;
   const floorStr = getParamValue(params, 'floor_select');
   const buildingType = getParamValue(params, 'builttype');
   const furniture = getParamValue(params, 'furniture');
@@ -99,7 +119,7 @@ function parseOlxOffer(raw: any): Listing {
 
   // Parse numeric values
   const area = areaStr ? parseFloat(String(areaStr).replace(/[^\d.]/g, '')) : null;
-  const rooms = roomsStr ? parseInt(String(roomsStr).replace(/\D/g, ''), 10) || null : null;
+  const rooms = roomsKey ? (ROOM_KEY_MAP[roomsKey] ?? (parseInt(String(roomsKey).replace(/\D/g, ''), 10) || null)) : null;
   const floor = floorStr === 'Parter' ? 0 : floorStr ? parseInt(floorStr, 10) || null : null;
 
   const photos = (raw.photos ?? []).map((p: any) => {
