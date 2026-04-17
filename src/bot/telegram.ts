@@ -44,8 +44,8 @@ async function ensureAuth(msg: Msg): Promise<boolean> {
     const username = msg.from?.username ?? msg.from?.first_name ?? String(telegramId);
     addUser(telegramId, username);
     authorizeUser(telegramId);
-    await _bot!.sendMessage(msg.chat.id, 'Access granted\\. Welcome\\! Type /start for commands\\.', {
-      parse_mode: 'MarkdownV2',
+    await _bot!.sendMessage(msg.chat.id, 'Access granted. Welcome! Type /start for commands.', {
+      parse_mode: 'Markdown',
     });
     return false; // handled — don't run command
   }
@@ -107,9 +107,9 @@ type SendPhotosFn = (chatId: number | string, urls: string[]) => Promise<void>;
 
 function makeSendFn(bot: TelegramBot): SendFn {
   return async (chatId, text, opts?) => {
-    // Don't force MarkdownV2 on AI responses — Claude returns plain text
-    // Only use MarkdownV2 when explicitly passed in opts
-    await bot.sendMessage(chatId, text, opts as TelegramBot.SendMessageOptions);
+    // Use Markdown (classic, not V2) — same as ai-managers
+    // Claude naturally uses *bold* and [links](url) which classic Markdown handles
+    await bot.sendMessage(chatId, text, { parse_mode: 'Markdown', ...opts } as TelegramBot.SendMessageOptions);
   };
 }
 
@@ -135,20 +135,18 @@ export function startBot(): TelegramBot {
   bot.onText(/\/start/, async (msg: Msg) => {
     if (!(await ensureAuth(msg))) return;
     const text = [
-      `\uD83C\uDDF5\uD83C\uDDF1 *Polish Rent & Items Bot*`,
+      '\uD83C\uDDF5\uD83C\uDDF1 *Polish Rent & Items Bot*',
       '',
-      `I'm an AI\\-powered assistant that helps you find apartments and items in Poland\\.`,
+      "I'm an AI-powered assistant that helps you find apartments and items in Poland.",
       '',
       'Just tell me what you need in plain language, for example:',
-      `\\- "Find me a 2\\-room apartment in Krakow up to 3000 PLN"`,
-      `\\- "Search for a used iPhone 15 under 2500 PLN"`,
-      `\\- "Set up a monitor for rentals in Warszawa"`,
+      '- "Find me a 2-room apartment in Krakow up to 3000 PLN"',
+      '- "Search for a used iPhone 15 under 2500 PLN"',
+      '- "Set up a monitor for rentals in Warszawa"',
       '',
-      'Or use these commands:',
-      '/help \\- show available commands',
-      '/start \\- show this welcome message',
+      'Or use /help for more info.',
     ].join('\n');
-    await bot.sendMessage(msg.chat.id, text, { parse_mode: 'MarkdownV2' });
+    await bot.sendMessage(msg.chat.id, text, { parse_mode: 'Markdown' });
   });
 
   // --- /help ---
@@ -157,23 +155,22 @@ export function startBot(): TelegramBot {
     const text = [
       '*How to use this bot*',
       '',
-      'Send me any message in natural language and I\u2019ll figure out what to do\\.',
+      'Send me any message in natural language.',
       '',
       'I can:',
-      `\\- Search rentals on OLX, Otodom, and Allegro`,
-      `\\- Search for items by keyword`,
-      `\\- Create persistent monitors that notify you of new listings`,
-      `\\- Analyze listing details \\(costs, contract type, amenities\\)`,
-      `\\- Score locations \\(nearby amenities, commute times\\)`,
+      '- Search rentals on OLX and Otodom',
+      '- Search for used items by keyword',
+      '- Analyze listings (costs, contract type, amenities)',
+      '- Score locations (nearby metro, gym, pool, commute)',
+      '- Create monitors that notify you of new listings',
       '',
-      'Examples:',
-      `"Find apartments in Gdansk, 2 rooms, max 2500 PLN"`,
-      `"Monitor iPhones under 3000 PLN in Warszawa"`,
-      `"Show my monitors"`,
-      `"Stop monitor 5"`,
-      `"What\u2019s the bot status?"`,
+      '*Examples:*',
+      '"Find apartments in Gdansk, 2 rooms, max 2500 PLN"',
+      '"Monitor iPhones under 3000 PLN in Warszawa"',
+      '"Show my monitors"',
+      '"Stop monitor 5"',
     ].join('\n');
-    await bot.sendMessage(msg.chat.id, text, { parse_mode: 'MarkdownV2' });
+    await bot.sendMessage(msg.chat.id, text, { parse_mode: 'Markdown' });
   });
 
   // --- Catch-all: forward everything else to AI agent ---

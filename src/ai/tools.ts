@@ -305,16 +305,27 @@ async function execFindRentals(
   // ---- Step A: Search OLX + Otodom in parallel ----
   const searchPromises: Promise<Listing[]>[] = [];
 
+  // Strip diacritics helper for URL-safe district names
+  const stripDiacritics = (s: string) => s.toLowerCase().trim()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/ł/g, 'l');
+
   if (doOlx) {
     const cityId = resolveCityId(city);
+    // Don't pass priceTo to OLX — user budget is TOTAL but API filters RENT only.
+    // Don't pre-filter price at all — let AI parse determine total and filter after.
+    // Fetch multiple pages to get enough results.
     searchPromises.push(
-      searchOlx({
-        categoryId: OLX_CATEGORIES.MIESZKANIA_WYNAJEM,
-        cityId,
-        priceFrom,
-        priceTo,
-        limit: 30,
-      }).then((r) => r.listings),
+      (async () => {
+        const page1 = await searchOlx({ categoryId: OLX_CATEGORIES.MIESZKANIA_WYNAJEM, cityId, limit: 40 });
+        const results = [...page1.listings];
+        // Fetch page 2 if available
+        if (page1.hasNextPage) {
+          const page2 = await searchOlx({ categoryId: OLX_CATEGORIES.MIESZKANIA_WYNAJEM, cityId, limit: 40, offset: 40 });
+          results.push(...page2.listings);
+        }
+        return results;
+      })(),
     );
   }
 
@@ -328,9 +339,9 @@ async function execFindRentals(
           estate: 'mieszkanie',
           province,
           city: city || undefined,
-          district: district?.toLowerCase().trim(),
+          district: district ? stripDiacritics(district) : undefined, // URL-safe, no diacritics
           priceFrom,
-          priceTo,
+          priceTo, // Otodom filters on advertised price, close enough
           areaFrom,
           areaTo,
           roomsFrom,
@@ -344,6 +355,8 @@ async function execFindRentals(
 
   const searchResults = await Promise.all(searchPromises);
   const allListings = searchResults.flat();
+  console.log(`[find_rentals] Search results: ${allListings.length} total (OLX: ${doOlx}, Otodom: ${doOtodom})`);
+  console.log(`[find_rentals] Params: city=${city}, districts=${districts.join(',')}, rooms=${roomsFrom}-${roomsTo}, priceTo=${priceTo}`);
 
   // ---- Filter by rooms/area (for OLX which doesn't filter well) ----
   let filtered = allListings;
@@ -360,12 +373,17 @@ async function execFindRentals(
     filtered = filtered.filter((l) => l.area == null || l.area <= areaTo);
   }
 
-  // Filter by district if specified and not already filtered via Otodom URL
+  // Filter by district — use substring matching, normalize diacritics
   if (districts.length > 0) {
-    const districtSet = new Set(districts.map((d) => d.toLowerCase().trim()));
+    const normalize = (s: string) => s.toLowerCase().trim()
+      .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+      .replace(/ł/g, 'l');
+    const normalizedDistricts = districts.map(normalize);
     filtered = filtered.filter((l) => {
       if (!l.district) return true; // keep listings without district info
-      return districtSet.has(l.district.toLowerCase().trim());
+      const nd = normalize(l.district);
+      // Substring match: "stary mokotow" contains "mokotow"
+      return normalizedDistricts.some(d => nd.includes(d) || d.includes(nd));
     });
   }
 
@@ -380,22 +398,26 @@ async function execFindRentals(
     }
   }
 
-  // Sort by price ascending
-  deduped.sort((a, b) => a.price - b.price);
+  // Sort by newest first (most relevant for monitoring new listings)
+  deduped.sort((a, b) => {
+    const ta = new Date(a.createdAt || 0).getTime();
+    const tb = new Date(b.createdAt || 0).getTime();
+    return tb - ta; // newest first
+  });
 
   if (deduped.length === 0) {
-    return 'No rental listings found matching your criteria. Try broadening the search (higher budget, fewer rooms, different district, or add more platforms).';
+    return `No rental listings found matching your criteria. I searched ${doOlx ? 'OLX' : ''}${doOlx && doOtodom ? ' + ' : ''}${doOtodom ? 'Otodom' : ''} for ${roomsFrom ?? 'any'}-room apartments in ${city}${districts.length ? ' (' + districts.join(', ') + ')' : ''}. Try broadening the search (more districts, relax room count, or add more platforms).`;
   }
 
   // ---- Step B: Send progress message ----
-  const candidateCount = Math.min(deduped.length, 15);
+  const candidateCount = Math.min(deduped.length, 25);
   await sendFn(
     ctx.chatId,
     `Found ${deduped.length} listings. Analyzing top ${candidateCount}...`,
   );
 
   // ---- Step C: Analyze top candidates ----
-  const candidates = deduped.slice(0, 15);
+  const candidates = deduped.slice(0, 25);
   const accepted: Array<{
     listing: Listing;
     parsedData: ParsedRentalData | null;
@@ -422,24 +444,31 @@ async function execFindRentals(
 
     try {
       // Fetch detail page for richer data
+      console.log(`[find_rentals] ${i + 1}/${candidateCount}: ${listing.platform} "${listing.title.slice(0, 50)}"`);
       let enrichedListing = listing;
       if (listing.platform === 'otodom') {
-        const detail = await fetchOtodomDetail(listing.url);
-        if (detail) {
-          enrichedListing = detail;
+        try {
+          const detail = await fetchOtodomDetail(listing.url);
+          if (detail) enrichedListing = detail;
+        } catch (detailErr) {
+          console.error(`[find_rentals] Detail fetch failed, using search data:`, detailErr);
         }
       } else if (listing.platform === 'olx' && !listing.phone) {
-        const phone = await fetchOlxPhone(listing.platformId);
-        if (phone) enrichedListing = { ...listing, phone };
+        try {
+          const phone = await fetchOlxPhone(listing.platformId);
+          if (phone) enrichedListing = { ...listing, phone };
+        } catch { /* phone is optional */ }
       }
 
-      // AI extraction
+      // AI extraction — best effort, don't block on failure
       let parsedData: ParsedRentalData | null = null;
       if (enrichedListing.description) {
         try {
+          console.log(`[find_rentals] AI parsing...`);
           parsedData = await parseRentalListing(enrichedListing);
+          console.log(`[find_rentals] AI parsed: total=${parsedData?.totalMonthlyCost}, contract=${parsedData?.contractType}, kaucja=${parsedData?.deposit}`);
         } catch (parseErr) {
-          console.error(`[find_rentals] Parse error for ${enrichedListing.url}:`, parseErr);
+          console.error(`[find_rentals] AI parse failed (showing listing anyway):`, parseErr);
         }
       }
 
@@ -469,12 +498,24 @@ async function execFindRentals(
         continue;
       }
 
-      // Location scoring (if coordinates available AND amenities requested)
+      // Location scoring — geocode if no coordinates
       let locationScore: LocationScore | null = null;
-      const hasCoords = enrichedListing.lat != null && enrichedListing.lng != null;
+      let lat = enrichedListing.lat;
+      let lng = enrichedListing.lng;
       const wantLocation = amenities.length > 0 || workAddress;
 
-      if (hasCoords && wantLocation) {
+      if (!lat || !lng) {
+        // Try to geocode from address info
+        try {
+          const { geocodeAddress, buildAddressFromListing } = await import('./maps.js');
+          const addr = buildAddressFromListing(enrichedListing);
+          console.log(`[find_rentals] No coords, geocoding: "${addr}"`);
+          const geo = await geocodeAddress(addr);
+          if (geo) { lat = geo.lat; lng = geo.lng; }
+        } catch { /* geocoding is best-effort */ }
+      }
+
+      if (lat && lng && wantLocation) {
         try {
           const amenityPrefs: AmenityPreference[] = amenities.map((a) => ({
             type: a.type,
@@ -482,25 +523,15 @@ async function execFindRentals(
           }));
 
           locationScore = await scoreLocation(
-            enrichedListing.lat!,
-            enrichedListing.lng!,
+            lat,
+            lng,
             amenityPrefs,
             workAddress,
             commuteMode,
           );
 
-          // Filter: reject if any amenity is outside the limit
-          if (amenities.length > 0) {
-            const failedAmenity = locationScore.amenities.find((a) => !a.withinLimit);
-            if (failedAmenity) {
-              rejected.push({
-                url: enrichedListing.url,
-                title: enrichedListing.title,
-                reason: `${failedAmenity.type} is ${failedAmenity.nearest ? failedAmenity.nearest.walkingMinutes + ' min away' : 'not found nearby'} (limit: ${amenities.find((a) => a.type === failedAmenity.type)?.maxMinutes ?? '?'} min)`,
-              });
-              continue;
-            }
-          }
+          // Amenity check is SOFT — don't reject, just note in the score
+          // The card will show ✓/⚠️ per amenity, AI summarizes at the end
         } catch (locErr) {
           console.error(`[find_rentals] Location scoring error for ${enrichedListing.url}:`, locErr);
           // Don't reject, just skip location data
