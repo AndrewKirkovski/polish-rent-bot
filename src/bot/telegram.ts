@@ -50,7 +50,7 @@ async function ensureAuth(msg: Msg): Promise<boolean> {
     return false; // handled — don't run command
   }
 
-  await _bot!.sendMessage(msg.chat.id, 'Send the password to access this bot\\.');
+  await _bot!.sendMessage(msg.chat.id, 'Send the password to access this bot.');
   return false;
 }
 
@@ -85,7 +85,7 @@ export async function sendEnrichedNotification(
     text = formatRichRentalNotification(listing as Listing, parsedData as ParsedRentalData | undefined, locationScore ?? undefined);
   }
 
-  await bot.sendMessage(chatId, text, { parse_mode: 'MarkdownV2', disable_web_page_preview: false });
+  await bot.sendMessage(chatId, text, { disable_web_page_preview: false });
 
   // Send photo album if available
   const photos = listing.photos;
@@ -107,7 +107,9 @@ type SendPhotosFn = (chatId: number | string, urls: string[]) => Promise<void>;
 
 function makeSendFn(bot: TelegramBot): SendFn {
   return async (chatId, text, opts?) => {
-    await bot.sendMessage(chatId, text, { parse_mode: 'MarkdownV2', ...opts });
+    // Don't force MarkdownV2 on AI responses — Claude returns plain text
+    // Only use MarkdownV2 when explicitly passed in opts
+    await bot.sendMessage(chatId, text, opts as TelegramBot.SendMessageOptions);
   };
 }
 
@@ -187,12 +189,13 @@ export function startBot(): TelegramBot {
     const userId = msg.from!.id;
     const chatId = msg.chat.id;
 
+    const typingFn = async (cid: number) => { await bot.sendChatAction(cid, 'typing'); };
+
     try {
-      await handleUserMessage(userId, chatId, text, sendFn, sendPhotosFn);
+      await handleUserMessage(userId, chatId, text, sendFn, sendPhotosFn, typingFn);
     } catch (err) {
       console.error(`[telegram] Agent error for user ${userId}:`, err);
-      const errorText = `Something went wrong\\. Please try again later\\.`;
-      await bot.sendMessage(chatId, errorText, { parse_mode: 'MarkdownV2' });
+      await bot.sendMessage(chatId, 'Something went wrong. Please try again later.');
     }
   });
 

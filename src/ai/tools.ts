@@ -1,22 +1,27 @@
 // Tool definitions for the Claude API + dispatcher that executes them
+// Deep pipeline tools: find_rentals, find_items, create_monitor, update_monitor, delete_monitor, list_monitors
 import type { Tool } from '@anthropic-ai/sdk/resources/messages.js';
 
 import { searchOlx, fetchOlxPhone, OLX_CATEGORIES, OLX_CITIES } from '../crawlers/olx.js';
-import { searchItems } from '../crawlers/olx-items.js';
+import { searchItems, fetchItemPhone } from '../crawlers/olx-items.js';
 import type { ItemListing } from '../crawlers/olx-items.js';
 import { searchOtodom, fetchOtodomDetail } from '../crawlers/otodom.js';
+import { parseRentalListing, parseItemListing } from './parse-listing.js';
+import { scoreLocation } from './maps.js';
+import type { AmenityPreference } from './maps.js';
+import { formatRichRentalNotification, formatRichItemNotification } from '../bot/format.js';
 import {
   addMonitor,
   getMonitors,
   getMonitor,
-  getDb,
   deactivateMonitor,
   getSeenCount,
+  updateMonitorConfig,
 } from '../storage/db.js';
-import type { Listing } from '../types.js';
+import type { Listing, ParsedRentalData, LocationScore } from '../types.js';
 
 // ---------------------------------------------------------------------------
-// User context — tracks state across the conversation for a single user
+// User context -- tracks state across the conversation for a single user
 // ---------------------------------------------------------------------------
 
 export interface UserContext {
@@ -40,7 +45,7 @@ export function getOrCreateContext(userId: number, chatId: number): UserContext 
 }
 
 // ---------------------------------------------------------------------------
-// City name → OLX city ID mapping
+// City name -> OLX city ID mapping
 // ---------------------------------------------------------------------------
 
 const CITY_ID_MAP: Record<string, number> = {
@@ -53,7 +58,7 @@ const CITY_ID_MAP: Record<string, number> = {
   katowice: OLX_CITIES.KATOWICE,
 };
 
-// City → default province for Otodom
+// City -> default province for Otodom
 const CITY_PROVINCE_MAP: Record<string, string> = {
   warszawa: 'mazowieckie',
   krakow: 'malopolskie',
@@ -69,311 +74,214 @@ function resolveCityId(name: string): number | undefined {
 }
 
 // ---------------------------------------------------------------------------
-// Tool definitions (Claude API format)
+// Send function types
+// ---------------------------------------------------------------------------
+
+type SendFn = (chatId: number, text: string) => Promise<void>;
+type SendPhotosFn = (chatId: number, urls: string[]) => Promise<void>;
+
+// ---------------------------------------------------------------------------
+// Tool definitions (Claude API format) -- 6 deep pipeline tools
 // ---------------------------------------------------------------------------
 
 export const TOOL_DEFINITIONS: Tool[] = [
+  // ---- 1. find_rentals ----
   {
-    name: 'search_rentals',
+    name: 'find_rentals',
     description:
-      'Search for rental apartments/rooms on OLX and/or Otodom. Returns a numbered list of listings with price, area, rooms, district, and contact info.',
+      'Full pipeline: search rental apartments on OLX and/or Otodom, analyze each with AI, check location amenities, filter by budget, and send rich cards with photos directly to the user. Call ONCE after confirming criteria.',
     input_schema: {
-      type: 'object',
+      type: 'object' as const,
       properties: {
         city: {
           type: 'string',
           description: 'City name (e.g. "warszawa", "krakow", "wroclaw", "gdansk", "poznan", "lodz", "katowice")',
         },
-        platforms: {
+        districts: {
           type: 'array',
-          items: { type: 'string', enum: ['olx', 'otodom'] },
-          description: 'Platforms to search. Defaults to ["olx"].',
-        },
-        district: {
-          type: 'string',
-          description: 'District within the city (e.g. "mokotow", "wola", "srodmiescie")',
+          items: { type: 'string' },
+          description: 'District names within the city (e.g. ["mokotow", "wola"])',
         },
         province: {
           type: 'string',
           description: 'Province/voivodeship (e.g. "mazowieckie"). Auto-resolved from city if omitted.',
         },
-        priceFrom: { type: 'number', description: 'Minimum monthly rent in PLN' },
-        priceTo: { type: 'number', description: 'Maximum monthly rent in PLN' },
+        priceFrom: { type: 'number', description: 'Minimum TOTAL monthly budget in PLN (rent + czynsz + media)' },
+        priceTo: { type: 'number', description: 'Maximum TOTAL monthly budget in PLN (rent + czynsz + media)' },
         roomsFrom: { type: 'number', description: 'Minimum number of rooms' },
         roomsTo: { type: 'number', description: 'Maximum number of rooms' },
-        areaFrom: { type: 'number', description: 'Minimum area in m²' },
-        areaTo: { type: 'number', description: 'Maximum area in m²' },
+        areaFrom: { type: 'number', description: 'Minimum area in m2' },
+        areaTo: { type: 'number', description: 'Maximum area in m2' },
         ownerType: {
           type: 'string',
           enum: ['ALL', 'PRIVATE', 'AGENCY'],
-          description: 'Filter by owner type (Otodom only)',
+          description: 'Filter by owner type',
         },
-        limit: {
+        platforms: {
+          type: 'string',
+          enum: ['olx', 'otodom', 'all'],
+          description: 'Platforms to search. Defaults to "all".',
+        },
+        amenities: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              type: { type: 'string', enum: ['metro', 'gym', 'pool', 'supermarket', 'park', 'pharmacy'], description: 'Amenity type' },
+              maxMinutes: { type: 'number', description: 'Maximum walking minutes to this amenity' },
+            },
+            required: ['type', 'maxMinutes'],
+          },
+          description: 'Desired nearby amenities with maximum walking time',
+        },
+        workAddress: { type: 'string', description: 'Work/commute destination address for commute calculation' },
+        commuteMode: {
+          type: 'string',
+          enum: ['transit', 'driving', 'walking', 'bicycling'],
+          description: 'Commute transport mode (default: transit)',
+        },
+        maxResults: {
           type: 'number',
-          description: 'Number of results to return (default 5, max 10)',
+          description: 'Number of final results to show (default 5, max 10)',
+        },
+        contractPreference: {
+          type: 'string',
+          enum: ['najem_okazjonalny', 'any'],
+          description: 'Preferred contract type. "najem_okazjonalny" filters for that type only.',
         },
       },
       required: ['city'],
     },
   },
+
+  // ---- 2. find_items ----
   {
-    name: 'search_items',
+    name: 'find_items',
     description:
-      'Search for items (furniture, electronics, etc.) on OLX by keyword. Returns a numbered list of items with price, condition, and location.',
+      'Search for items (furniture, electronics, etc.) on OLX, analyze condition with AI, and send formatted item cards with photos directly to the user.',
     input_schema: {
-      type: 'object',
+      type: 'object' as const,
       properties: {
         query: { type: 'string', description: 'Search keywords (e.g. "biurko", "iphone 15", "sofa")' },
         city: { type: 'string', description: 'City name to filter by' },
         priceFrom: { type: 'number', description: 'Minimum price in PLN' },
         priceTo: { type: 'number', description: 'Maximum price in PLN' },
-        limit: { type: 'number', description: 'Number of results (default 5, max 10)' },
+        maxResults: { type: 'number', description: 'Number of results to show (default 5, max 10)' },
       },
       required: ['query'],
     },
   },
-  {
-    name: 'get_listing_details',
-    description:
-      'Get full details for a specific listing. Use listingRef (number from previous search results) or provide a direct URL. Returns description, all amenities, contact info, deposit, and more.',
-    input_schema: {
-      type: 'object',
-      properties: {
-        listingRef: {
-          type: 'number',
-          description: 'Number from the previous search results (1-based index)',
-        },
-        url: { type: 'string', description: 'Direct listing URL (otodom.pl or olx.pl)' },
-      },
-    },
-  },
-  {
-    name: 'get_phone_number',
-    description: 'Fetch the phone number for an OLX listing.',
-    input_schema: {
-      type: 'object',
-      properties: {
-        platformId: { type: 'string', description: 'OLX listing platform ID' },
-        platform: { type: 'string', enum: ['olx'], description: 'Platform (only OLX supports phone fetch)' },
-      },
-      required: ['platformId'],
-    },
-  },
+
+  // ---- 3. create_monitor ----
   {
     name: 'create_monitor',
     description:
       'Create a persistent monitor that periodically checks for new listings matching the criteria and sends notifications to the user.',
     input_schema: {
-      type: 'object',
+      type: 'object' as const,
       properties: {
         type: { type: 'string', enum: ['rental', 'item'], description: 'Monitor type' },
-        platforms: {
-          type: 'array',
-          items: { type: 'string', enum: ['olx', 'otodom'] },
-          description: 'Platforms to monitor',
-        },
+        // Rental search params
         city: { type: 'string', description: 'City name' },
-        district: { type: 'string', description: 'District' },
-        province: { type: 'string', description: 'Province' },
-        priceFrom: { type: 'number', description: 'Min price' },
-        priceTo: { type: 'number', description: 'Max price' },
-        roomsFrom: { type: 'number', description: 'Min rooms' },
-        roomsTo: { type: 'number', description: 'Max rooms' },
-        areaFrom: { type: 'number', description: 'Min area m²' },
-        areaTo: { type: 'number', description: 'Max area m²' },
-        ownerType: { type: 'string', enum: ['ALL', 'PRIVATE', 'AGENCY'] },
-        query: { type: 'string', description: 'Search keywords (for item monitors)' },
-        workAddress: { type: 'string', description: 'Work/commute destination address' },
-        commuteMode: { type: 'string', enum: ['transit', 'driving', 'walking', 'bicycling'] },
-        amenities: {
+        districts: {
           type: 'array',
           items: { type: 'string' },
-          description: 'Desired nearby amenities (metro, gym, supermarket, park, pool)',
+          description: 'District names',
         },
+        province: { type: 'string', description: 'Province' },
+        priceFrom: { type: 'number', description: 'Min price / budget' },
+        priceTo: { type: 'number', description: 'Max total monthly budget in PLN' },
+        roomsFrom: { type: 'number', description: 'Min rooms' },
+        roomsTo: { type: 'number', description: 'Max rooms' },
+        areaFrom: { type: 'number', description: 'Min area m2' },
+        areaTo: { type: 'number', description: 'Max area m2' },
+        ownerType: { type: 'string', enum: ['ALL', 'PRIVATE', 'AGENCY'] },
+        platforms: {
+          type: 'string',
+          enum: ['olx', 'otodom', 'all'],
+          description: 'Platforms to monitor (default "all")',
+        },
+        amenities: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              type: { type: 'string' },
+              maxMinutes: { type: 'number' },
+            },
+            required: ['type', 'maxMinutes'],
+          },
+          description: 'Desired nearby amenities',
+        },
+        workAddress: { type: 'string', description: 'Work/commute destination address' },
+        commuteMode: { type: 'string', enum: ['transit', 'driving', 'walking', 'bicycling'] },
+        contractPreference: { type: 'string', enum: ['najem_okazjonalny', 'any'] },
+        // Item search params
+        query: { type: 'string', description: 'Search keywords (for item monitors)' },
       },
       required: ['type'],
     },
   },
+
+  // ---- 4. update_monitor ----
   {
     name: 'update_monitor',
-    description: 'Update an existing monitor\'s configuration.',
+    description: 'Update an existing monitor\'s configuration. Merges the provided updates into the existing config.',
     input_schema: {
-      type: 'object',
+      type: 'object' as const,
       properties: {
         monitorId: { type: 'number', description: 'Monitor ID to update' },
         updates: {
           type: 'object',
-          description: 'Partial config updates to merge into the existing monitor config',
+          description: 'Partial config updates to merge (e.g. {priceTo: 4000, districts: ["mokotow"]})',
         },
       },
       required: ['monitorId', 'updates'],
     },
   },
+
+  // ---- 5. delete_monitor ----
   {
     name: 'delete_monitor',
     description: 'Deactivate/delete a monitor. It will stop checking for new listings.',
     input_schema: {
-      type: 'object',
+      type: 'object' as const,
       properties: {
         monitorId: { type: 'number', description: 'Monitor ID to deactivate' },
       },
       required: ['monitorId'],
     },
   },
+
+  // ---- 6. list_monitors ----
   {
     name: 'list_monitors',
     description: 'List all active monitors for the current user, showing their config and how many listings have been seen.',
     input_schema: {
-      type: 'object',
+      type: 'object' as const,
       properties: {},
-    },
-  },
-  {
-    name: 'check_location',
-    description:
-      'Check amenities near a location and/or calculate commute time. Can resolve a listing from the last search results by number, or use lat/lng directly.',
-    input_schema: {
-      type: 'object',
-      properties: {
-        lat: { type: 'number', description: 'Latitude' },
-        lng: { type: 'number', description: 'Longitude' },
-        listingRef: { type: 'number', description: 'Listing number from last search results (resolves lat/lng from context)' },
-        checkAmenities: {
-          type: 'array',
-          items: { type: 'string' },
-          description: 'Amenities to check for nearby (e.g. ["metro", "gym", "supermarket"])',
-        },
-        commuteToAddress: { type: 'string', description: 'Destination address for commute calculation' },
-        commuteMode: {
-          type: 'string',
-          enum: ['transit', 'driving', 'walking', 'bicycling'],
-          description: 'Commute transport mode (default: transit)',
-        },
-      },
-    },
-  },
-  {
-    name: 'send_listing_photos',
-    description: 'Send listing photos as a Telegram photo album to the user.',
-    input_schema: {
-      type: 'object',
-      properties: {
-        listingRef: { type: 'number', description: 'Listing number from last search results' },
-        urls: {
-          type: 'array',
-          items: { type: 'string' },
-          description: 'Direct photo URLs to send (if not using listingRef)',
-        },
-      },
     },
   },
 ];
 
 // ---------------------------------------------------------------------------
-// Listing condensers — produce concise summaries for Claude's context
+// 1. find_rentals -- THE BIG ONE
 // ---------------------------------------------------------------------------
 
-function condenseListing(listing: Listing, index: number): string {
-  const parts: string[] = [];
-  parts.push(`#${index + 1}: ${listing.title}`);
-  parts.push(`  Platform: ${listing.platform} | ID: ${listing.platformId}`);
-  parts.push(`  Price: ${listing.price} PLN/month`);
-  if (listing.rent != null) {
-    parts.push(`  Czynsz (admin fee): ${listing.rent} PLN`);
-    parts.push(`  Total monthly: ${listing.price + listing.rent} PLN`);
-  }
-  if (listing.deposit != null) parts.push(`  Kaucja (deposit): ${listing.deposit} PLN`);
-  if (listing.area != null) parts.push(`  Area: ${listing.area} m²`);
-  if (listing.rooms != null) parts.push(`  Rooms: ${listing.rooms}`);
-  if (listing.floor != null) parts.push(`  Floor: ${listing.floor}`);
-  if (listing.buildingType) parts.push(`  Building: ${listing.buildingType}`);
-  if (listing.district) parts.push(`  District: ${listing.district}`);
-  parts.push(`  City: ${listing.city}`);
-  if (listing.advertiserType) parts.push(`  Owner: ${listing.advertiserType}${listing.agencyName ? ` (${listing.agencyName})` : ''}`);
-  if (listing.phone) parts.push(`  Phone: ${listing.phone}`);
-  parts.push(`  URL: ${listing.url}`);
-  if (listing.photos.length > 0) parts.push(`  Photos: ${listing.photos.length} available`);
-  return parts.join('\n');
+interface RejectionReason {
+  url: string;
+  title: string;
+  reason: string;
 }
 
-function condenseItem(item: ItemListing, index: number): string {
-  const parts: string[] = [];
-  parts.push(`#${index + 1}: ${item.title}`);
-  parts.push(`  Platform: olx | ID: ${item.platformId}`);
-  parts.push(`  Price: ${item.price} ${item.currency}${item.negotiable ? ' (negotiable)' : ''}`);
-  if (item.condition) parts.push(`  Condition: ${item.condition}`);
-  if (item.district) parts.push(`  District: ${item.district}`);
-  parts.push(`  City: ${item.city}`);
-  if (item.phone) parts.push(`  Phone: ${item.phone}`);
-  parts.push(`  URL: ${item.url}`);
-  if (item.photos.length > 0) parts.push(`  Photos: ${item.photos.length} available`);
-  return parts.join('\n');
-}
-
-function condenseDetailListing(listing: Listing): string {
-  const parts: string[] = [];
-  parts.push(`Title: ${listing.title}`);
-  parts.push(`Platform: ${listing.platform} | ID: ${listing.platformId}`);
-  parts.push(`URL: ${listing.url}`);
-  parts.push(`Price: ${listing.price} PLN/month`);
-  if (listing.rent != null) {
-    parts.push(`Czynsz (admin fee): ${listing.rent} PLN`);
-    parts.push(`Total monthly cost: ${listing.price + listing.rent} PLN`);
-  }
-  if (listing.deposit != null) parts.push(`Kaucja (deposit): ${listing.deposit} PLN`);
-  if (listing.area != null) parts.push(`Area: ${listing.area} m²`);
-  if (listing.rooms != null) parts.push(`Rooms: ${listing.rooms}`);
-  if (listing.floor != null) parts.push(`Floor: ${listing.floor}${listing.buildingFloor ? ` / ${listing.buildingFloor}` : ''}`);
-  if (listing.buildingType) parts.push(`Building type: ${listing.buildingType}`);
-  if (listing.heating) parts.push(`Heating: ${listing.heating}`);
-  if (listing.furniture != null) parts.push(`Furnished: ${listing.furniture ? 'yes' : 'no'}`);
-  if (listing.parking) parts.push(`Parking: ${listing.parking}`);
-  parts.push(`City: ${listing.city}`);
-  if (listing.district) parts.push(`District: ${listing.district}`);
-  if (listing.street) parts.push(`Street: ${listing.street}`);
-  if (listing.lat != null && listing.lng != null) parts.push(`Coordinates: ${listing.lat}, ${listing.lng}`);
-  if (listing.advertiserType) parts.push(`Owner: ${listing.advertiserType}${listing.agencyName ? ` (${listing.agencyName})` : ''}`);
-  if (listing.contactName) parts.push(`Contact: ${listing.contactName}`);
-  if (listing.phone) parts.push(`Phone: ${listing.phone}`);
-  parts.push(`Photos: ${listing.photos.length} available`);
-  if (listing.description) {
-    const desc = listing.description.length > 1000
-      ? listing.description.slice(0, 1000) + '...'
-      : listing.description;
-    parts.push(`\nDescription:\n${desc}`);
-  }
-  return parts.join('\n');
-}
-
-// ---------------------------------------------------------------------------
-// Resolve a listingRef (1-based) from context
-// ---------------------------------------------------------------------------
-
-function resolveListingRef(
-  ref: number,
-  ctx: UserContext,
-): Listing | ItemListing | null {
-  if (ref < 1 || ref > ctx.lastSearchResults.length) return null;
-  return ctx.lastSearchResults[ref - 1];
-}
-
-function isRentalListing(item: Listing | ItemListing): item is Listing {
-  return 'slug' in item;
-}
-
-// ---------------------------------------------------------------------------
-// Tool executors
-// ---------------------------------------------------------------------------
-
-type SendPhotosFn = (chatId: number, urls: string[]) => Promise<void>;
-
-async function execSearchRentals(
+async function execFindRentals(
   input: Record<string, unknown>,
   ctx: UserContext,
+  sendFn: SendFn,
+  sendPhotosFn: SendPhotosFn,
 ): Promise<string> {
   const city = String(input.city ?? '').toLowerCase().trim();
-  const platforms = (input.platforms as string[] | undefined) ?? ['olx'];
-  const district = input.district ? String(input.district).toLowerCase().trim() : undefined;
+  const districts = (input.districts as string[] | undefined) ?? [];
   const province = input.province
     ? String(input.province).toLowerCase().trim()
     : CITY_PROVINCE_MAP[city];
@@ -384,44 +292,60 @@ async function execSearchRentals(
   const areaFrom = input.areaFrom as number | undefined;
   const areaTo = input.areaTo as number | undefined;
   const ownerType = input.ownerType as string | undefined;
-  const limit = Math.min(Math.max((input.limit as number) || 5, 1), 10);
+  const platformsInput = (input.platforms as string | undefined) ?? 'all';
+  const amenities = (input.amenities as Array<{ type: string; maxMinutes: number }> | undefined) ?? [];
+  const workAddress = input.workAddress as string | undefined;
+  const commuteMode = (input.commuteMode as string | undefined) ?? 'transit';
+  const maxResults = Math.min(Math.max((input.maxResults as number) || 5, 1), 10);
+  const contractPreference = input.contractPreference as string | undefined;
 
-  const allListings: Listing[] = [];
+  const doOlx = platformsInput === 'olx' || platformsInput === 'all';
+  const doOtodom = platformsInput === 'otodom' || platformsInput === 'all';
 
-  // OLX search
-  if (platforms.includes('olx')) {
+  // ---- Step A: Search OLX + Otodom in parallel ----
+  const searchPromises: Promise<Listing[]>[] = [];
+
+  if (doOlx) {
     const cityId = resolveCityId(city);
-    const result = await searchOlx({
-      categoryId: OLX_CATEGORIES.MIESZKANIA_WYNAJEM,
-      cityId,
-      priceFrom,
-      priceTo,
-      limit: limit * 2, // fetch extra, we'll trim later
-    });
-    allListings.push(...result.listings);
+    searchPromises.push(
+      searchOlx({
+        categoryId: OLX_CATEGORIES.MIESZKANIA_WYNAJEM,
+        cityId,
+        priceFrom,
+        priceTo,
+        limit: 30,
+      }).then((r) => r.listings),
+    );
   }
 
-  // Otodom search
-  if (platforms.includes('otodom')) {
-    const result = await searchOtodom({
-      type: 'wynajem',
-      estate: 'mieszkanie',
-      province,
-      city: city || undefined,
-      district,
-      priceFrom,
-      priceTo,
-      areaFrom,
-      areaTo,
-      roomsFrom,
-      roomsTo,
-      ownerType: (ownerType as 'ALL' | 'PRIVATE' | 'AGENCY') ?? undefined,
-      limit: limit * 2,
-    });
-    allListings.push(...result.listings);
+  if (doOtodom) {
+    // If districts are specified, search each district. Otherwise search the city.
+    const districtList = districts.length > 0 ? districts : [undefined];
+    for (const district of districtList) {
+      searchPromises.push(
+        searchOtodom({
+          type: 'wynajem',
+          estate: 'mieszkanie',
+          province,
+          city: city || undefined,
+          district: district?.toLowerCase().trim(),
+          priceFrom,
+          priceTo,
+          areaFrom,
+          areaTo,
+          roomsFrom,
+          roomsTo,
+          ownerType: (ownerType as 'ALL' | 'PRIVATE' | 'AGENCY') ?? undefined,
+          limit: 36,
+        }).then((r) => r.listings),
+      );
+    }
   }
 
-  // Filter by rooms if OLX (OLX doesn't support rooms filter in API params well)
+  const searchResults = await Promise.all(searchPromises);
+  const allListings = searchResults.flat();
+
+  // ---- Filter by rooms/area (for OLX which doesn't filter well) ----
   let filtered = allListings;
   if (roomsFrom != null) {
     filtered = filtered.filter((l) => l.rooms == null || l.rooms >= roomsFrom);
@@ -436,6 +360,15 @@ async function execSearchRentals(
     filtered = filtered.filter((l) => l.area == null || l.area <= areaTo);
   }
 
+  // Filter by district if specified and not already filtered via Otodom URL
+  if (districts.length > 0) {
+    const districtSet = new Set(districts.map((d) => d.toLowerCase().trim()));
+    filtered = filtered.filter((l) => {
+      if (!l.district) return true; // keep listings without district info
+      return districtSet.has(l.district.toLowerCase().trim());
+    });
+  }
+
   // Deduplicate by platformId + platform
   const seen = new Set<string>();
   const deduped: Listing[] = [];
@@ -447,133 +380,290 @@ async function execSearchRentals(
     }
   }
 
-  const results = deduped.slice(0, limit);
-  ctx.lastSearchResults = results;
+  // Sort by price ascending
+  deduped.sort((a, b) => a.price - b.price);
 
-  if (results.length === 0) {
-    return 'No rental listings found matching your criteria. Try broadening the search (higher price, fewer rooms, different district, or add more platforms).';
+  if (deduped.length === 0) {
+    return 'No rental listings found matching your criteria. Try broadening the search (higher budget, fewer rooms, different district, or add more platforms).';
   }
 
-  const summaries = results.map((l, i) => condenseListing(l, i));
-  return `Found ${deduped.length} listings (showing ${results.length}):\n\n${summaries.join('\n\n')}`;
+  // ---- Step B: Send progress message ----
+  const candidateCount = Math.min(deduped.length, 15);
+  await sendFn(
+    ctx.chatId,
+    `Found ${deduped.length} listings. Analyzing top ${candidateCount}...`,
+  );
+
+  // ---- Step C: Analyze top candidates ----
+  const candidates = deduped.slice(0, 15);
+  const accepted: Array<{
+    listing: Listing;
+    parsedData: ParsedRentalData | null;
+    locationScore: LocationScore | null;
+  }> = [];
+  const rejected: RejectionReason[] = [];
+
+  // Store all candidates in context for later reference
+  ctx.lastSearchResults = candidates;
+
+  for (let i = 0; i < candidates.length; i++) {
+    const listing = candidates[i];
+
+    // Send progress update every 3-4 listings
+    if (i > 0 && i % 3 === 0) {
+      await sendFn(
+        ctx.chatId,
+        `Analyzing listing ${i + 1}/${candidateCount}...`,
+      );
+    }
+
+    // Stop if we have enough accepted results
+    if (accepted.length >= maxResults) break;
+
+    try {
+      // Fetch detail page for richer data
+      let enrichedListing = listing;
+      if (listing.platform === 'otodom') {
+        const detail = await fetchOtodomDetail(listing.url);
+        if (detail) {
+          enrichedListing = detail;
+        }
+      } else if (listing.platform === 'olx' && !listing.phone) {
+        const phone = await fetchOlxPhone(listing.platformId);
+        if (phone) enrichedListing = { ...listing, phone };
+      }
+
+      // AI extraction
+      let parsedData: ParsedRentalData | null = null;
+      if (enrichedListing.description) {
+        try {
+          parsedData = await parseRentalListing(enrichedListing);
+        } catch (parseErr) {
+          console.error(`[find_rentals] Parse error for ${enrichedListing.url}:`, parseErr);
+        }
+      }
+
+      // Budget filter: check if estimated total exceeds budget
+      if (priceTo != null && parsedData?.totalMonthlyCost != null) {
+        if (parsedData.totalMonthlyCost > priceTo) {
+          rejected.push({
+            url: enrichedListing.url,
+            title: enrichedListing.title,
+            reason: `estimated total ${parsedData.totalMonthlyCost} PLN exceeds budget ${priceTo} PLN`,
+          });
+          continue;
+        }
+      }
+
+      // Contract preference filter
+      if (
+        contractPreference === 'najem_okazjonalny' &&
+        parsedData?.contractType != null &&
+        parsedData.contractType !== 'najem_okazjonalny'
+      ) {
+        rejected.push({
+          url: enrichedListing.url,
+          title: enrichedListing.title,
+          reason: `contract type "${parsedData.contractType}" does not match preference "najem_okazjonalny"`,
+        });
+        continue;
+      }
+
+      // Location scoring (if coordinates available AND amenities requested)
+      let locationScore: LocationScore | null = null;
+      const hasCoords = enrichedListing.lat != null && enrichedListing.lng != null;
+      const wantLocation = amenities.length > 0 || workAddress;
+
+      if (hasCoords && wantLocation) {
+        try {
+          const amenityPrefs: AmenityPreference[] = amenities.map((a) => ({
+            type: a.type,
+            maxMinutes: a.maxMinutes,
+          }));
+
+          locationScore = await scoreLocation(
+            enrichedListing.lat!,
+            enrichedListing.lng!,
+            amenityPrefs,
+            workAddress,
+            commuteMode,
+          );
+
+          // Filter: reject if any amenity is outside the limit
+          if (amenities.length > 0) {
+            const failedAmenity = locationScore.amenities.find((a) => !a.withinLimit);
+            if (failedAmenity) {
+              rejected.push({
+                url: enrichedListing.url,
+                title: enrichedListing.title,
+                reason: `${failedAmenity.type} is ${failedAmenity.nearest ? failedAmenity.nearest.walkingMinutes + ' min away' : 'not found nearby'} (limit: ${amenities.find((a) => a.type === failedAmenity.type)?.maxMinutes ?? '?'} min)`,
+              });
+              continue;
+            }
+          }
+        } catch (locErr) {
+          console.error(`[find_rentals] Location scoring error for ${enrichedListing.url}:`, locErr);
+          // Don't reject, just skip location data
+        }
+      }
+
+      accepted.push({
+        listing: enrichedListing,
+        parsedData,
+        locationScore,
+      });
+    } catch (err) {
+      console.error(`[find_rentals] Error processing ${listing.url}:`, err);
+      rejected.push({
+        url: listing.url,
+        title: listing.title,
+        reason: `processing error: ${err instanceof Error ? err.message : String(err)}`,
+      });
+    }
+  }
+
+  // ---- Step D: Send results to user ----
+  if (accepted.length === 0) {
+    const rejectionSummary = rejected.length > 0
+      ? `\nRejection reasons:\n${rejected.map((r) => `- ${r.title}: ${r.reason}`).join('\n')}`
+      : '';
+    return `Analyzed ${candidateCount} listings but none passed the filters.${rejectionSummary}\nTry increasing the budget, relaxing amenity requirements, or broadening the search area.`;
+  }
+
+  for (let i = 0; i < accepted.length; i++) {
+    const { listing, parsedData, locationScore } = accepted[i];
+
+    // Send photos first (if available)
+    if (listing.photos.length > 0) {
+      try {
+        await sendPhotosFn(ctx.chatId, listing.photos.slice(0, 10));
+      } catch (photoErr) {
+        console.error(`[find_rentals] Photo send error for ${listing.url}:`, photoErr);
+      }
+    }
+
+    // Send the rich card
+    const card = formatRichRentalNotification(
+      listing,
+      parsedData ?? undefined,
+      locationScore ?? undefined,
+    );
+    await sendFn(ctx.chatId, card);
+  }
+
+  // Update context with the accepted listings for later reference
+  ctx.lastSearchResults = accepted.map((a) => a.listing);
+  if (accepted.length > 0) {
+    ctx.lastDetailListing = accepted[0].listing;
+  }
+
+  // ---- Step E: Return summary to Claude ----
+  const rejectionBreakdown = rejected.length > 0
+    ? `\nRejected ${rejected.length}: ${rejected.map((r) => r.reason).join('; ')}`
+    : '';
+
+  return `Showed ${accepted.length} listing(s) to the user with photos and rich cards. Analyzed ${candidateCount} candidates total.${rejectionBreakdown}`;
 }
 
-async function execSearchItems(
+// ---------------------------------------------------------------------------
+// 2. find_items
+// ---------------------------------------------------------------------------
+
+async function execFindItems(
   input: Record<string, unknown>,
   ctx: UserContext,
+  sendFn: SendFn,
+  sendPhotosFn: SendPhotosFn,
 ): Promise<string> {
   const query = String(input.query ?? '');
   const city = input.city ? String(input.city).toLowerCase().trim() : undefined;
   const cityId = city ? resolveCityId(city) : undefined;
   const priceFrom = input.priceFrom as number | undefined;
   const priceTo = input.priceTo as number | undefined;
-  const limit = Math.min(Math.max((input.limit as number) || 5, 1), 10);
+  const maxResults = Math.min(Math.max((input.maxResults as number) || 5, 1), 10);
 
   const result = await searchItems({
     query,
     cityId,
     priceFrom,
     priceTo,
-    limit: limit * 2,
+    limit: 30,
   });
 
-  const items = result.items.slice(0, limit);
-  // Store as generic results for reference
-  ctx.lastSearchResults = items;
-
-  if (items.length === 0) {
+  if (result.items.length === 0) {
     return 'No items found matching your search. Try different keywords or remove the city filter.';
   }
 
-  const summaries = items.map((item, i) => condenseItem(item, i));
-  return `Found ${result.totalAvailable} items (showing ${items.length}):\n\n${summaries.join('\n\n')}`;
-}
+  const candidates = result.items.slice(0, maxResults * 2); // get extra for potential filtering
+  ctx.lastSearchResults = candidates;
 
-async function execGetListingDetails(
-  input: Record<string, unknown>,
-  ctx: UserContext,
-): Promise<string> {
-  const listingRef = input.listingRef as number | undefined;
-  const url = input.url as string | undefined;
+  await sendFn(ctx.chatId, `Found ${result.totalAvailable} items. Analyzing top ${Math.min(candidates.length, maxResults)}...`);
 
-  let listing: Listing | ItemListing | null = null;
+  const shown: ItemListing[] = [];
 
-  if (listingRef != null) {
-    listing = resolveListingRef(listingRef, ctx);
-    if (!listing) {
-      return `Listing #${listingRef} not found. I only have ${ctx.lastSearchResults.length} results from the last search.`;
+  for (let i = 0; i < candidates.length && shown.length < maxResults; i++) {
+    const item = candidates[i];
+
+    // AI condition analysis
+    let parsedData = null;
+    if (item.description) {
+      try {
+        parsedData = await parseItemListing(item);
+      } catch (parseErr) {
+        console.error(`[find_items] Parse error for ${item.url}:`, parseErr);
+      }
     }
-  }
 
-  // If we have a URL (direct or resolved from listing), fetch full details
-  const targetUrl = url ?? (listing ? listing.url : null);
-
-  if (!targetUrl) {
-    return 'Please provide either a listingRef (number from search results) or a direct URL.';
-  }
-
-  // For Otodom listings, fetch full detail page
-  if (targetUrl.includes('otodom.pl')) {
-    const detail = await fetchOtodomDetail(targetUrl);
-    if (!detail) {
-      return 'Could not fetch details for this Otodom listing. The listing may have been removed.';
-    }
-    ctx.lastDetailListing = detail;
-    return condenseDetailListing(detail);
-  }
-
-  // For OLX listings, we already have most data; try to enrich with phone
-  if (listing && isRentalListing(listing)) {
-    if (!listing.phone) {
-      const phone = await fetchOlxPhone(listing.platformId);
-      if (phone) listing.phone = phone;
-    }
-    ctx.lastDetailListing = listing;
-    return condenseDetailListing(listing);
-  }
-
-  // If it's an OLX item listing, return what we have
-  if (listing && !isRentalListing(listing)) {
-    const item = listing as ItemListing;
+    // Fetch phone if not available
     if (!item.phone) {
-      const phone = await fetchOlxPhone(item.platformId);
-      if (phone) item.phone = phone;
+      try {
+        const phone = await fetchItemPhone(item.platformId);
+        if (phone) item.phone = phone;
+      } catch {
+        // ignore phone fetch errors
+      }
     }
-    return condenseItem(item, 0);
+
+    // Send photos
+    if (item.photos.length > 0) {
+      try {
+        await sendPhotosFn(ctx.chatId, item.photos.slice(0, 10));
+      } catch (photoErr) {
+        console.error(`[find_items] Photo send error for ${item.url}:`, photoErr);
+      }
+    }
+
+    // Send the rich card
+    const card = formatRichItemNotification(item, parsedData ?? undefined);
+    await sendFn(ctx.chatId, card);
+
+    shown.push(item);
   }
 
-  // URL provided but no listing in context — try fetching as Otodom
-  if (targetUrl.includes('olx.pl')) {
-    return 'For OLX listings, please search first and then reference by number. OLX does not have a public detail API.';
-  }
+  ctx.lastSearchResults = shown;
 
-  return 'Could not determine how to fetch details for this listing.';
+  return `Showed ${shown.length} item(s) to the user with photos and condition analysis. Total available: ${result.totalAvailable}.`;
 }
 
-async function execGetPhoneNumber(
-  input: Record<string, unknown>,
-): Promise<string> {
-  const platformId = String(input.platformId ?? '');
-  if (!platformId) return 'platformId is required.';
-
-  const phone = await fetchOlxPhone(platformId);
-  return phone ? `Phone number: ${phone}` : 'Phone number not available for this listing.';
-}
+// ---------------------------------------------------------------------------
+// 3. create_monitor
+// ---------------------------------------------------------------------------
 
 async function execCreateMonitor(
   input: Record<string, unknown>,
   ctx: UserContext,
 ): Promise<string> {
   const type = String(input.type ?? 'rental') as 'rental' | 'item';
-  const platforms = (input.platforms as string[] | undefined) ?? ['olx'];
-  const platform = platforms.length === 1 ? platforms[0] : 'all';
+  const platformsInput = (input.platforms as string | undefined) ?? 'all';
+  const platform = platformsInput === 'all' ? 'all' : platformsInput;
 
   // Build config from input, omitting undefined values
   const config: Record<string, unknown> = {};
   const configKeys = [
-    'city', 'district', 'province', 'priceFrom', 'priceTo',
+    'city', 'districts', 'province', 'priceFrom', 'priceTo',
     'roomsFrom', 'roomsTo', 'areaFrom', 'areaTo', 'ownerType',
     'query', 'workAddress', 'commuteMode', 'amenities',
+    'contractPreference', 'platforms',
   ];
   for (const key of configKeys) {
     if (input[key] !== undefined && input[key] !== null) {
@@ -596,14 +686,24 @@ async function execCreateMonitor(
 
   const details: string[] = [`Monitor created! ID: ${monitorId}`];
   details.push(`Type: ${type}`);
-  details.push(`Platforms: ${platforms.join(', ')}`);
+  details.push(`Platform: ${platform}`);
   for (const [k, v] of Object.entries(config)) {
-    if (v != null) details.push(`${k}: ${Array.isArray(v) ? v.join(', ') : v}`);
+    if (v != null) {
+      if (Array.isArray(v)) {
+        details.push(`${k}: ${JSON.stringify(v)}`);
+      } else {
+        details.push(`${k}: ${v}`);
+      }
+    }
   }
   details.push('\nI will notify you when new matching listings appear.');
 
   return details.join('\n');
 }
+
+// ---------------------------------------------------------------------------
+// 4. update_monitor
+// ---------------------------------------------------------------------------
 
 async function execUpdateMonitor(
   input: Record<string, unknown>,
@@ -619,18 +719,17 @@ async function execUpdateMonitor(
   if (!monitor.active) return `Monitor #${monitorId} is inactive. Create a new one instead.`;
 
   // Merge updates into existing config
-  const existingConfig = JSON.parse(monitor.config);
+  const existingConfig = JSON.parse(monitor.config) as Record<string, unknown>;
   const newConfig = { ...existingConfig, ...updates };
 
-  // Update in DB
-  const db = getDb();
-  db.prepare('UPDATE monitors SET config = ? WHERE id = ?').run(
-    JSON.stringify(newConfig),
-    monitorId,
-  );
+  updateMonitorConfig(monitorId, newConfig);
 
   return `Monitor #${monitorId} updated.\nNew config: ${JSON.stringify(newConfig, null, 2)}`;
 }
+
+// ---------------------------------------------------------------------------
+// 5. delete_monitor
+// ---------------------------------------------------------------------------
 
 async function execDeleteMonitor(
   input: Record<string, unknown>,
@@ -645,6 +744,10 @@ async function execDeleteMonitor(
   return `Monitor #${monitorId} has been deactivated. You will no longer receive notifications for it.`;
 }
 
+// ---------------------------------------------------------------------------
+// 6. list_monitors
+// ---------------------------------------------------------------------------
+
 async function execListMonitors(
   ctx: UserContext,
 ): Promise<string> {
@@ -657,108 +760,29 @@ async function execListMonitors(
   const lines: string[] = [`You have ${monitors.length} active monitor(s):\n`];
 
   for (const m of monitors) {
-    const seen = getSeenCount(m.id);
-    const config = JSON.parse(m.config);
+    const seenCount = getSeenCount(m.id);
+    const config = JSON.parse(m.config) as Record<string, unknown>;
     const parts: string[] = [];
 
     parts.push(`Monitor #${m.id} (${m.type}, ${m.platform})`);
     if (config.city) parts.push(`  City: ${config.city}`);
-    if (config.district) parts.push(`  District: ${config.district}`);
+    if (config.districts) parts.push(`  Districts: ${(config.districts as string[]).join(', ')}`);
     if (config.query) parts.push(`  Query: "${config.query}"`);
-    if (config.priceTo) parts.push(`  Max price: ${config.priceTo} PLN`);
+    if (config.priceTo) parts.push(`  Max budget: ${config.priceTo} PLN`);
     if (config.roomsFrom) parts.push(`  Rooms: ${config.roomsFrom}${config.roomsTo ? `-${config.roomsTo}` : '+'}`);
-    parts.push(`  Listings seen: ${seen}`);
+    if (config.amenities) {
+      const amens = config.amenities as Array<{ type: string; maxMinutes: number }>;
+      parts.push(`  Amenities: ${amens.map((a) => `${a.type} (${a.maxMinutes}min)`).join(', ')}`);
+    }
+    if (config.workAddress) parts.push(`  Commute to: ${config.workAddress}`);
+    if (config.contractPreference) parts.push(`  Contract: ${config.contractPreference}`);
+    parts.push(`  Listings seen: ${seenCount}`);
     parts.push(`  Created: ${m.created_at}`);
 
     lines.push(parts.join('\n'));
   }
 
   return lines.join('\n\n');
-}
-
-async function execCheckLocation(
-  input: Record<string, unknown>,
-  ctx: UserContext,
-): Promise<string> {
-  let lat = input.lat as number | undefined;
-  let lng = input.lng as number | undefined;
-
-  // Resolve from listing ref if provided
-  if (input.listingRef != null) {
-    const listing = resolveListingRef(input.listingRef as number, ctx);
-    if (!listing) {
-      return `Listing #${input.listingRef} not found in the last search results.`;
-    }
-    if (isRentalListing(listing)) {
-      lat = listing.lat ?? undefined;
-      lng = listing.lng ?? undefined;
-    }
-    if (lat == null || lng == null) {
-      return 'This listing does not have coordinates. Try fetching full details first with get_listing_details, or provide lat/lng manually.';
-    }
-  }
-
-  if (lat == null || lng == null) {
-    return 'Please provide lat/lng coordinates or a listingRef that has coordinates.';
-  }
-
-  // TODO: Implement Google Maps API calls in maps.ts
-  // For now, return a stub acknowledging the request
-  const checkAmenities = (input.checkAmenities as string[] | undefined) ?? [];
-  const commuteToAddress = input.commuteToAddress as string | undefined;
-  const commuteMode = input.commuteMode as string | undefined ?? 'transit';
-
-  const parts: string[] = [];
-  parts.push(`Location: ${lat}, ${lng}`);
-
-  if (checkAmenities.length > 0) {
-    parts.push(`\nAmenity check requested for: ${checkAmenities.join(', ')}`);
-    parts.push('(Location checking will be available once Google Maps integration is complete. For now, you can check the location on Google Maps directly.)');
-  }
-
-  if (commuteToAddress) {
-    parts.push(`\nCommute check requested: to "${commuteToAddress}" by ${commuteMode}`);
-    parts.push('(Commute calculation will be available once Google Maps integration is complete.)');
-  }
-
-  parts.push(`\nGoogle Maps link: https://www.google.com/maps?q=${lat},${lng}`);
-
-  return parts.join('\n');
-}
-
-async function execSendListingPhotos(
-  input: Record<string, unknown>,
-  ctx: UserContext,
-  sendPhotosFn: SendPhotosFn | null,
-): Promise<string> {
-  let urls = input.urls as string[] | undefined;
-
-  // Resolve from listing ref
-  if (input.listingRef != null && !urls) {
-    const listing = resolveListingRef(input.listingRef as number, ctx);
-    if (!listing) {
-      return `Listing #${input.listingRef} not found in the last search results.`;
-    }
-    urls = listing.photos;
-  }
-
-  if (!urls || urls.length === 0) {
-    return 'No photos available for this listing.';
-  }
-
-  // Limit to 10 photos (Telegram album limit)
-  const toSend = urls.slice(0, 10);
-
-  if (sendPhotosFn) {
-    try {
-      await sendPhotosFn(ctx.chatId, toSend);
-      return `${toSend.length} photo(s) sent to the chat.`;
-    } catch (err) {
-      return `Failed to send photos: ${err instanceof Error ? err.message : String(err)}`;
-    }
-  }
-
-  return `${toSend.length} photo URLs available but photo sending is not configured.`;
 }
 
 // ---------------------------------------------------------------------------
@@ -771,18 +795,15 @@ export async function executeTool(
   userId: number,
   chatId: number,
   context: UserContext,
-  sendPhotosFn: SendPhotosFn | null = null,
+  sendFn: (chatId: number, text: string) => Promise<void>,
+  sendPhotosFn: (chatId: number, urls: string[]) => Promise<void>,
 ): Promise<string> {
   try {
     switch (name) {
-      case 'search_rentals':
-        return await execSearchRentals(input, context);
-      case 'search_items':
-        return await execSearchItems(input, context);
-      case 'get_listing_details':
-        return await execGetListingDetails(input, context);
-      case 'get_phone_number':
-        return await execGetPhoneNumber(input);
+      case 'find_rentals':
+        return await execFindRentals(input, context, sendFn, sendPhotosFn);
+      case 'find_items':
+        return await execFindItems(input, context, sendFn, sendPhotosFn);
       case 'create_monitor':
         return await execCreateMonitor(input, context);
       case 'update_monitor':
@@ -791,10 +812,6 @@ export async function executeTool(
         return await execDeleteMonitor(input);
       case 'list_monitors':
         return await execListMonitors(context);
-      case 'check_location':
-        return await execCheckLocation(input, context);
-      case 'send_listing_photos':
-        return await execSendListingPhotos(input, context, sendPhotosFn);
       default:
         return `Unknown tool: ${name}`;
     }

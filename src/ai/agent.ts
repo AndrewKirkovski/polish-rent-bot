@@ -4,7 +4,6 @@ import Anthropic from '@anthropic-ai/sdk';
 import type { MessageParam, ContentBlockParam, ToolResultBlockParam } from '@anthropic-ai/sdk/resources/messages.js';
 import { SYSTEM_PROMPT } from './prompts.js';
 import { TOOL_DEFINITIONS, executeTool, getOrCreateContext } from './tools.js';
-import type { UserContext } from './tools.js';
 import { getDb } from '../storage/db.js';
 
 // ---------------------------------------------------------------------------
@@ -73,19 +72,12 @@ function getConversationHistory(userId: number, limit = 20): MessageParam[] {
 
 function startTypingIndicator(
   chatId: number,
-  sendFn: (chatId: number, text: string, opts?: Record<string, unknown>) => Promise<void>,
+  typingFn: (chatId: number) => Promise<void>,
 ): () => void {
-  // Send initial typing action
-  // node-telegram-bot-api uses sendChatAction but we only have sendMessage here.
-  // The caller should pass a function that can send chat actions.
-  // For now, we'll use the interval pattern — the caller wraps sendChatAction.
-
+  typingFn(chatId).catch(() => {});
   const interval = setInterval(() => {
-    // This is a best-effort typing indicator refresh.
-    // Errors are silently ignored — typing indicators are not critical.
-    sendFn(chatId, '', { _action: 'typing' }).catch(() => {});
+    typingFn(chatId).catch(() => {});
   }, 4000);
-
   return () => clearInterval(interval);
 }
 
@@ -99,6 +91,7 @@ export async function handleUserMessage(
   text: string,
   sendFn: (chatId: number, text: string, opts?: Record<string, unknown>) => Promise<void>,
   sendPhotosFn: (chatId: number, urls: string[]) => Promise<void>,
+  typingFn?: (chatId: number) => Promise<void>,
 ): Promise<void> {
   try {
     // 1. Get or create user context
@@ -117,7 +110,8 @@ export async function handleUserMessage(
     saveConversationTurn(userId, 'user', text);
 
     // 5. Start typing indicator
-    const stopTyping = startTypingIndicator(chatId, sendFn);
+    const noopTyping = async () => {};
+    const stopTyping = startTypingIndicator(chatId, typingFn ?? noopTyping);
 
     try {
       // 6. Call Claude with system prompt, tools, and messages
@@ -141,7 +135,8 @@ export async function handleUserMessage(
 
         if (toolUseBlocks.length === 0) break;
 
-        // Execute each tool and collect results
+        // Execute each tool and collect results — pass sendFn and sendPhotosFn
+        // so tools can send progress messages and photo albums directly
         const toolResults: ToolResultBlockParam[] = [];
         for (const toolUse of toolUseBlocks) {
           const result = await executeTool(
@@ -150,6 +145,7 @@ export async function handleUserMessage(
             userId,
             chatId,
             context,
+            sendFn,
             sendPhotosFn,
           );
 
@@ -195,7 +191,7 @@ export async function handleUserMessage(
       // 9. Save assistant response to DB
       saveConversationTurn(userId, 'assistant', finalText);
 
-      // 10. Send response to user
+      // 10. Send response to user — plain text, no parse_mode
       await sendFn(chatId, finalText);
     } finally {
       // Always stop typing indicator
