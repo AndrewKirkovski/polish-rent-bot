@@ -4,14 +4,9 @@
 import { chromium } from 'playwright-extra';
 import stealthPlugin from 'puppeteer-extra-plugin-stealth';
 import type { BrowserContext, Page } from 'playwright';
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
 import type { Listing, CrawlResult } from '../types.js';
 
 chromium.use(stealthPlugin());
-
-const SESSION_DIR = '.local/sessions';
-const SESSION_FILE = `${SESSION_DIR}/otodom-session.json`;
-mkdirSync(SESSION_DIR, { recursive: true });
 
 const CONTEXT_OPTIONS = {
   userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
@@ -86,39 +81,23 @@ export function buildOtodomUrl(params: OtodomSearchParams): string {
   return `${parts.join('/')}?${qs.toString()}`;
 }
 
-// --- Browser Management ---
+// --- Browser Management (singleton browser + singleton context) ---
 
 let _browser: Awaited<ReturnType<typeof chromium.launch>> | null = null;
+let _context: BrowserContext | null = null;
 
-async function getBrowser() {
+async function getContext(): Promise<BrowserContext> {
   if (!_browser || !_browser.isConnected()) {
     _browser = await chromium.launch({
       headless: true,
       args: ['--disable-blink-features=AutomationControlled'],
     });
+    _context = null; // reset context when browser restarts
   }
-  return _browser;
-}
-
-async function getContext(): Promise<BrowserContext> {
-  const browser = await getBrowser();
-
-  // Restore session if exists
-  if (existsSync(SESSION_FILE)) {
-    try {
-      const state = JSON.parse(readFileSync(SESSION_FILE, { encoding: 'utf-8' }));
-      return await browser.newContext({ ...CONTEXT_OPTIONS, storageState: state });
-    } catch {
-      // corrupted session, start fresh
-    }
+  if (!_context) {
+    _context = await _browser.newContext(CONTEXT_OPTIONS);
   }
-
-  return await browser.newContext(CONTEXT_OPTIONS);
-}
-
-async function saveSession(context: BrowserContext): Promise<void> {
-  const state = await context.storageState();
-  writeFileSync(SESSION_FILE, JSON.stringify(state), { encoding: 'utf-8' });
+  return _context;
 }
 
 // --- Cookie Consent ---
@@ -270,8 +249,6 @@ export async function searchOtodom(params: OtodomSearchParams): Promise<CrawlRes
       return { platform: 'otodom', listings: [], totalAvailable: 0, page: 0, hasNextPage: false, nextPageUrl: null };
     }
 
-    await saveSession(context);
-
     const pageProps = nextData.props?.pageProps;
     const tracking = pageProps?.tracking?.listing;
     const items = pageProps?.data?.searchAds?.items ?? [];
@@ -310,7 +287,6 @@ export async function fetchOtodomDetail(listingUrl: string): Promise<Listing | n
       return null;
     }
 
-    await saveSession(context);
     return parseOtodomDetailAd(ad);
   } finally {
     await page.close();
@@ -336,8 +312,6 @@ export async function fetchAllOtodomPages(params: OtodomSearchParams, maxPages =
 }
 
 export async function closeBrowser(): Promise<void> {
-  if (_browser) {
-    await _browser.close();
-    _browser = null;
-  }
+  if (_context) { await _context.close().catch(() => {}); _context = null; }
+  if (_browser) { await _browser.close().catch(() => {}); _browser = null; }
 }

@@ -374,8 +374,16 @@ async function execFindRentals(
     }
   }
 
-  const searchResults = await Promise.all(searchPromises);
-  const allListings = searchResults.flat();
+  const searchResults = await Promise.allSettled(searchPromises);
+  const allListings = searchResults
+    .filter((r): r is PromiseFulfilledResult<Listing[]> => r.status === 'fulfilled')
+    .flatMap(r => r.value);
+
+  const failedSearches = searchResults.filter(r => r.status === 'rejected');
+  if (failedSearches.length > 0) {
+    console.error('[find_rentals] Some searches failed:', failedSearches.map(r => (r as PromiseRejectedResult).reason));
+  }
+
   console.log(`[find_rentals] Search results: ${allListings.length} total (OLX: ${doOlx}, Otodom: ${doOtodom})`);
   console.log(`[find_rentals] Params: city=${city}, districts=${districts.join(',')}, rooms=${roomsFrom}-${roomsTo}, priceTo=${priceTo}`);
 
@@ -433,11 +441,7 @@ async function execFindRentals(
   // ---- Step B: Send progress message ----
   const debugLimit = process.env.DEBUG_LIMIT ? parseInt(process.env.DEBUG_LIMIT, 10) : 0;
   const candidateCount = debugLimit > 0 ? Math.min(deduped.length, debugLimit) : Math.min(deduped.length, 25);
-  await sendFn(
-    ctx.chatId,
-    `Found ${deduped.length} listings. Analyzing top ${candidateCount}...`,
-    { parse_mode: undefined },
-  );
+  try { await sendFn(ctx.chatId, `Found ${deduped.length} listings. Analyzing top ${candidateCount}...`, { parse_mode: undefined }); } catch {}
 
   // ---- Step C: Analyze top candidates ----
   const candidates = deduped.slice(0, candidateCount);
@@ -458,11 +462,7 @@ async function execFindRentals(
 
     // Send progress update every 3-4 listings
     if (i > 0 && i % 3 === 0) {
-      await sendFn(
-        ctx.chatId,
-        `Analyzing listing ${i + 1}/${candidateCount}...`,
-        { parse_mode: undefined },
-      );
+      try { await sendFn(ctx.chatId, `Analyzing listing ${i + 1}/${candidateCount}...`, { parse_mode: undefined }); } catch {}
     }
 
     // Stop if we have enough accepted results
@@ -661,7 +661,7 @@ async function execFindItems(
   const candidates = result.items.slice(0, candidateLimit); // get extra for potential filtering
   ctx.lastSearchResults = candidates;
 
-  await sendFn(ctx.chatId, `Found ${result.totalAvailable} items. Analyzing top ${Math.min(candidates.length, maxResults)}...`, { parse_mode: undefined });
+  try { await sendFn(ctx.chatId, `Found ${result.totalAvailable} items. Analyzing top ${Math.min(candidates.length, maxResults)}...`, { parse_mode: undefined }); } catch {}
 
   const shown: ItemListing[] = [];
 

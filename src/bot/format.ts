@@ -14,7 +14,7 @@ function esc(text: string | number | null | undefined): string {
   if (text == null) return '';
   return String(text)
     .replace(/\\/g, '\\\\')   // escape backslash first
-    .replace(/[_*`\[]/g, '\\$&'); // escape _ * ` [
+    .replace(/[_*`\[\]()]/g, '\\$&'); // escape _ * ` [ ] ( )
 }
 
 function pln(amount: number | null | undefined): string {
@@ -52,7 +52,7 @@ export function formatRentalCard(
 
   // Header
   lines.push(`*\uD83C\uDFE0 ${esc(listing.title)}*`);
-  lines.push(listing.url);
+  lines.push(`\`${listing.url}\``);
   lines.push('');
 
   // AI Summary (the most valuable part)
@@ -108,8 +108,8 @@ export function formatRentalCard(
   if (parsed?.contractNote) {
     lines.push(esc(parsed.contractNote));
   }
-  if (parsed?.availableFrom) lines.push(`Available: ${parsed.availableFrom}`);
-  if (parsed?.minimumLease) lines.push(`Min lease: ${parsed.minimumLease}`);
+  if (parsed?.availableFrom) lines.push(`Available: ${esc(parsed.availableFrom)}`);
+  if (parsed?.minimumLease) lines.push(`Min lease: ${esc(parsed.minimumLease)}`);
 
   const restrictions: string[] = [];
   restrictions.push(`Pets: ${yn(parsed?.petFriendly)}`);

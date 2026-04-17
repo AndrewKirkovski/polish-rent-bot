@@ -66,6 +66,17 @@ function getConversationHistory(userId: number, limit = 20): MessageParam[] {
   }));
 }
 
+/** Ensure messages alternate user/assistant before sending to Claude — prevents 400 errors */
+function sanitizeHistory(history: MessageParam[]): MessageParam[] {
+  const result: MessageParam[] = [];
+  for (const msg of history) {
+    if (result.length === 0 && msg.role !== 'user') continue; // skip leading assistant
+    if (result.length > 0 && result[result.length - 1].role === msg.role) continue; // skip consecutive same role
+    result.push(msg);
+  }
+  return result;
+}
+
 // ---------------------------------------------------------------------------
 // Typing indicator management
 // ---------------------------------------------------------------------------
@@ -97,19 +108,21 @@ export async function handleUserMessage(
     // 1. Get or create user context
     const context = getOrCreateContext(userId, chatId);
 
-    // 2. Load conversation history from DB
-    const history = getConversationHistory(userId);
+    // 2. Load conversation history from DB and sanitize to ensure alternation
+    let history = sanitizeHistory(getConversationHistory(userId));
 
-    // 3. Build messages array — history + current user message
+    // 3. If history ends with 'user', drop it to prevent consecutive user messages
+    if (history.length > 0 && history[history.length - 1].role === 'user') {
+      history = history.slice(0, -1);
+    }
+
+    // 4. Build messages array — history + current user message
     const messages: MessageParam[] = [
       ...history,
       { role: 'user', content: text },
     ];
 
-    // 4. Save user message to DB
-    saveConversationTurn(userId, 'user', text);
-
-    // 5. Start typing indicator
+    // 4. Start typing indicator (user message saved AFTER successful API call to prevent corruption)
     const noopTyping = async () => {};
     const stopTyping = startTypingIndicator(chatId, typingFn ?? noopTyping);
 
@@ -121,7 +134,7 @@ export async function handleUserMessage(
         system: SYSTEM_PROMPT,
         tools: TOOL_DEFINITIONS,
         messages,
-      });
+      }, { timeout: 60_000 }); // 60s timeout — longer than parse-listing since tool loops take time
 
       // 7. Tool-use loop
       let rounds = 0;
@@ -173,7 +186,7 @@ export async function handleUserMessage(
           system: SYSTEM_PROMPT,
           tools: TOOL_DEFINITIONS,
           messages,
-        });
+        }, { timeout: 60_000 });
       }
 
       // 8. Extract final text response
@@ -188,11 +201,16 @@ export async function handleUserMessage(
         return;
       }
 
-      // 9. Save assistant response to DB
-      saveConversationTurn(userId, 'assistant', finalText);
-
-      // 10. Send response to user — plain text, no parse_mode
+      // 9. Send response to user FIRST — this is the priority
       await sendFn(chatId, finalText);
+
+      // 10. Save conversation to DB — best effort, don't block the user
+      try {
+        saveConversationTurn(userId, 'user', text);
+        saveConversationTurn(userId, 'assistant', finalText);
+      } catch (dbErr) {
+        console.error('[agent] Failed to save conversation:', dbErr);
+      }
     } finally {
       // Always stop typing indicator
       stopTyping();

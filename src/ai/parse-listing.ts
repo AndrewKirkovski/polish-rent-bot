@@ -107,7 +107,7 @@ Advertiser: ${listing.advertiserType ?? 'unknown'}
 Coordinates: ${listing.lat ?? 'unknown'}, ${listing.lng ?? 'unknown'}
 
 Full description (Polish):
-${listing.description || 'No description provided'}`;
+${(listing.description || 'No description provided').slice(0, 8000)}`;
 
   const response = await getClient().messages.create({
     model: MODEL,
@@ -115,7 +115,7 @@ ${listing.description || 'No description provided'}`;
     temperature: 0,
     system: RENTAL_PROMPT,
     messages: [{ role: 'user', content: userMessage }],
-  });
+  }, { timeout: 30_000 });
 
   const textBlock = response.content.find((b) => b.type === 'text');
   if (!textBlock || textBlock.type !== 'text') {
@@ -139,13 +139,17 @@ ${listing.description || 'No description provided'}`;
     throw new Error('AI returned invalid JSON');
   }
 
-  saveParsedListing(
-    listing.platform,
-    listing.platformId,
-    'rental',
-    JSON.stringify(parsed),
-    descHash,
-  );
+  try {
+    saveParsedListing(
+      listing.platform,
+      listing.platformId,
+      'rental',
+      JSON.stringify(parsed),
+      descHash,
+    );
+  } catch (dbErr) {
+    console.error('[parse-listing] Cache write failed:', dbErr);
+  }
 
   return parsed;
 }
@@ -193,7 +197,7 @@ Seller: ${item.contactName ?? 'unknown'}${item.isBusiness ? ' (business)' : ' (p
 Category params: ${Object.entries(item.params).filter(([k]) => k !== 'price').map(([k, v]) => `${k}: ${v}`).join(', ')}
 
 Full description (Polish):
-${item.description || 'No description provided'}`;
+${(item.description || 'No description provided').slice(0, 8000)}`;
 
   const response = await getClient().messages.create({
     model: MODEL,
@@ -201,7 +205,7 @@ ${item.description || 'No description provided'}`;
     temperature: 0,
     system: ITEM_PROMPT,
     messages: [{ role: 'user', content: userMessage }],
-  });
+  }, { timeout: 30_000 });
 
   const textBlock = response.content.find((b) => b.type === 'text');
   if (!textBlock || textBlock.type !== 'text') {
@@ -223,13 +227,17 @@ ${item.description || 'No description provided'}`;
     throw new Error('AI returned invalid JSON');
   }
 
-  saveParsedListing(
-    item.platform,
-    item.platformId,
-    'item',
-    JSON.stringify(parsed),
-    descHash,
-  );
+  try {
+    saveParsedListing(
+      item.platform,
+      item.platformId,
+      'item',
+      JSON.stringify(parsed),
+      descHash,
+    );
+  } catch (dbErr) {
+    console.error('[parse-listing] Cache write failed:', dbErr);
+  }
 
   return parsed;
 }

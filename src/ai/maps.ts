@@ -187,7 +187,8 @@ export async function findNearbyAmenities(
       }
     }
 
-    // Sort by walking time, take top 3
+    // Filter out invalid walking times (sentinel -1), sort by walking time, take top 3
+    nearbyPlaces = nearbyPlaces.filter(p => p.walkingMinutes > 0);
     nearbyPlaces.sort((a, b) => a.walkingMinutes - b.walkingMinutes);
     nearbyPlaces = nearbyPlaces.slice(0, MAX_PLACES_PER_TYPE);
 
@@ -251,7 +252,7 @@ export async function scoreLocation(
   if (workAddress) {
     try {
       commute = await calculateCommute(lat, lng, workAddress, commuteMode);
-    } catch { /* leave null */ }
+    } catch (err) { console.error('[maps] Commute calculation failed:', err instanceof Error ? err.message : err); }
   }
 
   const total = amenityPrefs.length;

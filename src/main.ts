@@ -4,6 +4,17 @@ import { startBot, sendEnrichedNotification } from './bot/telegram.js';
 import { startScheduler } from './scheduler/monitor.js';
 import { closeBrowser } from './crawlers/otodom.js';
 
+// --- Global error handlers FIRST — before anything else can throw ---
+
+process.on('unhandledRejection', (reason, _promise) => {
+  console.error('[FATAL] Unhandled rejection:', reason);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('[FATAL] Uncaught exception:', err);
+  process.exit(1);
+});
+
 // --- Bootstrap ---
 
 initDb();
