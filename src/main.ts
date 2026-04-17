@@ -1,6 +1,6 @@
 import 'dotenv/config';
 import { initDb } from './storage/db.js';
-import { startBot, sendNewListingNotification } from './bot/telegram.js';
+import { startBot, sendEnrichedNotification } from './bot/telegram.js';
 import { startScheduler } from './scheduler/monitor.js';
 import { closeBrowser } from './crawlers/otodom.js';
 
@@ -10,7 +10,7 @@ initDb();
 startBot();
 
 const MONITOR_INTERVAL_MINUTES = 10;
-const stopScheduler = startScheduler(MONITOR_INTERVAL_MINUTES, sendNewListingNotification);
+const stopScheduler = startScheduler(MONITOR_INTERVAL_MINUTES, sendEnrichedNotification);
 
 console.log(`Polish Rent Bot started. Monitoring every ${MONITOR_INTERVAL_MINUTES} minutes.`);
 

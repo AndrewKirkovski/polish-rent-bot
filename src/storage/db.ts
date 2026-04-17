@@ -17,7 +17,7 @@ export interface MonitorRow {
   id: number;
   user_id: number;
   type: string;       // 'rental' | 'item'
-  platform: string;   // 'olx' | 'otodom' | 'all'
+  platform: string;   // 'olx' | 'otodom' | 'all' | 'allegro' | 'multi'
   config: string;     // JSON
   active: number;     // 0 | 1
   created_at: string;
@@ -50,7 +50,7 @@ const SCHEMA = `
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id     INTEGER NOT NULL,
     type        TEXT NOT NULL CHECK (type IN ('rental', 'item')),
-    platform    TEXT NOT NULL CHECK (platform IN ('olx', 'otodom', 'all')),
+    platform    TEXT NOT NULL CHECK (platform IN ('olx', 'otodom', 'all', 'allegro', 'multi')),
     config      TEXT NOT NULL DEFAULT '{}',
     active      INTEGER NOT NULL DEFAULT 1,
     created_at  TEXT NOT NULL DEFAULT (datetime('now')),
@@ -75,6 +75,34 @@ const SCHEMA = `
 
   CREATE INDEX IF NOT EXISTS idx_seen_monitor
     ON seen_listings(monitor_id, first_seen_at);
+
+  CREATE TABLE IF NOT EXISTS conversations (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id     INTEGER NOT NULL,
+    role        TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+    content     TEXT NOT NULL,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (user_id) REFERENCES users(telegram_id)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_conversations_user
+    ON conversations(user_id, created_at);
+
+  CREATE TABLE IF NOT EXISTS parsed_listings (
+    platform        TEXT NOT NULL,
+    platform_id     TEXT NOT NULL,
+    parse_type      TEXT NOT NULL CHECK (parse_type IN ('rental', 'item')),
+    parsed_data     TEXT NOT NULL,
+    description_hash TEXT NOT NULL,
+    parsed_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (platform, platform_id)
+  );
+
+  CREATE TABLE IF NOT EXISTS maps_cache (
+    cache_key    TEXT PRIMARY KEY,
+    result       TEXT NOT NULL,
+    cached_at    TEXT NOT NULL DEFAULT (datetime('now'))
+  );
 `;
 
 // ---------------------------------------------------------------------------
@@ -149,7 +177,7 @@ export function authorizeUser(telegramId: number): void {
 export function addMonitor(
   userId: number,
   type: 'rental' | 'item',
-  platform: 'olx' | 'otodom' | 'all',
+  platform: 'olx' | 'otodom' | 'all' | 'allegro' | 'multi',
   config: Record<string, unknown>,
 ): number {
   const db = getDb();
@@ -233,4 +261,109 @@ export function cleanOldSeen(olderThanDays: number): number {
     WHERE first_seen_at < datetime('now', ? || ' days')
   `).run(`-${olderThanDays}`);
   return result.changes;
+}
+
+// ---------------------------------------------------------------------------
+// Conversations
+// ---------------------------------------------------------------------------
+
+export function saveConversation(userId: number, role: 'user' | 'assistant', content: string): void {
+  const db = getDb();
+  db.prepare(`
+    INSERT INTO conversations (user_id, role, content)
+    VALUES (?, ?, ?)
+  `).run(userId, role, content);
+}
+
+export function getConversationHistory(userId: number, limit = 20): { role: string; content: string }[] {
+  const db = getDb();
+  const rows = db.prepare(`
+    SELECT role, content FROM conversations
+    WHERE user_id = ?
+    ORDER BY created_at DESC
+    LIMIT ?
+  `).all(userId, limit) as { role: string; content: string }[];
+  // Return in chronological order (oldest first)
+  return rows.reverse();
+}
+
+export function clearConversation(userId: number): void {
+  const db = getDb();
+  db.prepare('DELETE FROM conversations WHERE user_id = ?').run(userId);
+}
+
+// ---------------------------------------------------------------------------
+// Parsed listings cache
+// ---------------------------------------------------------------------------
+
+export function getParsedListing(
+  platform: string,
+  platformId: string,
+): { parsed_data: string; description_hash: string } | undefined {
+  const db = getDb();
+  return db.prepare(
+    'SELECT parsed_data, description_hash FROM parsed_listings WHERE platform = ? AND platform_id = ?',
+  ).get(platform, platformId) as { parsed_data: string; description_hash: string } | undefined;
+}
+
+export function saveParsedListing(
+  platform: string,
+  platformId: string,
+  parseType: string,
+  data: string,
+  descriptionHash: string,
+): void {
+  const db = getDb();
+  db.prepare(`
+    INSERT INTO parsed_listings (platform, platform_id, parse_type, parsed_data, description_hash)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(platform, platform_id) DO UPDATE SET
+      parse_type = excluded.parse_type,
+      parsed_data = excluded.parsed_data,
+      description_hash = excluded.description_hash,
+      parsed_at = datetime('now')
+  `).run(platform, platformId, parseType, data, descriptionHash);
+}
+
+// ---------------------------------------------------------------------------
+// Maps cache
+// ---------------------------------------------------------------------------
+
+export function getMapsCacheEntry(cacheKey: string): string | null {
+  const db = getDb();
+  const row = db.prepare(
+    'SELECT result FROM maps_cache WHERE cache_key = ?',
+  ).get(cacheKey) as { result: string } | undefined;
+  return row?.result ?? null;
+}
+
+export function setMapsCacheEntry(cacheKey: string, result: string): void {
+  const db = getDb();
+  db.prepare(`
+    INSERT INTO maps_cache (cache_key, result)
+    VALUES (?, ?)
+    ON CONFLICT(cache_key) DO UPDATE SET
+      result = excluded.result,
+      cached_at = datetime('now')
+  `).run(cacheKey, result);
+}
+
+export function cleanExpiredMapsCache(maxAgeDays = 7): number {
+  const db = getDb();
+  const result = db.prepare(`
+    DELETE FROM maps_cache
+    WHERE cached_at < datetime('now', ? || ' days')
+  `).run(`-${maxAgeDays}`);
+  return result.changes;
+}
+
+// ---------------------------------------------------------------------------
+// Monitor config update
+// ---------------------------------------------------------------------------
+
+export function updateMonitorConfig(monitorId: number, config: Record<string, unknown>): void {
+  const db = getDb();
+  db.prepare(
+    'UPDATE monitors SET config = ? WHERE id = ?',
+  ).run(JSON.stringify(config), monitorId);
 }

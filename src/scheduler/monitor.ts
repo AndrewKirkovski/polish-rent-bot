@@ -7,6 +7,8 @@ import { searchOtodom } from '../crawlers/otodom.js';
 import { getMonitors, isListingSeen, markListingSeen, cleanOldSeen, type MonitorRow } from '../storage/db.js';
 import type { Listing } from '../types.js';
 import type { ItemListing } from '../crawlers/olx-items.js';
+import { parseRentalListing, parseItemListing } from '../ai/parse-listing.js';
+import { scoreLocation } from '../ai/maps.js';
 
 // ---------------------------------------------------------------------------
 // City name → OLX city ID mapping (case-insensitive)
@@ -168,7 +170,8 @@ export async function runAllMonitors(): Promise<MonitorResult[]> {
 
 export function startScheduler(
   intervalMinutes: number,
-  notifyFn: (userId: number, listing: Listing | ItemListing) => void | Promise<void>,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  notifyFn: (userId: number, listing: Listing | ItemListing, parsedData?: any, locationScore?: any) => void | Promise<void>,
 ): () => void {
   let stopped = false;
   let timer: ReturnType<typeof setTimeout> | null = null;
@@ -184,7 +187,36 @@ export function startScheduler(
       for (const { monitor, newListings } of results) {
         for (const listing of newListings) {
           try {
-            await notifyFn(monitor.user_id, listing);
+            // AI-parse the listing for structured data
+            let parsedData = null;
+            try {
+              if (monitor.type === 'rental') {
+                parsedData = await parseRentalListing(listing as Listing);
+              } else {
+                parsedData = await parseItemListing(listing as ItemListing);
+              }
+            } catch (parseErr) {
+              console.error(`[scheduler] AI parse failed:`, parseErr);
+            }
+
+            // Score location if monitor has amenity prefs
+            let locationScore = null;
+            const config = JSON.parse(monitor.config);
+            if (config.amenities && listing.lat && listing.lng) {
+              try {
+                locationScore = await scoreLocation(
+                  listing.lat,
+                  listing.lng,
+                  config.amenities,
+                  config.workAddress,
+                  config.commuteMode,
+                );
+              } catch (mapErr) {
+                console.error(`[scheduler] Maps scoring failed:`, mapErr);
+              }
+            }
+
+            await notifyFn(monitor.user_id, listing, parsedData, locationScore);
           } catch (notifyErr) {
             console.error(`[scheduler] Notify failed for user ${monitor.user_id}:`, notifyErr);
           }
