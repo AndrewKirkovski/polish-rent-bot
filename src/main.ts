@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { initDb } from './storage/db.js';
+import { getDb } from './storage/db.js';
 import { startBot, sendEnrichedNotification } from './bot/telegram.js';
 import { startScheduler } from './scheduler/monitor.js';
 import { closeBrowser } from './crawlers/otodom.js';
@@ -17,7 +17,7 @@ process.on('uncaughtException', (err) => {
 
 // --- Bootstrap ---
 
-initDb();
+getDb(); // initialize DB singleton (creates tables if needed)
 startBot();
 
 const MONITOR_INTERVAL_MINUTES = 10;

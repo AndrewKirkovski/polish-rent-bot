@@ -777,6 +777,7 @@ async function execCreateMonitor(
 
 async function execUpdateMonitor(
   input: Record<string, unknown>,
+  context: UserContext,
 ): Promise<string> {
   const monitorId = input.monitorId as number;
   const updates = input.updates as Record<string, unknown> | undefined;
@@ -786,6 +787,7 @@ async function execUpdateMonitor(
 
   const monitor = getMonitor(monitorId);
   if (!monitor) return `Monitor #${monitorId} not found.`;
+  if (monitor.user_id !== context.userId) return `Monitor #${monitorId} doesn't belong to you.`;
   if (!monitor.active) return `Monitor #${monitorId} is inactive. Create a new one instead.`;
 
   // Merge updates into existing config
@@ -803,12 +805,14 @@ async function execUpdateMonitor(
 
 async function execDeleteMonitor(
   input: Record<string, unknown>,
+  context: UserContext,
 ): Promise<string> {
   const monitorId = input.monitorId as number;
   if (!monitorId) return 'monitorId is required.';
 
   const monitor = getMonitor(monitorId);
   if (!monitor) return `Monitor #${monitorId} not found.`;
+  if (monitor.user_id !== context.userId) return `Monitor #${monitorId} doesn't belong to you.`;
 
   deactivateMonitor(monitorId);
   return `Monitor #${monitorId} has been deactivated. You will no longer receive notifications for it.`;
@@ -877,9 +881,9 @@ export async function executeTool(
       case 'create_monitor':
         return await execCreateMonitor(input, context);
       case 'update_monitor':
-        return await execUpdateMonitor(input);
+        return await execUpdateMonitor(input, context);
       case 'delete_monitor':
-        return await execDeleteMonitor(input);
+        return await execDeleteMonitor(input, context);
       case 'list_monitors':
         return await execListMonitors(context);
       default:
