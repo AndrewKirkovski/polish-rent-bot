@@ -5,8 +5,13 @@ import { chromium } from 'playwright-extra';
 import stealthPlugin from 'puppeteer-extra-plugin-stealth';
 import type { BrowserContext, Page } from 'playwright';
 import type { Listing, CrawlResult } from '../types.js';
+import { AsyncMutex } from '../utils/mutex.js';
 
 chromium.use(stealthPlugin());
+
+// All Playwright operations go through this mutex — prevents race conditions
+// on browser launch, context creation, and concurrent page navigation
+const browserMutex = new AsyncMutex();
 
 const CONTEXT_OPTIONS = {
   userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
@@ -233,6 +238,7 @@ function parseOtodomDetailAd(ad: any): Listing | null {
 // --- Public API ---
 
 export async function searchOtodom(params: OtodomSearchParams): Promise<CrawlResult> {
+  return browserMutex.run(async () => {
   const url = buildOtodomUrl(params);
   const context = await getContext();
   const page = await context.newPage();
@@ -269,28 +275,31 @@ export async function searchOtodom(params: OtodomSearchParams): Promise<CrawlRes
   } finally {
     await page.close();
   }
+  }); // browserMutex.run
 }
 
 export async function fetchOtodomDetail(listingUrl: string): Promise<Listing | null> {
-  const context = await getContext();
-  const page = await context.newPage();
+  return browserMutex.run(async () => {
+    const context = await getContext();
+    const page = await context.newPage();
 
-  try {
-    await page.goto(listingUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 });
-    await dismissCookieConsent(page);
-    await page.waitForTimeout(1000);
+    try {
+      await page.goto(listingUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+      await dismissCookieConsent(page);
+      await page.waitForTimeout(1000);
 
-    const nextData = await extractNextData(page);
-    const ad = nextData?.props?.pageProps?.ad;
-    if (!ad) {
-      console.error('  Otodom: no ad data in __NEXT_DATA__');
-      return null;
+      const nextData = await extractNextData(page);
+      const ad = nextData?.props?.pageProps?.ad;
+      if (!ad) {
+        console.error('  Otodom: no ad data in __NEXT_DATA__');
+        return null;
+      }
+
+      return parseOtodomDetailAd(ad);
+    } finally {
+      await page.close();
     }
-
-    return parseOtodomDetailAd(ad);
-  } finally {
-    await page.close();
-  }
+  }); // browserMutex.run
 }
 
 export async function fetchAllOtodomPages(params: OtodomSearchParams, maxPages = 10): Promise<Listing[]> {

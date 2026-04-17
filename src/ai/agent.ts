@@ -5,6 +5,16 @@ import type { MessageParam, ContentBlockParam, ToolResultBlockParam } from '@ant
 import { SYSTEM_PROMPT } from './prompts.js';
 import { TOOL_DEFINITIONS, executeTool, getOrCreateContext } from './tools.js';
 import { getDb } from '../storage/db.js';
+import { AsyncMutex } from '../utils/mutex.js';
+
+// Per-user mutex — prevents concurrent message handling for the same user
+// (conversation history ordering, context state)
+const userMutexes = new Map<number, AsyncMutex>();
+function getUserMutex(userId: number): AsyncMutex {
+  let m = userMutexes.get(userId);
+  if (!m) { m = new AsyncMutex(); userMutexes.set(userId, m); }
+  return m;
+}
 
 // ---------------------------------------------------------------------------
 // Anthropic client
@@ -104,6 +114,8 @@ export async function handleUserMessage(
   sendPhotosFn: (chatId: number, urls: string[]) => Promise<void>,
   typingFn?: (chatId: number) => Promise<void>,
 ): Promise<void> {
+  // Per-user mutex — if user sends multiple messages quickly, they queue up
+  return getUserMutex(userId).run(async () => {
   try {
     // 1. Get or create user context
     const context = getOrCreateContext(userId, chatId);
@@ -225,4 +237,5 @@ export async function handleUserMessage(
       console.error('[agent] Failed to send error message:', sendErr);
     }
   }
+  }); // getUserMutex.run
 }
