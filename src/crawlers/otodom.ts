@@ -321,6 +321,8 @@ export async function fetchAllOtodomPages(params: OtodomSearchParams, maxPages =
 }
 
 export async function closeBrowser(): Promise<void> {
-  if (_context) { await _context.close().catch(() => {}); _context = null; }
-  if (_browser) { await _browser.close().catch(() => {}); _browser = null; }
+  await browserMutex.run(async () => {
+    if (_context) { await _context.close().catch(() => {}); _context = null; }
+    if (_browser) { await _browser.close().catch(() => {}); _browser = null; }
+  });
 }

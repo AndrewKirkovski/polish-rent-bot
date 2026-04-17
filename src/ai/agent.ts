@@ -4,11 +4,13 @@ import Anthropic from '@anthropic-ai/sdk';
 import type { MessageParam, ContentBlockParam, ToolResultBlockParam } from '@anthropic-ai/sdk/resources/messages.js';
 import { SYSTEM_PROMPT } from './prompts.js';
 import { TOOL_DEFINITIONS, executeTool, getOrCreateContext } from './tools.js';
-import { getDb } from '../storage/db.js';
+import {
+  saveConversation,
+  getConversationHistory as getConversationHistoryFromDb,
+} from '../storage/db.js';
 import { AsyncMutex } from '../utils/mutex.js';
 
 // Per-user mutex — prevents concurrent message handling for the same user
-// (conversation history ordering, context state)
 const userMutexes = new Map<number, AsyncMutex>();
 function getUserMutex(userId: number): AsyncMutex {
   let m = userMutexes.get(userId);
@@ -20,56 +22,21 @@ function getUserMutex(userId: number): AsyncMutex {
 // Anthropic client
 // ---------------------------------------------------------------------------
 
-const client = new Anthropic(); // uses ANTHROPIC_API_KEY env var
+const client = new Anthropic();
 const MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-6';
 const MAX_TOKENS = 2048;
-const MAX_TOOL_ROUNDS = 10; // safety limit on tool-use loops
+const MAX_TOOL_ROUNDS = 10;
 
 // ---------------------------------------------------------------------------
-// Conversation history persistence
+// Conversation history — uses db.ts exports, maps to Claude MessageParam[]
 // ---------------------------------------------------------------------------
-
-// Ensure the conversations table exists (called once lazily)
-let _tableCreated = false;
-
-function ensureConversationTable(): void {
-  if (_tableCreated) return;
-  const db = getDb();
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS conversations (
-      id         INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id    INTEGER NOT NULL,
-      role       TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
-      content    TEXT NOT NULL,
-      created_at TEXT NOT NULL DEFAULT (datetime('now'))
-    );
-    CREATE INDEX IF NOT EXISTS idx_conversations_user
-      ON conversations(user_id, created_at);
-  `);
-  _tableCreated = true;
-}
 
 function saveConversationTurn(userId: number, role: 'user' | 'assistant', content: string): void {
-  ensureConversationTable();
-  const db = getDb();
-  db.prepare(
-    'INSERT INTO conversations (user_id, role, content) VALUES (?, ?, ?)',
-  ).run(userId, role, content);
+  saveConversation(userId, role, content);
 }
 
 function getConversationHistory(userId: number, limit = 20): MessageParam[] {
-  ensureConversationTable();
-  const db = getDb();
-  const rows = db.prepare(`
-    SELECT role, content FROM conversations
-    WHERE user_id = ?
-    ORDER BY created_at DESC
-    LIMIT ?
-  `).all(userId, limit) as Array<{ role: string; content: string }>;
-
-  // Rows come newest-first, reverse to chronological order
-  rows.reverse();
-
+  const rows = getConversationHistoryFromDb(userId, limit);
   return rows.map((row) => ({
     role: row.role as 'user' | 'assistant',
     content: row.content,

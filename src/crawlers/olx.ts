@@ -55,7 +55,7 @@ interface OlxSearchParams {
 
 async function fetchJson<T>(url: string): Promise<T | null> {
   try {
-    const res = await fetch(url, { headers: HEADERS });
+    const res = await fetch(url, { headers: HEADERS, signal: AbortSignal.timeout(15_000) });
     if (!res.ok) {
       console.error(`OLX API ${res.status}: ${url.slice(0, 120)}`);
       return null;

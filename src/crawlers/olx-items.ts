@@ -126,7 +126,7 @@ export async function searchItems(params: ItemSearchParams): Promise<ItemCrawlRe
   const url = buildItemSearchUrl(params);
   let data: any;
   try {
-    const res = await fetch(url, { headers: HEADERS });
+    const res = await fetch(url, { headers: HEADERS, signal: AbortSignal.timeout(15_000) });
     if (!res.ok) {
       console.error(`OLX items API ${res.status}: ${url.slice(0, 120)}`);
       return { items: [], totalAvailable: 0, page: 0, hasNextPage: false, nextPageUrl: null };
@@ -157,7 +157,7 @@ export async function searchItems(params: ItemSearchParams): Promise<ItemCrawlRe
 
 export async function fetchItemPhone(offerId: string): Promise<string | null> {
   try {
-    const res = await fetch(`${OLX_API}/offers/${offerId}/phones/`, { headers: HEADERS });
+    const res = await fetch(`${OLX_API}/offers/${offerId}/phones/`, { headers: HEADERS, signal: AbortSignal.timeout(10_000) });
     if (!res.ok) return null;
     const data = await res.json();
     return data?.data?.phones?.[0] ?? null;

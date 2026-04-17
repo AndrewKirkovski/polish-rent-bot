@@ -38,7 +38,7 @@ function roundCoord(v: number): string { return v.toFixed(4); }
 function hashStr(t: string): string { return createHash('sha256').update(t, 'utf-8').digest('hex').slice(0, 16); }
 
 async function fetchJson<T>(url: string): Promise<T> {
-  const res = await fetch(url);
+  const res = await fetch(url, { signal: AbortSignal.timeout(10_000) });
   if (!res.ok) throw new Error(`Google Maps API ${res.status}: ${res.statusText}`);
   return (await res.json()) as T;
 }
