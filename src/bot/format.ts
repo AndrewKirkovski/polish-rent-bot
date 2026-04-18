@@ -78,6 +78,13 @@ const CE = {
   ac:         '<tg-emoji emoji-id="5424976150810086048">☀️</tg-emoji>',
   bathroom:   '<tg-emoji emoji-id="5436199127987799646">💦</tg-emoji>',
   contract:   '<tg-emoji emoji-id="5364265065799239497">✏️</tg-emoji>',
+  // Location & amenities
+  location:   '<tg-emoji emoji-id="5192907870827467960">🗺</tg-emoji>',
+  gym:        '<tg-emoji emoji-id="5443161635046833571">🍑</tg-emoji>',
+  pool:       '<tg-emoji emoji-id="5199865266875420387">🏊</tg-emoji>',
+  pharmacy:   '<tg-emoji emoji-id="5363970667265934950">🩹</tg-emoji>',
+  furniture:  '<tg-emoji emoji-id="5219787086130859981">🏖</tg-emoji>',
+  costBreak:  '<tg-emoji emoji-id="5422878175250106861">🛍</tg-emoji>',
 } as const;
 
 function ceYn(val: boolean | null | undefined): string {
@@ -114,7 +121,7 @@ export function formatRentalCard(
   }
 
   // ---- COST BREAKDOWN ----
-  lines.push(`<b>\uD83D\uDCCB Cost breakdown:</b>`);
+  lines.push(`<b>${CE.costBreak} Cost breakdown:</b>`);
   lines.push(`  Rent:         ${pln(listing.price)}`);
   if (parsed?.adminFee != null) {
     lines.push(`  Czynsz admin: ${pln(parsed.adminFee)}`);
@@ -190,42 +197,43 @@ export function formatRentalCard(
   if (furnitureList.length > 0) {
     const shown = furnitureList.slice(0, 5).map(f => esc(f));
     const suffix = furnitureList.length > 5 ? `, and ${furnitureList.length - 5} more` : '';
-    lines.push(`\uD83E\uDE91 Equipment: ${shown.join(', ')}${suffix}`);
+    lines.push(`${CE.furniture} Equipment: ${shown.join(', ')}${suffix}`);
   }
   lines.push('');
 
   // ---- LOCATION ----
   if (locationScore) {
-    lines.push(`<b>\uD83D\uDCCD LOCATION (${locationScore.overallScore}/100)</b>`);
-    // Combine district + city on one line
+    lines.push(`<b>${CE.location} LOCATION (${locationScore.overallScore}/100)</b>`);
     if (listing.district) {
-      lines.push(`\uD83D\uDCCD ${esc(listing.district)}, ${esc(listing.city)}`);
+      lines.push(`${CE.location} ${esc(listing.district)}, ${esc(listing.city)}`);
     } else {
-      lines.push(`\uD83D\uDCCD ${esc(listing.city)}`);
+      lines.push(`${CE.location} ${esc(listing.city)}`);
     }
+    // Amenity icons — use custom emoji where available, fallback to Unicode
     const icons: Record<string, string> = {
-      metro: '\uD83D\uDE87', tram: '\uD83D\uDE8B', gym: '\uD83C\uDFCB\uFE0F', pool: '\uD83C\uDFCA', supermarket: '\uD83D\uDED2', park: '\uD83C\uDF33', pharmacy: '\uD83D\uDC8A',
+      metro: '\uD83D\uDE87', tram: '\uD83D\uDE8B',
+      gym: CE.gym, pool: CE.pool, pharmacy: CE.pharmacy,
+      supermarket: '\uD83D\uDED2', park: '\uD83C\uDF33',
     };
-    // Show only nearest place per amenity type
     for (const a of locationScore.amenities) {
-      const icon = icons[a.type] ?? '\uD83D\uDCCD';
+      const icon = icons[a.type] ?? CE.location;
       if (a.places.length > 0) {
         const p = a.places[0];
-        const mark = a.withinLimit ? ' \u2713' : ' \u26A0\uFE0F';
+        const mark = a.withinLimit ? ` ${CE.yes}` : ` ${CE.warning}`;
         lines.push(`${icon} ${esc(p.name)} \u2014 ${p.walkingMinutes} min${mark}`);
       } else {
         lines.push(`${icon} ${a.type}: not found nearby`);
       }
     }
     if (locationScore.commute) {
-      lines.push(`\uD83C\uDFE2 \u2192 ${locationScore.commute.duration} by ${locationScore.commute.mode}`);
+      lines.push(`\u2192 ${locationScore.commute.duration} by ${locationScore.commute.mode}`);
     }
     lines.push(locationScore.mapsLink);
   } else if (listing.lat && listing.lng) {
-    lines.push(`\uD83D\uDCCD ${listing.district ? esc(listing.district) + ', ' : ''}${esc(listing.city)}`);
+    lines.push(`${CE.location} ${listing.district ? esc(listing.district) + ', ' : ''}${esc(listing.city)}`);
     lines.push(`https://www.google.com/maps?q=${listing.lat},${listing.lng}`);
   } else {
-    lines.push(`\uD83D\uDCCD ${listing.district ? esc(listing.district) + ', ' : ''}${esc(listing.city)}`);
+    lines.push(`${CE.location} ${listing.district ? esc(listing.district) + ', ' : ''}${esc(listing.city)}`);
   }
   lines.push('');
 
@@ -316,7 +324,7 @@ export function formatItemCard(
 
   // Location + contact
   lines.push('');
-  if (item.city) lines.push(`\uD83D\uDCCD ${item.district ? esc(item.district) + ', ' : ''}${esc(item.city)}`);
+  if (item.city) lines.push(`${CE.location} ${item.district ? esc(item.district) + ', ' : ''}${esc(item.city)}`);
   if (item.phone) lines.push(`${CE.phone} ${item.phone}`);
   if (item.contactName) lines.push(`${CE.person} ${esc(item.contactName)}${item.isBusiness ? ' (business)' : ''}`);
 
