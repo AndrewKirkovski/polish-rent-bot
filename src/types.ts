@@ -104,8 +104,6 @@ export interface ParsedRentalData {
   positives: string[];
   restrictions: string[];
   additionalNotes: string[];
-  rejected?: boolean;
-  rejectionReason?: string | null;
 }
 
 export interface ParsedItemData {
@@ -119,8 +117,15 @@ export interface ParsedItemData {
   bestFor: string | null;
   redFlags: string[];
   additionalNotes: string[];
-  rejected?: boolean;
-  rejectionReason?: string | null;
+}
+
+// ---------------------------------------------------------------------------
+// Rejection cache result (two-tier AI caching)
+// ---------------------------------------------------------------------------
+
+export interface RejectionResult {
+  rejected: boolean;
+  rejectionReason: string | null;
 }
 
 // ---------------------------------------------------------------------------

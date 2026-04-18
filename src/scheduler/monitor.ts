@@ -7,7 +7,7 @@ import { searchOtodom } from '../crawlers/otodom.js';
 import { getMonitors, isListingSeen, markListingSeen, cleanOldSeen, type MonitorRow } from '../storage/db.js';
 import type { Listing } from '../types.js';
 import type { ItemListing } from '../crawlers/olx-items.js';
-import { parseRentalListing, parseItemListing } from '../ai/parse-listing.js';
+import { parseRentalListing, parseItemListing, evaluateRejection } from '../ai/parse-listing.js';
 import { scoreLocation } from '../ai/maps.js';
 
 // ---------------------------------------------------------------------------
@@ -197,9 +197,25 @@ export function startScheduler(
               console.error(`[scheduler] AI parse failed:`, parseErr);
             }
 
+            // Evaluate rejection criteria if configured (two-tier AI caching)
+            const config = JSON.parse(monitor.config);
+            if (config.rejectionCriteria && parsedData) {
+              try {
+                const rejectionResult = await evaluateRejection(listing, parsedData, config.rejectionCriteria as string);
+                if (rejectionResult.rejected) {
+                  console.log(`[scheduler] Rejected "${listing.title}": ${rejectionResult.rejectionReason}`);
+                  // Mark as seen so we don't re-evaluate next cycle
+                  markListingSeen(monitor.id, listing.platform, listing.platformId, listing.url, listing.title, listing.price);
+                  continue;
+                }
+              } catch (rejErr) {
+                console.error(`[scheduler] Rejection eval failed:`, rejErr);
+                // Don't reject on evaluation failure — let it through
+              }
+            }
+
             // Score location if monitor has amenity prefs
             let locationScore = null;
-            const config = JSON.parse(monitor.config);
             if (config.amenities && listing.lat && listing.lng) {
               try {
                 locationScore = await scoreLocation(

@@ -6,7 +6,7 @@ import { searchOlx, fetchOlxPhone, OLX_CATEGORIES, OLX_CITIES, OLX_DISTRICTS } f
 import { searchItems, fetchItemPhone } from '../crawlers/olx-items.js';
 import type { ItemListing } from '../crawlers/olx-items.js';
 import { searchOtodom, fetchOtodomDetail } from '../crawlers/otodom.js';
-import { parseRentalListing, parseItemListing } from './parse-listing.js';
+import { parseRentalListing, parseItemListing, evaluateRejection } from './parse-listing.js';
 import { scoreLocation } from './maps.js';
 import type { AmenityPreference } from './maps.js';
 import { formatRichRentalNotification, formatRichItemNotification, splitMessage } from '../bot/format.js';
@@ -515,7 +515,7 @@ async function execFindRentals(
       if (enrichedListing.description) {
         try {
           console.log(`[find_rentals] AI parsing...`);
-          parsedData = await parseRentalListing(enrichedListing, rejectionCriteria);
+          parsedData = await parseRentalListing(enrichedListing);
           console.log(`[find_rentals] AI parsed: total=${parsedData?.totalMonthlyCost}, contract=${parsedData?.contractType}, kaucja=${parsedData?.deposit}`);
         } catch (parseErr) {
           console.error(`[find_rentals] AI parse FAILED for "${enrichedListing.title}":`, parseErr instanceof Error ? parseErr.message : parseErr);
@@ -550,14 +550,22 @@ async function execFindRentals(
         continue;
       }
 
-      // AI rejection criteria filter
-      if (parsedData?.rejected) {
-        rejected.push({
-          url: enrichedListing.url,
-          title: enrichedListing.title,
-          reason: parsedData.rejectionReason ?? 'Rejected by AI criteria',
-        });
-        continue;
+      // AI rejection criteria filter (two-tier: separate tiny call, cached per criteria)
+      if (rejectionCriteria && parsedData) {
+        try {
+          const rejectionResult = await evaluateRejection(enrichedListing, parsedData, rejectionCriteria);
+          if (rejectionResult.rejected) {
+            rejected.push({
+              url: enrichedListing.url,
+              title: enrichedListing.title,
+              reason: rejectionResult.rejectionReason ?? 'Rejected by AI criteria',
+            });
+            continue;
+          }
+        } catch (rejErr) {
+          console.error(`[find_rentals] Rejection eval failed for "${enrichedListing.title}":`, rejErr instanceof Error ? rejErr.message : rejErr);
+          // Don't reject on evaluation failure — let it through
+        }
       }
 
       // Location scoring — geocode if no coordinates
@@ -750,21 +758,29 @@ async function execFindItems(
     let parsedData = null;
     if (item.description) {
       try {
-        parsedData = await parseItemListing(item, rejectionCriteria);
+        parsedData = await parseItemListing(item);
       } catch (parseErr) {
         console.error(`[find_items] AI parse FAILED for "${item.title}":`, parseErr instanceof Error ? parseErr.message : parseErr);
         // Continue without parsed data
       }
     }
 
-    // AI rejection criteria filter
-    if (parsedData?.rejected) {
-      itemRejected.push({
-        url: item.url,
-        title: item.title,
-        reason: parsedData.rejectionReason ?? 'Rejected by AI criteria',
-      });
-      continue;
+    // AI rejection criteria filter (two-tier: separate tiny call, cached per criteria)
+    if (rejectionCriteria && parsedData) {
+      try {
+        const rejectionResult = await evaluateRejection(item, parsedData, rejectionCriteria);
+        if (rejectionResult.rejected) {
+          itemRejected.push({
+            url: item.url,
+            title: item.title,
+            reason: rejectionResult.rejectionReason ?? 'Rejected by AI criteria',
+          });
+          continue;
+        }
+      } catch (rejErr) {
+        console.error(`[find_items] Rejection eval failed for "${item.title}":`, rejErr instanceof Error ? rejErr.message : rejErr);
+        // Don't reject on evaluation failure — let it through
+      }
     }
 
     // Fetch phone if not available — don't mutate original item

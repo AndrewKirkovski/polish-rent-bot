@@ -103,6 +103,16 @@ const SCHEMA = `
     result       TEXT NOT NULL,
     cached_at    TEXT NOT NULL DEFAULT (datetime('now'))
   );
+
+  CREATE TABLE IF NOT EXISTS rejection_cache (
+    platform         TEXT NOT NULL,
+    platform_id      TEXT NOT NULL,
+    criteria_hash    TEXT NOT NULL,
+    rejected         INTEGER NOT NULL DEFAULT 0,
+    rejection_reason TEXT,
+    cached_at        TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (platform, platform_id, criteria_hash)
+  );
 `;
 
 // ---------------------------------------------------------------------------
@@ -367,6 +377,44 @@ export function clearEmptyMapsCache(): number {
       AND result LIKE '%"places":[]%'
   `).run();
   return result.changes;
+}
+
+// ---------------------------------------------------------------------------
+// Rejection cache (two-tier AI caching)
+// ---------------------------------------------------------------------------
+
+export function getRejectionCache(
+  platform: string,
+  platformId: string,
+  criteriaHash: string,
+): { rejected: boolean; rejectionReason: string | null } | undefined {
+  const db = getDb();
+  const row = db.prepare(
+    'SELECT rejected, rejection_reason FROM rejection_cache WHERE platform = ? AND platform_id = ? AND criteria_hash = ?',
+  ).get(platform, platformId, criteriaHash) as { rejected: number; rejection_reason: string | null } | undefined;
+  if (!row) return undefined;
+  return {
+    rejected: row.rejected === 1,
+    rejectionReason: row.rejection_reason,
+  };
+}
+
+export function saveRejectionCache(
+  platform: string,
+  platformId: string,
+  criteriaHash: string,
+  rejected: boolean,
+  rejectionReason: string | null,
+): void {
+  const db = getDb();
+  db.prepare(`
+    INSERT INTO rejection_cache (platform, platform_id, criteria_hash, rejected, rejection_reason)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(platform, platform_id, criteria_hash) DO UPDATE SET
+      rejected = excluded.rejected,
+      rejection_reason = excluded.rejection_reason,
+      cached_at = datetime('now')
+  `).run(platform, platformId, criteriaHash, rejected ? 1 : 0, rejectionReason);
 }
 
 // ---------------------------------------------------------------------------

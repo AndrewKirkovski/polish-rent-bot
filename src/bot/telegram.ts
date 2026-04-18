@@ -87,8 +87,8 @@ function mdToHtml(text: string): string {
   // sanitize-html: keep only Telegram-supported tags
   const clean = sanitizeHtml(processed, {
     allowedTags: ['b', 'strong', 'i', 'em', 'u', 'ins', 's', 'strike', 'del',
-                  'a', 'code', 'pre', 'blockquote'],
-    allowedAttributes: { 'a': ['href'] },
+                  'a', 'code', 'pre', 'blockquote', 'tg-emoji'],
+    allowedAttributes: { 'a': ['href'], 'tg-emoji': ['emoji-id'] },
     transformTags: {
       'strong': 'b',
       'em': 'i',

@@ -3,10 +3,10 @@
 
 import Anthropic from '@anthropic-ai/sdk';
 import { createHash } from 'node:crypto';
-import type { Listing, ParsedRentalData, ParsedItemData } from '../types.js';
+import type { Listing, ParsedRentalData, ParsedItemData, RejectionResult } from '../types.js';
 import type { ItemListing } from '../crawlers/olx-items.js';
-import { getParsedListing, saveParsedListing } from '../storage/db.js';
-import { ParsedRentalDataSchema, ParsedItemDataSchema } from './schemas.js';
+import { getParsedListing, saveParsedListing, getRejectionCache, saveRejectionCache } from '../storage/db.js';
+import { ParsedRentalDataSchema, ParsedItemDataSchema, RejectionResultSchema } from './schemas.js';
 
 export type { ParsedRentalData, ParsedItemData } from '../types.js';
 
@@ -84,7 +84,7 @@ Return ONLY valid JSON (no markdown fences):
   "additionalNotes": ["anything else noteworthy"]
 }`;
 
-export async function parseRentalListing(listing: Listing, rejectionCriteria?: string): Promise<ParsedRentalData> {
+export async function parseRentalListing(listing: Listing): Promise<ParsedRentalData> {
   const descHash = hashText(listing.description || listing.title);
 
   // Check cache
@@ -108,7 +108,7 @@ Advertiser: ${listing.advertiserType ?? 'unknown'}
 Coordinates: ${listing.lat ?? 'unknown'}, ${listing.lng ?? 'unknown'}
 
 Full description (Polish):
-${(listing.description || 'No description provided').slice(0, 8000)}${rejectionCriteria ? `\n\nUSER REJECTION CRITERIA: ${rejectionCriteria}\nEvaluate the listing against these criteria. Add a "rejected" field (boolean) and "rejectionReason" (string or null) to your response. Set rejected=true and provide rejectionReason if the listing fails ANY of these criteria.` : ''}`;
+${(listing.description || 'No description provided').slice(0, 8000)}`;
 
   const response = await getClient().messages.create({
     model: MODEL,
@@ -189,7 +189,7 @@ Return ONLY valid JSON (no markdown fences):
   "additionalNotes": ["anything else noteworthy"]
 }`;
 
-export async function parseItemListing(item: ItemListing, rejectionCriteria?: string): Promise<ParsedItemData> {
+export async function parseItemListing(item: ItemListing): Promise<ParsedItemData> {
   const descHash = hashText(item.description || item.title);
 
   const cached = getParsedListing(item.platform, item.platformId);
@@ -205,7 +205,7 @@ Seller: ${item.contactName ?? 'unknown'}${item.isBusiness ? ' (business)' : ' (p
 Category params: ${Object.entries(item.params).filter(([k]) => k !== 'price').map(([k, v]) => `${k}: ${v}`).join(', ')}
 
 Full description (Polish):
-${(item.description || 'No description provided').slice(0, 8000)}${rejectionCriteria ? `\n\nUSER REJECTION CRITERIA: ${rejectionCriteria}\nEvaluate the listing against these criteria. Add a "rejected" field (boolean) and "rejectionReason" (string or null) to your response. Set rejected=true and provide rejectionReason if the listing fails ANY of these criteria.` : ''}`;
+${(item.description || 'No description provided').slice(0, 8000)}`;
 
   const response = await getClient().messages.create({
     model: MODEL,
@@ -255,4 +255,125 @@ ${(item.description || 'No description provided').slice(0, 8000)}${rejectionCrit
   }
 
   return parsed;
+}
+
+// ---------------------------------------------------------------------------
+// Rejection evaluation — tiny Claude call against user criteria
+// Two-tier cache: universal parse is cached separately, rejection is cached
+// per (platform, platformId, hash(criteria))
+// ---------------------------------------------------------------------------
+
+const REJECTION_PROMPT = `You evaluate rental/item listings against user rejection criteria.
+Given a listing summary and the user's criteria, determine if the listing should be rejected.
+Return ONLY valid JSON (no markdown fences):
+{"rejected": true/false, "rejectionReason": "reason string or null"}
+Set rejected=true and provide rejectionReason if the listing fails ANY of the criteria.
+If the listing passes all criteria, set rejected=false and rejectionReason=null.`;
+
+export async function evaluateRejection(
+  listing: { platform: string; platformId: string; title: string },
+  universalParse: ParsedRentalData | ParsedItemData,
+  rejectionCriteria: string,
+): Promise<RejectionResult> {
+  const criteriaHash = hashText(rejectionCriteria);
+
+  // Check rejection cache
+  const cached = getRejectionCache(listing.platform, listing.platformId, criteriaHash);
+  if (cached) return cached;
+
+  // Build a compact summary from the universal parse for the rejection prompt
+  const summaryParts: string[] = [`Title: ${listing.title}`];
+
+  // Rental-specific fields
+  if ('totalMonthlyCost' in universalParse && universalParse.totalMonthlyCost != null) {
+    summaryParts.push(`Total monthly cost: ${universalParse.totalMonthlyCost} PLN`);
+  }
+  if ('contractType' in universalParse && universalParse.contractType != null) {
+    summaryParts.push(`Contract type: ${universalParse.contractType}`);
+  }
+  if ('petFriendly' in universalParse && universalParse.petFriendly != null) {
+    summaryParts.push(`Pets allowed: ${universalParse.petFriendly}`);
+  }
+  if ('furnished' in universalParse && universalParse.furnished != null) {
+    summaryParts.push(`Furnished: ${universalParse.furnished}`);
+  }
+  if ('balcony' in universalParse && universalParse.balcony != null) {
+    summaryParts.push(`Balcony: ${universalParse.balcony}`);
+  }
+  if ('parkingIncluded' in universalParse && universalParse.parkingIncluded != null) {
+    summaryParts.push(`Parking: ${universalParse.parkingIncluded}`);
+  }
+  if ('restrictions' in universalParse) {
+    const restrictions = universalParse.restrictions as string[];
+    if (restrictions.length > 0) summaryParts.push(`Restrictions: ${restrictions.join(', ')}`);
+  }
+
+  // Item-specific fields
+  if ('actualCondition' in universalParse) {
+    summaryParts.push(`Condition: ${universalParse.actualCondition}`);
+  }
+  if ('defects' in universalParse) {
+    const defects = universalParse.defects as string[];
+    if (defects.length > 0) summaryParts.push(`Defects: ${defects.join(', ')}`);
+  }
+  if ('includedAccessories' in universalParse) {
+    const accessories = universalParse.includedAccessories as string[];
+    if (accessories.length > 0) summaryParts.push(`Included: ${accessories.join(', ')}`);
+  }
+
+  // Common fields
+  if (universalParse.descriptionSummary) {
+    summaryParts.push(`Summary: ${universalParse.descriptionSummary}`);
+  }
+
+  const userMessage = `LISTING SUMMARY:
+${summaryParts.join('\n')}
+
+USER REJECTION CRITERIA:
+${rejectionCriteria}`;
+
+  const response = await getClient().messages.create({
+    model: MODEL,
+    max_tokens: 256,
+    temperature: 0,
+    system: REJECTION_PROMPT,
+    messages: [{ role: 'user', content: userMessage }],
+  }, { timeout: 15_000 });
+
+  const textBlock = response.content.find((b) => b.type === 'text');
+  if (!textBlock || textBlock.type !== 'text') {
+    throw new Error('No text in Claude rejection response');
+  }
+
+  let rejJsonStr = textBlock.text.trim();
+  if (rejJsonStr.startsWith('```')) {
+    rejJsonStr = rejJsonStr.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '');
+  }
+  const rejJsonMatch = rejJsonStr.match(/\{[\s\S]*\}/);
+  if (rejJsonMatch) rejJsonStr = rejJsonMatch[0];
+
+  let result: RejectionResult;
+  try {
+    const raw = JSON.parse(rejJsonStr);
+    result = RejectionResultSchema.parse(raw) as RejectionResult;
+  } catch (parseErr) {
+    console.error('[evaluateRejection] Failed to parse AI JSON:', rejJsonStr.slice(0, 200));
+    // Default to not rejected on parse failure
+    result = { rejected: false, rejectionReason: null };
+  }
+
+  // Cache the rejection result
+  try {
+    saveRejectionCache(
+      listing.platform,
+      listing.platformId,
+      criteriaHash,
+      result.rejected,
+      result.rejectionReason,
+    );
+  } catch (dbErr) {
+    console.error('[evaluateRejection] Cache write failed:', dbErr);
+  }
+
+  return result;
 }
