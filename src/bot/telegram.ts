@@ -249,6 +249,15 @@ export function startBot(): TelegramBot {
     const text = (msg.text ?? '').trim();
     if (!text) return;
 
+    // Log custom emoji entities for collecting emoji IDs
+    const customEmojis = (msg.entities ?? []).filter((e: any) => e.type === 'custom_emoji');
+    if (customEmojis.length > 0) {
+      for (const e of customEmojis) {
+        const emojiChar = text.slice(e.offset, e.offset + e.length);
+        console.log(`[emoji] Custom emoji: "${emojiChar}" → id: ${(e as any).custom_emoji_id}`);
+      }
+    }
+
     // /start and /help are handled above — skip them here
     if (/^\/start\b/.test(text) || /^\/help\b/.test(text)) return;
 

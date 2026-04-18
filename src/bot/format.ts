@@ -41,6 +41,38 @@ function truncate(text: string, limit = 4000): string {
 }
 
 // ---------------------------------------------------------------------------
+// Custom emoji — premium animated emoji via tg-emoji tags
+// ---------------------------------------------------------------------------
+
+const CE = {
+  yes:        '<tg-emoji emoji-id="5424972835095329742">👍</tg-emoji>',
+  no:         '<tg-emoji emoji-id="5416036249397905594">👎</tg-emoji>',
+  fire:       '<tg-emoji emoji-id="5425111515294354563">🔥</tg-emoji>',
+  warning:    '<tg-emoji emoji-id="5357067430755585653">❗️</tg-emoji>',
+  doubt:      '<tg-emoji emoji-id="5357585725934029727">❓</tg-emoji>',
+  price:      '<tg-emoji emoji-id="5435999124245729290">💰</tg-emoji>',
+  house:      '<tg-emoji emoji-id="5363840027245696377">🏠</tg-emoji>',
+  phone:      '<tg-emoji emoji-id="5433866857666855412">📞</tg-emoji>',
+  mail:       '<tg-emoji emoji-id="5224229095927205846">💌</tg-emoji>',
+  person:     '<tg-emoji emoji-id="5425112292683435471">🐰</tg-emoji>',
+  landlord:   '<tg-emoji emoji-id="5433767609562578028">🐸</tg-emoji>',
+  thinking:   '<tg-emoji emoji-id="5424920651242687937">💭</tg-emoji>',
+  pros:       '<tg-emoji emoji-id="5224694451338759997">↗️</tg-emoji>',
+  cons:       '<tg-emoji emoji-id="5224340348465073584">↘️</tg-emoji>',
+  pets:       '<tg-emoji emoji-id="5224205894513873252">🐾</tg-emoji>',
+  kitchen:    '<tg-emoji emoji-id="5364142105180521805">🍴</tg-emoji>',
+  ac:         '<tg-emoji emoji-id="5424976150810086048">☀️</tg-emoji>',
+  bathroom:   '<tg-emoji emoji-id="5436199127987799646">💦</tg-emoji>',
+  contract:   '<tg-emoji emoji-id="5364265065799239497">✏️</tg-emoji>',
+} as const;
+
+function ceYn(val: boolean | null | undefined): string {
+  if (val === true) return CE.yes;
+  if (val === false) return CE.no;
+  return CE.doubt;
+}
+
+// ---------------------------------------------------------------------------
 // Rental card — comprehensive
 // ---------------------------------------------------------------------------
 
@@ -52,18 +84,18 @@ export function formatRentalCard(
   const lines: string[] = [];
 
   // Header
-  lines.push(`<b>\uD83C\uDFE0 ${esc(listing.title)}</b>`);
+  lines.push(`<b>${CE.house} ${esc(listing.title)}</b>`);
   lines.push(listing.url);
   lines.push('');
 
-  // AI Summary (the most valuable part)
+  // AI Summary
   if (parsed?.descriptionSummary) {
-    lines.push(`\uD83D\uDCDD ${esc(parsed.descriptionSummary)}`);
+    lines.push(`${CE.thinking} ${esc(parsed.descriptionSummary)}`);
     lines.push('');
   }
 
   // ---- COSTS (CRITICAL) ----
-  lines.push('<b>\uD83D\uDCB0 COSTS</b>');
+  lines.push(`<b>${CE.price} COSTS</b>`);
   lines.push(`Rent:        ${pln(listing.price)}`);
   if (parsed?.adminFee != null) {
     lines.push(`Czynsz admin: ${pln(parsed.adminFee)}`);
@@ -86,7 +118,7 @@ export function formatRentalCard(
   } else if (listing.deposit != null) {
     lines.push(`Kaucja: ${pln(listing.deposit)}`);
   } else {
-    lines.push(`Kaucja: \u26A0\uFE0F not specified \u2014 ask landlord`);
+    lines.push(`Kaucja: ${CE.warning} not specified \u2014 ask landlord`);
   }
 
   // What's included / tenant pays
@@ -99,7 +131,7 @@ export function formatRentalCard(
   lines.push('');
 
   // ---- CONTRACT (CRITICAL) ----
-  lines.push('<b>\uD83D\uDCCB CONTRACT</b>');
+  lines.push(`<b>${CE.contract} CONTRACT</b>`);
   if (parsed?.contractType) {
     const contractDisplay = parsed.contractType.replace(/_/g, ' ');
     lines.push(`Type: ${contractDisplay}`);
@@ -111,21 +143,21 @@ export function formatRentalCard(
   if (parsed?.minimumLease) lines.push(`Min lease: ${esc(parsed.minimumLease)}`);
 
   const restrictions: string[] = [];
-  restrictions.push(`Pets: ${yn(parsed?.petFriendly)}`);
-  restrictions.push(`Smoking: ${yn(parsed?.smokingAllowed)}`);
+  restrictions.push(`${CE.pets} Pets: ${ceYn(parsed?.petFriendly)}`);
+  restrictions.push(`Smoking: ${ceYn(parsed?.smokingAllowed)}`);
   if (parsed?.furnished) restrictions.push(`Furnished: ${parsed.furnished}`);
-  if (parsed?.parkingIncluded != null) restrictions.push(`Parking: ${yn(parsed.parkingIncluded)}`);
-  if (parsed?.balcony != null) restrictions.push(`Balcony: ${yn(parsed.balcony)}`);
+  if (parsed?.parkingIncluded != null) restrictions.push(`Parking: ${ceYn(parsed.parkingIncluded)}`);
+  if (parsed?.balcony != null) restrictions.push(`Balcony: ${ceYn(parsed.balcony)}`);
   lines.push(restrictions.join(' | '));
 
   const restrictionsList = parsed?.restrictions ?? [];
   if (restrictionsList.length > 0) {
-    lines.push(`\u26A0\uFE0F ${restrictionsList.map(r => esc(r)).join(', ')}`);
+    lines.push(`${CE.warning} ${restrictionsList.map(r => esc(r)).join(', ')}`);
   }
   lines.push('');
 
   // ---- APARTMENT ----
-  lines.push('<b>\uD83C\uDFE0 APARTMENT</b>');
+  lines.push(`<b>${CE.house} APARTMENT</b>`);
   const details: string[] = [];
   if (listing.rooms != null) details.push(`${listing.rooms} rooms`);
   if (listing.area != null) details.push(`${listing.area} m\u00B2`);
@@ -134,9 +166,9 @@ export function formatRentalCard(
   if (listing.heating) details.push(esc(listing.heating));
   if (details.length > 0) lines.push(details.join(' | '));
 
-  if (parsed?.kitchenDetails) lines.push(`\uD83C\uDF73 Kitchen: ${esc(parsed.kitchenDetails)}`);
-  if (parsed?.bathroomDetails) lines.push(`\uD83D\uDEBF Bathroom: ${esc(parsed.bathroomDetails)}`);
-  if (parsed?.internetReady) lines.push(`\uD83C\uDF10 Internet: ${esc(parsed.internetReady)}`);
+  if (parsed?.kitchenDetails) lines.push(`${CE.kitchen} Kitchen: ${esc(parsed.kitchenDetails)}`);
+  if (parsed?.bathroomDetails) lines.push(`${CE.bathroom} Bathroom: ${esc(parsed.bathroomDetails)}`);
+  if (parsed?.internetReady) lines.push(`${CE.ac} Internet: ${esc(parsed.internetReady)}`);
 
   const furnitureList = parsed?.furnitureAndEquipment ?? [];
   if (furnitureList.length > 0) {
@@ -178,33 +210,32 @@ export function formatRentalCard(
 
   // ---- AI ASSESSMENT ----
   if (parsed?.bestSuitedFor) {
-    lines.push(`\uD83D\uDC64 Best for: ${esc(parsed.bestSuitedFor)}`);
+    lines.push(`${CE.person} Best for: ${esc(parsed.bestSuitedFor)}`);
   }
   if (parsed?.landlordNotes) {
-    lines.push(`\uD83D\uDDE3 Landlord: ${esc(parsed.landlordNotes)}`);
+    lines.push(`${CE.landlord} Landlord: ${esc(parsed.landlordNotes)}`);
   }
   const positives = parsed?.positives ?? [];
   if (positives.length > 0) {
-    lines.push(`\u2705 ${positives.map(p => esc(p)).join(', ')}`);
+    lines.push(`${CE.pros} ${positives.map(p => esc(p)).join(', ')}`);
   }
   const redFlags = parsed?.redFlags ?? [];
   if (redFlags.length > 0) {
-    lines.push(`\uD83D\uDEA9 ${redFlags.map(f => esc(f)).join(', ')}`);
+    lines.push(`${CE.cons} ${redFlags.map(f => esc(f)).join(', ')}`);
   }
   const additionalNotes = parsed?.additionalNotes ?? [];
   if (additionalNotes.length > 0) {
-    lines.push(`\uD83D\uDCCC ${additionalNotes.map(n => esc(n)).join(', ')}`);
+    lines.push(additionalNotes.map(n => esc(n)).join(', '));
   }
 
   // Contact
   lines.push('');
   const contactParts: string[] = [];
-  if (listing.phone) contactParts.push(`\uD83D\uDCDE ${listing.phone}`);
-  if (listing.contactName) contactParts.push(esc(listing.contactName));
+  if (listing.phone) contactParts.push(`${CE.phone} ${listing.phone}`);
+  if (listing.contactName) contactParts.push(`${CE.person} ${esc(listing.contactName)}`);
   if (listing.advertiserType) contactParts.push(listing.advertiserType);
   if (listing.agencyName) contactParts.push(esc(listing.agencyName));
   if (contactParts.length > 0) lines.push(contactParts.join(' | '));
-  lines.push(`\uD83D\uDCF8 ${listing.photos.length} photos`);
 
   return truncate(lines.join('\n'));
 }
@@ -223,39 +254,39 @@ export function formatItemCard(
   const lines: string[] = [];
 
   // PRICE + CONDITION first (most important info)
-  lines.push(`<b>\uD83D\uDCB0 ${pln(item.price)}${item.negotiable ? ' (negotiable)' : ''}</b>`);
+  lines.push(`<b>${CE.price} ${pln(item.price)}${item.negotiable ? ' (negotiable)' : ''}</b>`);
   if (item.condition) lines.push(`<b>${esc(item.condition)}</b>`);
   lines.push('');
 
   // Title + link
-  lines.push(`\uD83D\uDECD ${esc(item.title)}`);
+  lines.push(`${esc(item.title)}`);
   lines.push(item.url);
   lines.push('');
 
   // AI assessment
-  if (parsed?.actualCondition) lines.push(`\uD83D\uDD0D ${esc(parsed.actualCondition)}`);
-  if (parsed?.priceAssessment) lines.push(`\uD83D\uDCA1 ${esc(parsed.priceAssessment)}`);
-  if (parsed?.descriptionSummary) lines.push(`\uD83D\uDCDD ${esc(parsed.descriptionSummary)}`);
+  if (parsed?.actualCondition) lines.push(`${CE.thinking} ${esc(parsed.actualCondition)}`);
+  if (parsed?.priceAssessment) lines.push(`${CE.fire} ${esc(parsed.priceAssessment)}`);
+  if (parsed?.descriptionSummary) lines.push(`${esc(parsed.descriptionSummary)}`);
   lines.push('');
 
   // Details
   const defects = parsed?.defects ?? [];
   if (defects.length > 0) {
-    lines.push(`\u26A0\uFE0F Defects: ${defects.map(d => esc(d)).join(', ')}`);
+    lines.push(`${CE.warning} Defects: ${defects.map(d => esc(d)).join(', ')}`);
   }
   const accessories = parsed?.includedAccessories ?? [];
   if (accessories.length > 0) {
-    lines.push(`\uD83D\uDCE6 Includes: ${accessories.map(a => esc(a)).join(', ')}`);
+    lines.push(`${CE.yes} Includes: ${accessories.map(a => esc(a)).join(', ')}`);
   }
   if (parsed?.whySelling) {
-    lines.push(`\uD83D\uDCAC Why selling: ${esc(parsed.whySelling)}`);
+    lines.push(`${CE.doubt} Why selling: ${esc(parsed.whySelling)}`);
   }
   if (parsed?.bestFor) {
-    lines.push(`\uD83D\uDC64 Best for: ${esc(parsed.bestFor)}`);
+    lines.push(`${CE.person} Best for: ${esc(parsed.bestFor)}`);
   }
   const itemRedFlags = parsed?.redFlags ?? [];
   if (itemRedFlags.length > 0) {
-    lines.push(`\uD83D\uDEA9 ${itemRedFlags.map(f => esc(f)).join(', ')}`);
+    lines.push(`${CE.cons} ${itemRedFlags.map(f => esc(f)).join(', ')}`);
   }
 
   // Params
@@ -268,8 +299,8 @@ export function formatItemCard(
   // Location + contact
   lines.push('');
   if (item.city) lines.push(`\uD83D\uDCCD ${item.district ? esc(item.district) + ', ' : ''}${esc(item.city)}`);
-  if (item.phone) lines.push(`\uD83D\uDCDE ${item.phone}`);
-  if (item.contactName) lines.push(`\uD83D\uDC64 ${esc(item.contactName)}${item.isBusiness ? ' (business)' : ''}`);
+  if (item.phone) lines.push(`${CE.phone} ${item.phone}`);
+  if (item.contactName) lines.push(`${CE.person} ${esc(item.contactName)}${item.isBusiness ? ' (business)' : ''}`);
   lines.push(`\uD83D\uDCF8 ${item.photos.length} photos`);
 
   return truncate(lines.join('\n'));
