@@ -651,13 +651,13 @@ async function execFindRentals(
       } catch (e) {
         console.error('[tools] photo+caption failed:', e instanceof Error ? e.message : e);
         // Fallback: send separately
-        try { await sendFn(ctx.chatId, card); } catch (e2) { console.error('[tools] send failed:', e2 instanceof Error ? e2.message : e2); }
+        try { await sendFn(ctx.chatId, card, { parse_mode: 'HTML' }); } catch (e2) { console.error('[tools] send failed:', e2 instanceof Error ? e2.message : e2); }
       }
     } else {
-      // Send all chunks
+      // Send all chunks — pass parse_mode: 'HTML' to bypass mdToHtml (cards are already HTML)
       for (const chunk of cardChunks) {
         try {
-          await sendFn(ctx.chatId, chunk);
+          await sendFn(ctx.chatId, chunk, { parse_mode: 'HTML' });
         } catch (cardErr) {
           try { await sendFn(ctx.chatId, `${listing.title}\n${listing.url}\nPrice: ${listing.price} PLN`, { parse_mode: undefined }); } catch (e) { console.error('[tools] send failed:', e instanceof Error ? e.message : e); }
           break;
@@ -804,12 +804,12 @@ async function execFindItems(
         await sendPhotosFn(ctx.chatId, enrichedItem.photos.slice(0, 10), card);
       } catch (e) {
         console.error('[tools] photo+caption failed:', e instanceof Error ? e.message : e);
-        try { await sendFn(ctx.chatId, card); } catch (e2) { console.error('[tools] send failed:', e2 instanceof Error ? e2.message : e2); }
+        try { await sendFn(ctx.chatId, card, { parse_mode: 'HTML' }); } catch (e2) { console.error('[tools] send failed:', e2 instanceof Error ? e2.message : e2); }
       }
     } else {
       for (const chunk of itemChunks) {
         try {
-          await sendFn(ctx.chatId, chunk);
+          await sendFn(ctx.chatId, chunk, { parse_mode: 'HTML' });
         } catch (cardErr) {
           try { await sendFn(ctx.chatId, `${enrichedItem.title}\n${enrichedItem.url}\nPrice: ${enrichedItem.price} PLN`, { parse_mode: undefined }); } catch (e) { console.error('[tools] send failed:', e instanceof Error ? e.message : e); }
           break;

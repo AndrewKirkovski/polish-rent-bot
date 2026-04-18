@@ -281,10 +281,21 @@ export async function evaluateRejection(
   const cached = getRejectionCache(listing.platform, listing.platformId, criteriaHash);
   if (cached) return cached;
 
-  // Build a compact summary from the universal parse for the rejection prompt
+  // Build a compact summary from listing + universal parse for the rejection prompt
   const summaryParts: string[] = [`Title: ${listing.title}`];
 
-  // Rental-specific fields
+  // Listing-level fields (from crawler data — always available)
+  const l = listing as Record<string, unknown>;
+  if (l.floor != null) summaryParts.push(`Floor: ${l.floor}`);
+  if (l.area != null) summaryParts.push(`Area: ${l.area} m²`);
+  if (l.rooms != null) summaryParts.push(`Rooms: ${l.rooms}`);
+  if (l.district) summaryParts.push(`District: ${l.district}`);
+  if (l.city) summaryParts.push(`City: ${l.city}`);
+  if (l.advertiserType) summaryParts.push(`Advertiser: ${l.advertiserType}`);
+  if (l.price != null) summaryParts.push(`Rent price: ${l.price} PLN`);
+  if (l.rent != null) summaryParts.push(`Czynsz admin: ${l.rent} PLN`);
+
+  // AI-parsed fields
   if ('totalMonthlyCost' in universalParse && universalParse.totalMonthlyCost != null) {
     summaryParts.push(`Total monthly cost: ${universalParse.totalMonthlyCost} PLN`);
   }

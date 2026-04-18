@@ -34,7 +34,7 @@ function listItems(items: string[] | undefined, prefix = '\u2022 '): string {
   return items.map(i => `${prefix}${esc(i)}`).join('\n');
 }
 
-/** Split text into chunks that fit Telegram's 4096 char limit */
+/** Split text into chunks that fit Telegram's 4096 char limit. HTML-tag-aware. */
 export function splitMessage(text: string, limit = 4000): string[] {
   if (text.length <= limit) return [text];
 
@@ -42,10 +42,20 @@ export function splitMessage(text: string, limit = 4000): string[] {
   let remaining = text;
 
   while (remaining.length > limit) {
-    // Find last double-newline before the limit
     let splitAt = remaining.lastIndexOf('\n\n', limit);
     if (splitAt <= 0) splitAt = remaining.lastIndexOf('\n', limit);
-    if (splitAt <= 0) splitAt = limit; // hard split as last resort
+    if (splitAt <= 0) {
+      // Hard split — but avoid splitting inside an HTML tag
+      splitAt = limit;
+      // Scan backwards to find a position outside any < > tag
+      const lastOpen = remaining.lastIndexOf('<', splitAt);
+      const lastClose = remaining.lastIndexOf('>', splitAt);
+      if (lastOpen > lastClose) {
+        // We're inside a tag — back up to before the tag opens
+        splitAt = lastOpen;
+      }
+    }
+    if (splitAt <= 0) splitAt = limit; // absolute fallback
 
     chunks.push(remaining.slice(0, splitAt).trim());
     remaining = remaining.slice(splitAt).trim();
