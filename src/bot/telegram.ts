@@ -45,7 +45,7 @@ async function ensureAuth(msg: Msg): Promise<boolean> {
     addUser(telegramId, username);
     authorizeUser(telegramId);
     await safeSend(_bot!, msg.chat.id, 'Access granted. Welcome! Type /start for commands.', {
-      parse_mode: 'Markdown',
+      parse_mode: 'HTML',
     });
     return false; // handled — don't run command
   }
@@ -54,7 +54,7 @@ async function ensureAuth(msg: Msg): Promise<boolean> {
   return false;
 }
 
-// (dead MarkdownV2 esc() removed — format.ts has its own esc() for classic Markdown)
+// (format.ts has its own esc() for HTML escaping)
 
 // ---------------------------------------------------------------------------
 // Enriched notification sender (used by scheduler)
@@ -76,7 +76,7 @@ export async function sendEnrichedNotification(
     text = formatRichRentalNotification(listing as Listing, parsedData as ParsedRentalData | undefined, locationScore ?? undefined);
   }
 
-  await safeSend(bot, chatId, text, { parse_mode: 'Markdown', disable_web_page_preview: false });
+  await safeSend(bot, chatId, text, { parse_mode: 'HTML', disable_web_page_preview: false });
 
   // Send photo album if available
   const photos = listing.photos;
@@ -96,13 +96,13 @@ export async function sendEnrichedNotification(
 type SendFn = (chatId: number | string, text: string, opts?: Record<string, unknown>) => Promise<void>;
 type SendPhotosFn = (chatId: number | string, urls: string[]) => Promise<void>;
 
-// Safe sendMessage wrapper — catches errors, retries without parse_mode on Markdown failures
+// Safe sendMessage wrapper — catches errors, retries without parse_mode on parse failures
 async function safeSend(bot: TelegramBot, chatId: number | string, text: string, opts?: TelegramBot.SendMessageOptions): Promise<void> {
   try {
     await bot.sendMessage(chatId, text, opts);
   } catch (err) {
     console.error('[telegram] sendMessage failed:', err instanceof Error ? err.message : err);
-    // If Markdown failed, retry without parse_mode
+    // If HTML parsing failed, retry without parse_mode
     if (opts?.parse_mode && err instanceof Error && err.message.includes("can't parse entities")) {
       try {
         await bot.sendMessage(chatId, text); // plain text fallback
@@ -115,9 +115,8 @@ async function safeSend(bot: TelegramBot, chatId: number | string, text: string,
 
 function makeSendFn(bot: TelegramBot): SendFn {
   return async (chatId, text, opts?) => {
-    // Use Markdown (classic, not V2) — same as ai-managers
-    // Claude naturally uses *bold* and [links](url) which classic Markdown handles
-    await safeSend(bot, chatId, text, { parse_mode: 'Markdown', ...opts } as TelegramBot.SendMessageOptions);
+    // Use HTML parse_mode — more robust escaping, clickable URLs
+    await safeSend(bot, chatId, text, { parse_mode: 'HTML', ...opts } as TelegramBot.SendMessageOptions);
   };
 }
 
@@ -148,7 +147,7 @@ export function startBot(): TelegramBot {
     try {
       if (!(await ensureAuth(msg))) return;
       const text = [
-        '\uD83C\uDDF5\uD83C\uDDF1 *Polish Rent & Items Bot*',
+        '\uD83C\uDDF5\uD83C\uDDF1 <b>Polish Rent &amp; Items Bot</b>',
         '',
         "I'm an AI-powered assistant that helps you find apartments and items in Poland.",
         '',
@@ -159,7 +158,7 @@ export function startBot(): TelegramBot {
         '',
         'Or use /help for more info.',
       ].join('\n');
-      await safeSend(bot, msg.chat.id, text, { parse_mode: 'Markdown' });
+      await safeSend(bot, msg.chat.id, text, { parse_mode: 'HTML' });
     } catch (err) {
       console.error('[telegram] /start handler error:', err);
     }
@@ -170,7 +169,7 @@ export function startBot(): TelegramBot {
     try {
       if (!(await ensureAuth(msg))) return;
       const text = [
-        '*How to use this bot*',
+        '<b>How to use this bot</b>',
         '',
         'Send me any message in natural language.',
         '',
@@ -181,13 +180,13 @@ export function startBot(): TelegramBot {
         '- Score locations (nearby metro, gym, pool, commute)',
         '- Create monitors that notify you of new listings',
         '',
-        '*Examples:*',
+        '<b>Examples:</b>',
         '"Find apartments in Gdansk, 2 rooms, max 2500 PLN"',
         '"Monitor iPhones under 3000 PLN in Warszawa"',
         '"Show my monitors"',
         '"Stop monitor 5"',
       ].join('\n');
-      await safeSend(bot, msg.chat.id, text, { parse_mode: 'Markdown' });
+      await safeSend(bot, msg.chat.id, text, { parse_mode: 'HTML' });
     } catch (err) {
       console.error('[telegram] /help handler error:', err);
     }

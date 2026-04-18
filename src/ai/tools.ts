@@ -163,6 +163,11 @@ export const TOOL_DEFINITIONS: Tool[] = [
       type: 'object' as const,
       properties: {
         query: { type: 'string', description: 'Search keywords (e.g. "biurko", "iphone 15", "sofa")' },
+        mandatoryKeywords: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Keywords that MUST appear in the listing title. Used to filter out irrelevant results. E.g. for "Galaxy XR" search, mandatory keywords would be ["galaxy", "xr"]',
+        },
         city: { type: 'string', description: 'City name to filter by' },
         priceFrom: { type: 'number', description: 'Minimum price in PLN' },
         priceTo: { type: 'number', description: 'Maximum price in PLN' },
@@ -288,7 +293,8 @@ async function execFindRentals(
   const priceFrom = input.priceFrom as number | undefined;
   const priceTo = input.priceTo as number | undefined;
   const roomsFrom = input.roomsFrom as number | undefined;
-  const roomsTo = input.roomsTo as number | undefined;
+  // If roomsFrom is set but roomsTo is not, default to exact match
+  const roomsTo = (input.roomsTo as number | undefined) ?? roomsFrom;
   const areaFrom = input.areaFrom as number | undefined;
   const areaTo = input.areaTo as number | undefined;
   const ownerType = input.ownerType as string | undefined;
@@ -652,16 +658,29 @@ async function execFindItems(
     limit: 30,
   });
 
-  if (result.items.length === 0) {
+  // Pre-filter by mandatory keywords in title before AI parsing
+  const mandatoryKeywords = (input.mandatoryKeywords as string[] ?? []).map(k => k.toLowerCase());
+
+  let filteredItems = result.items;
+  if (mandatoryKeywords.length > 0) {
+    filteredItems = filteredItems.filter(item => {
+      const titleLower = item.title.toLowerCase();
+      return mandatoryKeywords.every(kw => titleLower.includes(kw));
+    });
+    console.log(`[find_items] Filtered by mandatory keywords [${mandatoryKeywords.join(', ')}]: ${filteredItems.length} of ${result.items.length}`);
+  }
+
+  if (filteredItems.length === 0) {
     return 'No items found matching your search. Try different keywords or remove the city filter.';
   }
 
   const debugLimit = process.env.DEBUG_LIMIT ? parseInt(process.env.DEBUG_LIMIT, 10) : 0;
-  const candidateLimit = debugLimit > 0 ? Math.min(result.items.length, debugLimit) : maxResults * 2;
-  const candidates = result.items.slice(0, candidateLimit); // get extra for potential filtering
+  const candidateLimit = debugLimit > 0 ? Math.min(filteredItems.length, debugLimit) : maxResults * 2;
+  const candidates = filteredItems.slice(0, candidateLimit); // get extra for potential filtering
   ctx.lastSearchResults = candidates;
 
-  try { await sendFn(ctx.chatId, `Found ${result.totalAvailable} items. Analyzing top ${Math.min(candidates.length, maxResults)}...`, { parse_mode: undefined }); } catch (e) { console.error('[tools] send failed:', e instanceof Error ? e.message : e); }
+  const displayTotal = mandatoryKeywords.length > 0 ? filteredItems.length : result.totalAvailable;
+  try { await sendFn(ctx.chatId, `Found ${displayTotal} items${mandatoryKeywords.length > 0 ? ` (filtered from ${result.totalAvailable})` : ''}. Analyzing top ${Math.min(candidates.length, maxResults)}...`, { parse_mode: undefined }); } catch (e) { console.error('[tools] send failed:', e instanceof Error ? e.message : e); }
 
   const shown: ItemListing[] = [];
 
@@ -712,7 +731,7 @@ async function execFindItems(
 
   ctx.lastSearchResults = shown;
 
-  return `Showed ${shown.length} item(s) to the user with photos and detailed condition analysis cards. Total available: ${result.totalAvailable}.\n\nIMPORTANT: The user has ALREADY seen full details, photos, prices, and cards. Do NOT repeat listing details. Just offer next steps.`;
+  return `Showed ${shown.length} item(s) to the user with photos and detailed condition analysis cards. Total available: ${displayTotal}${mandatoryKeywords.length > 0 ? ` (filtered from ${result.totalAvailable} by mandatory keywords)` : ''}.\n\nIMPORTANT: The user has ALREADY seen full details, photos, prices, and cards. Do NOT repeat listing details. Just offer next steps.`;
 }
 
 // ---------------------------------------------------------------------------

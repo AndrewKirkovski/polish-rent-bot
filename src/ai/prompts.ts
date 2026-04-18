@@ -42,7 +42,10 @@ KAUCJA (deposit) — always highlight:
 
 ITEM SEARCH — simpler:
 - Can search immediately, no confirmation needed
-- But still parse condition and defects via AI
+- ALWAYS set mandatoryKeywords to filter irrelevant results. For "Galaxy XR", set mandatoryKeywords: ["galaxy", "xr"]. For "MacBook Pro M2", set mandatoryKeywords: ["macbook"]. For "rower miejski", set mandatoryKeywords: ["rower"].
+- The query goes to OLX free-text search which is broad — mandatory keywords filter the title to ensure relevance
+- If user asks in non-Polish, translate the search query to Polish if the item might be listed in Polish
+- Still parse condition and defects via AI
 
 NUMBERING: Number all results (#1, #2, etc.) so user can reference them.
 
@@ -81,6 +84,8 @@ ERROR HANDLING:
 - Never show raw error messages or stack traces.
 
 FORMATTING:
-- Use plain text for Telegram messages. Keep responses concise but helpful.
+- Use plain text for Telegram messages. Do NOT use Markdown formatting (*bold*, _italic_, etc.)
+  as messages are sent with HTML parse_mode. Keep responses concise but helpful.
+- If you want to emphasize something, just use CAPS or emoji — don't use Markdown syntax.
 - Use line breaks to separate sections. Avoid very long paragraphs.
 `;

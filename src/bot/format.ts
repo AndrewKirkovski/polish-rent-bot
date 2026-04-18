@@ -1,5 +1,5 @@
 // Rich notification formatters for Telegram
-// Uses classic Markdown parse_mode — sanitize user/AI text with esc()
+// Uses HTML parse_mode — sanitize user/AI text with esc()
 
 import type TelegramBot from 'node-telegram-bot-api';
 import type { Listing, ParsedRentalData, ParsedItemData, LocationScore } from '../types.js';
@@ -9,12 +9,13 @@ import type { ItemListing } from '../crawlers/olx-items.js';
 // Helpers
 // ---------------------------------------------------------------------------
 
-/** Escape classic Telegram Markdown special chars in user/AI-generated text */
+/** Escape HTML special chars in user/AI-generated text for Telegram HTML parse_mode */
 function esc(text: string | number | null | undefined): string {
   if (text == null) return '';
   return String(text)
-    .replace(/\\/g, '\\\\')   // escape backslash first
-    .replace(/[_*`\[\]()]/g, '\\$&'); // escape _ * ` [ ] ( )
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
 }
 
 function pln(amount: number | null | undefined): string {
@@ -36,7 +37,7 @@ function listItems(items: string[] | undefined, prefix = '\u2022 '): string {
 /** Telegram message limit is 4096; truncate with a marker so we never exceed it */
 function truncate(text: string, limit = 4000): string {
   if (text.length <= limit) return text;
-  return text.slice(0, limit) + '\n\u2026 _(truncated)_';
+  return text.slice(0, limit) + '\n\u2026 <i>(truncated)</i>';
 }
 
 // ---------------------------------------------------------------------------
@@ -51,8 +52,8 @@ export function formatRentalCard(
   const lines: string[] = [];
 
   // Header
-  lines.push(`*\uD83C\uDFE0 ${esc(listing.title)}*`);
-  lines.push(`\`${listing.url}\``);
+  lines.push(`<b>\uD83C\uDFE0 ${esc(listing.title)}</b>`);
+  lines.push(listing.url);
   lines.push('');
 
   // AI Summary (the most valuable part)
@@ -62,7 +63,7 @@ export function formatRentalCard(
   }
 
   // ---- COSTS (CRITICAL) ----
-  lines.push('*\uD83D\uDCB0 COSTS*');
+  lines.push('<b>\uD83D\uDCB0 COSTS</b>');
   lines.push(`Rent:        ${pln(listing.price)}`);
   if (parsed?.adminFee != null) {
     lines.push(`Czynsz admin: ${pln(parsed.adminFee)}`);
@@ -98,7 +99,7 @@ export function formatRentalCard(
   lines.push('');
 
   // ---- CONTRACT (CRITICAL) ----
-  lines.push('*\uD83D\uDCCB CONTRACT*');
+  lines.push('<b>\uD83D\uDCCB CONTRACT</b>');
   if (parsed?.contractType) {
     const contractDisplay = parsed.contractType.replace(/_/g, ' ');
     lines.push(`Type: ${contractDisplay}`);
@@ -126,7 +127,7 @@ export function formatRentalCard(
   lines.push('');
 
   // ---- APARTMENT ----
-  lines.push('*\uD83C\uDFE0 APARTMENT*');
+  lines.push('<b>\uD83C\uDFE0 APARTMENT</b>');
   const details: string[] = [];
   if (listing.rooms != null) details.push(`${listing.rooms} rooms`);
   if (listing.area != null) details.push(`${listing.area} m\u00B2`);
@@ -147,7 +148,7 @@ export function formatRentalCard(
 
   // ---- LOCATION ----
   if (locationScore) {
-    lines.push(`*\uD83D\uDCCD LOCATION (${locationScore.overallScore}/100)*`);
+    lines.push(`<b>\uD83D\uDCCD LOCATION (${locationScore.overallScore}/100)</b>`);
     const icons: Record<string, string> = {
       metro: '\uD83D\uDE87', tram: '\uD83D\uDE8B', gym: '\uD83C\uDFCB\uFE0F', pool: '\uD83C\uDFCA', supermarket: '\uD83D\uDED2', park: '\uD83C\uDF33', pharmacy: '\uD83D\uDC8A',
     };
@@ -223,8 +224,8 @@ export function formatItemCard(
 ): string {
   const lines: string[] = [];
 
-  lines.push(`*\uD83D\uDECD ${esc(item.title)}*`);
-  lines.push(`\`${item.url}\``);
+  lines.push(`<b>\uD83D\uDECD ${esc(item.title)}</b>`);
+  lines.push(item.url);
   lines.push('');
 
   // AI summary
