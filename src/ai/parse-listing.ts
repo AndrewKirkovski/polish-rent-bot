@@ -32,7 +32,7 @@ Given the listing data below, produce a COMPREHENSIVE analysis in JSON. Read the
 
 CRITICAL fields to extract from the description:
 - Kaucja (deposit): Look for "kaucja", "depozyt", "zabezpieczenie", "kaucja zwrotna", amounts like "2x czynsz"
-- Contract type: "najem okazjonalny", "umowa najmu okazjonalnego", "najem instytucjonalny" — if not mentioned assume najem zwykły
+- Contract type: "najem okazjonalny", "umowa najmu okazjonalnego", "najem instytucjonalny" — if NOT mentioned in the description, return null (do NOT assume najem zwykły)
 - Total monthly cost: rent + czynsz administracyjny + estimated utilities. Calculate this explicitly.
 - What's included in czynsz: often includes heating, garbage, water — extract this
 - What tenant pays separately: gas, electricity, internet — extract this
@@ -84,7 +84,7 @@ Return ONLY valid JSON (no markdown fences):
   "additionalNotes": ["anything else noteworthy"]
 }`;
 
-export async function parseRentalListing(listing: Listing): Promise<ParsedRentalData> {
+export async function parseRentalListing(listing: Listing, rejectionCriteria?: string): Promise<ParsedRentalData> {
   const descHash = hashText(listing.description || listing.title);
 
   // Check cache
@@ -108,7 +108,7 @@ Advertiser: ${listing.advertiserType ?? 'unknown'}
 Coordinates: ${listing.lat ?? 'unknown'}, ${listing.lng ?? 'unknown'}
 
 Full description (Polish):
-${(listing.description || 'No description provided').slice(0, 8000)}`;
+${(listing.description || 'No description provided').slice(0, 8000)}${rejectionCriteria ? `\n\nUSER REJECTION CRITERIA: ${rejectionCriteria}\nEvaluate the listing against these criteria. Add a "rejected" field (boolean) and "rejectionReason" (string or null) to your response. Set rejected=true and provide rejectionReason if the listing fails ANY of these criteria.` : ''}`;
 
   const response = await getClient().messages.create({
     model: MODEL,
@@ -189,7 +189,7 @@ Return ONLY valid JSON (no markdown fences):
   "additionalNotes": ["anything else noteworthy"]
 }`;
 
-export async function parseItemListing(item: ItemListing): Promise<ParsedItemData> {
+export async function parseItemListing(item: ItemListing, rejectionCriteria?: string): Promise<ParsedItemData> {
   const descHash = hashText(item.description || item.title);
 
   const cached = getParsedListing(item.platform, item.platformId);
@@ -205,7 +205,7 @@ Seller: ${item.contactName ?? 'unknown'}${item.isBusiness ? ' (business)' : ' (p
 Category params: ${Object.entries(item.params).filter(([k]) => k !== 'price').map(([k, v]) => `${k}: ${v}`).join(', ')}
 
 Full description (Polish):
-${(item.description || 'No description provided').slice(0, 8000)}`;
+${(item.description || 'No description provided').slice(0, 8000)}${rejectionCriteria ? `\n\nUSER REJECTION CRITERIA: ${rejectionCriteria}\nEvaluate the listing against these criteria. Add a "rejected" field (boolean) and "rejectionReason" (string or null) to your response. Set rejected=true and provide rejectionReason if the listing fails ANY of these criteria.` : ''}`;
 
   const response = await getClient().messages.create({
     model: MODEL,

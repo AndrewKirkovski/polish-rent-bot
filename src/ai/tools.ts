@@ -78,7 +78,12 @@ function resolveCityId(name: string): number | undefined {
 // ---------------------------------------------------------------------------
 
 type SendFn = (chatId: number, text: string, opts?: Record<string, unknown>) => Promise<void>;
-type SendPhotosFn = (chatId: number, urls: string[]) => Promise<void>;
+type SendPhotosFn = (chatId: number, urls: string[], caption?: string) => Promise<void>;
+
+/** Escape HTML special chars for Telegram HTML parse_mode */
+function escHtml(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
 
 // ---------------------------------------------------------------------------
 // Tool definitions (Claude API format) -- 6 deep pipeline tools
@@ -149,6 +154,10 @@ export const TOOL_DEFINITIONS: Tool[] = [
           enum: ['najem_okazjonalny', 'any'],
           description: 'Preferred contract type. "najem_okazjonalny" filters for that type only.',
         },
+        rejectionCriteria: {
+          type: 'string',
+          description: 'Free-text criteria for rejecting listings. The AI will evaluate each listing against this. E.g. "no ground floor", "must have balcony", "exclude agencies"',
+        },
       },
       required: ['city'],
     },
@@ -172,6 +181,10 @@ export const TOOL_DEFINITIONS: Tool[] = [
         priceFrom: { type: 'number', description: 'Minimum price in PLN' },
         priceTo: { type: 'number', description: 'Maximum price in PLN' },
         maxResults: { type: 'number', description: 'Number of results to show (default 5, max 10)' },
+        rejectionCriteria: {
+          type: 'string',
+          description: 'Free-text criteria for rejecting items. The AI will evaluate each listing against this. E.g. "exclude non-AMOLED displays", "must have original box", "no scratches on screen"',
+        },
       },
       required: ['query'],
     },
@@ -221,6 +234,10 @@ export const TOOL_DEFINITIONS: Tool[] = [
         workAddress: { type: 'string', description: 'Work/commute destination address' },
         commuteMode: { type: 'string', enum: ['transit', 'driving', 'walking', 'bicycling'] },
         contractPreference: { type: 'string', enum: ['najem_okazjonalny', 'any'] },
+        rejectionCriteria: {
+          type: 'string',
+          description: 'Free-text criteria for rejecting listings. The AI will evaluate each listing against this.',
+        },
         // Item search params
         query: { type: 'string', description: 'Search keywords (for item monitors)' },
       },
@@ -304,6 +321,7 @@ async function execFindRentals(
   const commuteMode = (input.commuteMode as string | undefined) ?? 'transit';
   const maxResults = Math.min(Math.max((input.maxResults as number) || 5, 1), 10);
   const contractPreference = input.contractPreference as string | undefined;
+  const rejectionCriteria = input.rejectionCriteria as string | undefined;
 
   const doOlx = platformsInput === 'olx' || platformsInput === 'all';
   const doOtodom = platformsInput === 'otodom' || platformsInput === 'all';
@@ -497,7 +515,7 @@ async function execFindRentals(
       if (enrichedListing.description) {
         try {
           console.log(`[find_rentals] AI parsing...`);
-          parsedData = await parseRentalListing(enrichedListing);
+          parsedData = await parseRentalListing(enrichedListing, rejectionCriteria);
           console.log(`[find_rentals] AI parsed: total=${parsedData?.totalMonthlyCost}, contract=${parsedData?.contractType}, kaucja=${parsedData?.deposit}`);
         } catch (parseErr) {
           console.error(`[find_rentals] AI parse failed (showing listing anyway):`, parseErr);
@@ -526,6 +544,16 @@ async function execFindRentals(
           url: enrichedListing.url,
           title: enrichedListing.title,
           reason: `contract type "${parsedData.contractType}" does not match preference "najem_okazjonalny"`,
+        });
+        continue;
+      }
+
+      // AI rejection criteria filter
+      if (parsedData?.rejected) {
+        rejected.push({
+          url: enrichedListing.url,
+          title: enrichedListing.title,
+          reason: parsedData.rejectionReason ?? 'Rejected by AI criteria',
         });
         continue;
       }
@@ -593,29 +621,49 @@ async function execFindRentals(
     return `Analyzed ${candidateCount} listings but none passed the filters.${rejectionSummary}\nTry increasing the budget, relaxing amenity requirements, or broadening the search area.`;
   }
 
+  const CAPTION_LIMIT = 1024;
   for (let i = 0; i < accepted.length; i++) {
     const { listing, parsedData, locationScore } = accepted[i];
 
-    // Send card first
     const card = formatRichRentalNotification(
       listing,
       parsedData ?? undefined,
       locationScore ?? undefined,
     );
-    try {
-      await sendFn(ctx.chatId, card);
-    } catch (cardErr) {
-      // fallback: send minimal plain text
-      try { await sendFn(ctx.chatId, `${listing.title}\n${listing.url}\nPrice: ${listing.price} PLN`, { parse_mode: undefined }); } catch (e) { console.error('[tools] send failed:', e instanceof Error ? e.message : e); }
-    }
 
-    // Then photos
-    if (listing.photos.length > 0) {
+    // Send photos with card as caption if short enough, otherwise card then photos
+    if (card.length <= CAPTION_LIMIT && listing.photos.length > 0) {
       try {
-        await sendPhotosFn(ctx.chatId, listing.photos.slice(0, 10));
-      } catch (photoErr) {
-        console.error(`[find_rentals] Photo send error for ${listing.url}:`, photoErr);
+        await sendPhotosFn(ctx.chatId, listing.photos.slice(0, 10), card);
+      } catch (e) {
+        console.error('[tools] photo+caption failed:', e instanceof Error ? e.message : e);
+        // Fallback: send separately
+        try { await sendFn(ctx.chatId, card); } catch (e2) { console.error('[tools] send failed:', e2 instanceof Error ? e2.message : e2); }
       }
+    } else {
+      try {
+        await sendFn(ctx.chatId, card);
+      } catch (cardErr) {
+        try { await sendFn(ctx.chatId, `${listing.title}\n${listing.url}\nPrice: ${listing.price} PLN`, { parse_mode: undefined }); } catch (e) { console.error('[tools] send failed:', e instanceof Error ? e.message : e); }
+      }
+      if (listing.photos.length > 0) {
+        try {
+          await sendPhotosFn(ctx.chatId, listing.photos.slice(0, 10));
+        } catch (photoErr) {
+          console.error(`[find_rentals] Photo send error for ${listing.url}:`, photoErr);
+        }
+      }
+    }
+  }
+
+  // Send rejected listings as brief one-line messages (no photos, no AI analysis)
+  if (rejected.length > 0) {
+    const rejectionLines = rejected.slice(0, 10).map(r =>
+      `\u274C <a href="${r.url}">${escHtml(r.title.slice(0, 60))}</a> \u2014 ${escHtml(r.reason)}`
+    );
+    const rejectionText = `<b>Didn't match:</b>\n${rejectionLines.join('\n')}`;
+    try { await sendFn(ctx.chatId, rejectionText); } catch (e) {
+      console.error('[tools] rejection send failed:', e instanceof Error ? e.message : e);
     }
   }
 
@@ -649,6 +697,7 @@ async function execFindItems(
   const priceFrom = input.priceFrom as number | undefined;
   const priceTo = input.priceTo as number | undefined;
   const maxResults = Math.min(Math.max((input.maxResults as number) || 5, 1), 10);
+  const rejectionCriteria = input.rejectionCriteria as string | undefined;
 
   const result = await searchItems({
     query,
@@ -683,6 +732,7 @@ async function execFindItems(
   try { await sendFn(ctx.chatId, `Found ${displayTotal} items${mandatoryKeywords.length > 0 ? ` (filtered from ${result.totalAvailable})` : ''}. Analyzing top ${Math.min(candidates.length, maxResults)}...`, { parse_mode: undefined }); } catch (e) { console.error('[tools] send failed:', e instanceof Error ? e.message : e); }
 
   const shown: ItemListing[] = [];
+  const itemRejected: RejectionReason[] = [];
 
   for (let i = 0; i < candidates.length && shown.length < maxResults; i++) {
     const item = candidates[i];
@@ -691,10 +741,20 @@ async function execFindItems(
     let parsedData = null;
     if (item.description) {
       try {
-        parsedData = await parseItemListing(item);
+        parsedData = await parseItemListing(item, rejectionCriteria);
       } catch (parseErr) {
         console.error(`[find_items] Parse error for ${item.url}:`, parseErr);
       }
+    }
+
+    // AI rejection criteria filter
+    if (parsedData?.rejected) {
+      itemRejected.push({
+        url: item.url,
+        title: item.title,
+        reason: parsedData.rejectionReason ?? 'Rejected by AI criteria',
+      });
+      continue;
     }
 
     // Fetch phone if not available — don't mutate original item
@@ -708,30 +768,53 @@ async function execFindItems(
       }
     }
 
-    // Send card first
     const card = formatRichItemNotification(enrichedItem, parsedData ?? undefined);
-    try {
-      await sendFn(ctx.chatId, card);
-    } catch (cardErr) {
-      // fallback: send minimal plain text
-      try { await sendFn(ctx.chatId, `${enrichedItem.title}\n${enrichedItem.url}\nPrice: ${enrichedItem.price} PLN`, { parse_mode: undefined }); } catch (e) { console.error('[tools] send failed:', e instanceof Error ? e.message : e); }
-    }
+    const ITEM_CAPTION_LIMIT = 1024;
 
-    // Then photos
-    if (enrichedItem.photos.length > 0) {
+    // Send photos with card as caption if short enough, otherwise card then photos
+    if (card.length <= ITEM_CAPTION_LIMIT && enrichedItem.photos.length > 0) {
       try {
-        await sendPhotosFn(ctx.chatId, enrichedItem.photos.slice(0, 10));
-      } catch (photoErr) {
-        console.error(`[find_items] Photo send error for ${enrichedItem.url}:`, photoErr);
+        await sendPhotosFn(ctx.chatId, enrichedItem.photos.slice(0, 10), card);
+      } catch (e) {
+        console.error('[tools] photo+caption failed:', e instanceof Error ? e.message : e);
+        try { await sendFn(ctx.chatId, card); } catch (e2) { console.error('[tools] send failed:', e2 instanceof Error ? e2.message : e2); }
+      }
+    } else {
+      try {
+        await sendFn(ctx.chatId, card);
+      } catch (cardErr) {
+        try { await sendFn(ctx.chatId, `${enrichedItem.title}\n${enrichedItem.url}\nPrice: ${enrichedItem.price} PLN`, { parse_mode: undefined }); } catch (e) { console.error('[tools] send failed:', e instanceof Error ? e.message : e); }
+      }
+      if (enrichedItem.photos.length > 0) {
+        try {
+          await sendPhotosFn(ctx.chatId, enrichedItem.photos.slice(0, 10));
+        } catch (photoErr) {
+          console.error(`[find_items] Photo send error for ${enrichedItem.url}:`, photoErr);
+        }
       }
     }
 
     shown.push(enrichedItem);
   }
 
+  // Send rejected items as brief one-line messages
+  if (itemRejected.length > 0) {
+    const rejectionLines = itemRejected.slice(0, 10).map(r =>
+      `\u274C <a href="${r.url}">${escHtml(r.title.slice(0, 60))}</a> \u2014 ${escHtml(r.reason)}`
+    );
+    const rejectionText = `<b>Didn't match:</b>\n${rejectionLines.join('\n')}`;
+    try { await sendFn(ctx.chatId, rejectionText); } catch (e) {
+      console.error('[tools] item rejection send failed:', e instanceof Error ? e.message : e);
+    }
+  }
+
   ctx.lastSearchResults = shown;
 
-  return `Showed ${shown.length} item(s) to the user with photos and detailed condition analysis cards. Total available: ${displayTotal}${mandatoryKeywords.length > 0 ? ` (filtered from ${result.totalAvailable} by mandatory keywords)` : ''}.\n\nIMPORTANT: The user has ALREADY seen full details, photos, prices, and cards. Do NOT repeat listing details. Just offer next steps.`;
+  const itemRejectionBreakdown = itemRejected.length > 0
+    ? `\nRejected ${itemRejected.length}: ${itemRejected.map((r) => r.reason).join('; ')}`
+    : '';
+
+  return `Showed ${shown.length} item(s) to the user with photos and detailed condition analysis cards. Total available: ${displayTotal}${mandatoryKeywords.length > 0 ? ` (filtered from ${result.totalAvailable} by mandatory keywords)` : ''}.${itemRejectionBreakdown}\n\nIMPORTANT: The user has ALREADY seen full details, photos, prices, and cards. Do NOT repeat listing details. Just offer next steps.`;
 }
 
 // ---------------------------------------------------------------------------
@@ -752,7 +835,7 @@ async function execCreateMonitor(
     'city', 'districts', 'province', 'priceFrom', 'priceTo',
     'roomsFrom', 'roomsTo', 'areaFrom', 'areaTo', 'ownerType',
     'query', 'workAddress', 'commuteMode', 'amenities',
-    'contractPreference', 'platforms',
+    'contractPreference', 'platforms', 'rejectionCriteria',
   ];
   for (const key of configKeys) {
     if (input[key] !== undefined && input[key] !== null) {
@@ -889,7 +972,7 @@ export async function executeTool(
   _chatId: number,
   context: UserContext,
   sendFn: (chatId: number, text: string, opts?: Record<string, unknown>) => Promise<void>,
-  sendPhotosFn: (chatId: number, urls: string[]) => Promise<void>,
+  sendPhotosFn: (chatId: number, urls: string[], caption?: string) => Promise<void>,
 ): Promise<string> {
   try {
     switch (name) {

@@ -23,6 +23,7 @@ RENTAL SEARCH FLOW — ALWAYS follow this:
    - Keep confirmation SHORT — 2-3 lines max, not a wall of text
 
 3. Call find_rentals AFTER brief confirmation. Don't over-ask. One round of clarification max.
+   - If the user specifies exclusion criteria (e.g. "no ground floor", "must have balcony"), pass them as rejectionCriteria. The AI will evaluate each listing and reject ones that don't match.
 
 4. After results come in, present the summary and offer to:
    - Create a monitor for ongoing notifications
@@ -42,6 +43,7 @@ KAUCJA (deposit) — always highlight:
 
 ITEM SEARCH — simpler:
 - Can search immediately, no confirmation needed
+- If the user specifies exclusion criteria (e.g. "exclude non-AMOLED", "must have original box", "no scratches"), pass them as rejectionCriteria. The AI will evaluate each listing and reject ones that don't match.
 - ALWAYS set mandatoryKeywords to filter irrelevant results. For "Galaxy XR", set mandatoryKeywords: ["galaxy", "xr"]. For "MacBook Pro M2", set mandatoryKeywords: ["macbook"]. For "rower miejski", set mandatoryKeywords: ["rower"].
 - The query goes to OLX free-text search which is broad — mandatory keywords filter the title to ensure relevance
 - If user asks in non-Polish, translate the search query to Polish if the item might be listed in Polish
@@ -84,8 +86,8 @@ ERROR HANDLING:
 - Never show raw error messages or stack traces.
 
 FORMATTING:
-- Use plain text for Telegram messages. Do NOT use Markdown formatting (*bold*, _italic_, etc.)
-  as messages are sent with HTML parse_mode. Keep responses concise but helpful.
-- If you want to emphasize something, just use CAPS or emoji — don't use Markdown syntax.
+- Write naturally. Use *bold* for emphasis, _italic_ for terms. Your Markdown will be
+  automatically converted to Telegram formatting.
+- Keep responses concise but helpful.
 - Use line breaks to separate sections. Avoid very long paragraphs.
 `;

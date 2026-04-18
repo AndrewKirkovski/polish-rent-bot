@@ -57,6 +57,42 @@ async function ensureAuth(msg: Msg): Promise<boolean> {
 // (format.ts has its own esc() for HTML escaping)
 
 // ---------------------------------------------------------------------------
+// Convert Markdown from Claude's responses to Telegram-safe HTML
+// Uses marked (full MD→HTML) + sanitize-html (whitelist Telegram-supported tags)
+// ---------------------------------------------------------------------------
+
+import { marked } from 'marked';
+import sanitizeHtml from 'sanitize-html';
+
+// Configure marked for inline-only output (no <p> wrappers for single paragraphs)
+marked.setOptions({ breaks: true, gfm: true });
+
+/** Convert Markdown (including raw HTML) to Telegram-safe HTML */
+function mdToHtml(text: string): string {
+  // marked converts MD → full HTML (supports *bold*, _italic_, `code`, [links](url), etc.)
+  // Also passes through any existing HTML tags Claude might use (<b>, <a>, etc.)
+  const rawHtml = marked.parse(text, { async: false }) as string;
+
+  // sanitize-html strips everything except Telegram-supported tags
+  const clean = sanitizeHtml(rawHtml, {
+    allowedTags: ['b', 'strong', 'i', 'em', 'u', 'ins', 's', 'strike', 'del',
+                  'a', 'code', 'pre', 'blockquote'],
+    allowedAttributes: { 'a': ['href'] },
+    // Convert <strong> → <b>, <em> → <i> (Telegram prefers short tags)
+    transformTags: {
+      'strong': 'b',
+      'em': 'i',
+      'ins': 'u',
+      'strike': 's',
+      'del': 's',
+    },
+  });
+
+  // Clean up: remove empty lines from marked's paragraph breaks, trim
+  return clean.replace(/\n{3,}/g, '\n\n').trim();
+}
+
+// ---------------------------------------------------------------------------
 // Enriched notification sender (used by scheduler)
 // ---------------------------------------------------------------------------
 
@@ -76,15 +112,21 @@ export async function sendEnrichedNotification(
     text = formatRichRentalNotification(listing as Listing, parsedData as ParsedRentalData | undefined, locationScore ?? undefined);
   }
 
-  await safeSend(bot, chatId, text, { parse_mode: 'HTML', disable_web_page_preview: false });
-
-  // Send photo album if available
+  // Send photos with card as caption if short enough, otherwise card then photos
   const photos = listing.photos;
-  if (photos.length > 0) {
+  const CAPTION_LIMIT = 1024;
+  if (photos.length > 0 && text.length <= CAPTION_LIMIT) {
     try {
-      await sendPhotoAlbum(bot, chatId, photos);
+      await sendPhotoAlbum(bot, chatId, photos, text);
     } catch {
-      // photo sending is best-effort
+      // Fallback: send card and photos separately
+      await safeSend(bot, chatId, text, { parse_mode: 'HTML', disable_web_page_preview: false });
+      try { await sendPhotoAlbum(bot, chatId, photos); } catch { /* best-effort */ }
+    }
+  } else {
+    await safeSend(bot, chatId, text, { parse_mode: 'HTML', disable_web_page_preview: false });
+    if (photos.length > 0) {
+      try { await sendPhotoAlbum(bot, chatId, photos); } catch { /* best-effort */ }
     }
   }
 }
@@ -94,7 +136,7 @@ export async function sendEnrichedNotification(
 // ---------------------------------------------------------------------------
 
 type SendFn = (chatId: number | string, text: string, opts?: Record<string, unknown>) => Promise<void>;
-type SendPhotosFn = (chatId: number | string, urls: string[]) => Promise<void>;
+type SendPhotosFn = (chatId: number | string, urls: string[], caption?: string) => Promise<void>;
 
 // Safe sendMessage wrapper — catches errors, retries without parse_mode on parse failures
 async function safeSend(bot: TelegramBot, chatId: number | string, text: string, opts?: TelegramBot.SendMessageOptions): Promise<void> {
@@ -115,13 +157,14 @@ async function safeSend(bot: TelegramBot, chatId: number | string, text: string,
 
 function makeSendFn(bot: TelegramBot): SendFn {
   return async (chatId, text, opts?) => {
-    // Use HTML parse_mode — more robust escaping, clickable URLs
-    await safeSend(bot, chatId, text, { parse_mode: 'HTML', ...opts } as TelegramBot.SendMessageOptions);
+    // If no explicit parse_mode override, transform Claude's Markdown to HTML
+    const finalText = (!opts || !('parse_mode' in opts)) ? mdToHtml(text) : text;
+    await safeSend(bot, chatId, finalText, { parse_mode: 'HTML', ...opts } as TelegramBot.SendMessageOptions);
   };
 }
 
 function makeSendPhotosFn(bot: TelegramBot): SendPhotosFn {
-  return (chatId, urls) => sendPhotoAlbum(bot, chatId, urls);
+  return (chatId, urls, caption?) => sendPhotoAlbum(bot, chatId, urls, caption);
 }
 
 // ---------------------------------------------------------------------------

@@ -103,8 +103,6 @@ export function formatRentalCard(
   if (parsed?.contractType) {
     const contractDisplay = parsed.contractType.replace(/_/g, ' ');
     lines.push(`Type: ${contractDisplay}`);
-  } else {
-    lines.push(`Type: \u26A0\uFE0F not specified`);
   }
   if (parsed?.contractNote) {
     lines.push(esc(parsed.contractNote));
@@ -289,18 +287,20 @@ export async function sendPhotoAlbum(
   bot: TelegramBot,
   chatId: number | string,
   photoUrls: string[],
+  caption?: string,
 ): Promise<void> {
   const urls = photoUrls.slice(0, 10);
   if (urls.length === 0) return;
 
   if (urls.length === 1) {
-    await bot.sendPhoto(chatId, urls[0]);
+    await bot.sendPhoto(chatId, urls[0], { caption, parse_mode: caption ? 'HTML' : undefined });
     return;
   }
 
-  const media = urls.map((url) => ({
+  const media = urls.map((url, i) => ({
     type: 'photo' as const,
     media: url,
+    ...(i === 0 && caption ? { caption, parse_mode: 'HTML' as const } : {}),
   }));
 
   await bot.sendMediaGroup(chatId, media);

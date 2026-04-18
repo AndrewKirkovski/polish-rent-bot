@@ -78,7 +78,7 @@ export async function handleUserMessage(
   chatId: number,
   text: string,
   sendFn: (chatId: number, text: string, opts?: Record<string, unknown>) => Promise<void>,
-  sendPhotosFn: (chatId: number, urls: string[]) => Promise<void>,
+  sendPhotosFn: (chatId: number, urls: string[], caption?: string) => Promise<void>,
   typingFn?: (chatId: number) => Promise<void>,
 ): Promise<void> {
   // Per-user mutex — if user sends multiple messages quickly, they queue up

@@ -48,6 +48,8 @@ export const ParsedRentalDataSchema = z.looseObject({
   positives: z.array(z.string()).default([]),
   restrictions: z.array(z.string()).default([]),
   additionalNotes: z.array(z.string()).default([]),
+  rejected: z.boolean().default(false),
+  rejectionReason: z.string().nullable().default(null),
 });
 
 // ---------------------------------------------------------------------------
@@ -64,4 +66,6 @@ export const ParsedItemDataSchema = z.looseObject({
   bestFor: z.string().nullable().default(null),
   redFlags: z.array(z.string()).default([]),
   additionalNotes: z.array(z.string()).default([]),
+  rejected: z.boolean().default(false),
+  rejectionReason: z.string().nullable().default(null),
 });
