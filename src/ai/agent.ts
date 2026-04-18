@@ -107,11 +107,24 @@ export async function handleUserMessage(
 
     try {
       // 6. Call Claude with system prompt, tools, and messages
+      // Prompt caching: cache_control on system prompt and last tool definition
+      // caches everything up to that point (5-min TTL), saving ~90% input tokens on repeat calls
+      const cachedTools = TOOL_DEFINITIONS.map((tool, i) =>
+        i === TOOL_DEFINITIONS.length - 1
+          ? { ...tool, cache_control: { type: 'ephemeral' as const } }
+          : tool,
+      );
       let response = await client.messages.create({
         model: MODEL,
         max_tokens: MAX_TOKENS,
-        system: SYSTEM_PROMPT,
-        tools: TOOL_DEFINITIONS,
+        system: [
+          {
+            type: 'text' as const,
+            text: SYSTEM_PROMPT,
+            cache_control: { type: 'ephemeral' as const },
+          },
+        ],
+        tools: cachedTools,
         messages,
       }, { timeout: 60_000 }); // 60s timeout — longer than parse-listing since tool loops take time
 
@@ -158,12 +171,18 @@ export async function handleUserMessage(
           content: toolResults,
         });
 
-        // Call Claude again with the updated messages
+        // Call Claude again with the updated messages (reuses cached system + tools)
         response = await client.messages.create({
           model: MODEL,
           max_tokens: MAX_TOKENS,
-          system: SYSTEM_PROMPT,
-          tools: TOOL_DEFINITIONS,
+          system: [
+            {
+              type: 'text' as const,
+              text: SYSTEM_PROMPT,
+              cache_control: { type: 'ephemeral' as const },
+            },
+          ],
+          tools: cachedTools,
           messages,
         }, { timeout: 60_000 });
       }

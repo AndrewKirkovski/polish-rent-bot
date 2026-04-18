@@ -17,10 +17,14 @@
     "node-telegram-bot-api": "^0.67.0",
     "playwright": "^1.50.0",
     "playwright-extra": "^4.3.0",
-    "puppeteer-extra-plugin-stealth": "^2.11.0"
+    "puppeteer-extra-plugin-stealth": "^2.11.0",
+    "zod": "^4.3.6"
   },
   "pnpm": {
-    "onlyBuiltDependencies": ["better-sqlite3", "esbuild"]
+    "onlyBuiltDependencies": [
+      "better-sqlite3",
+      "esbuild"
+    ]
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",

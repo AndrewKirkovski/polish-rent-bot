@@ -6,6 +6,7 @@ import { createHash } from 'node:crypto';
 import type { Listing, ParsedRentalData, ParsedItemData } from '../types.js';
 import type { ItemListing } from '../crawlers/olx-items.js';
 import { getParsedListing, saveParsedListing } from '../storage/db.js';
+import { ParsedRentalDataSchema, ParsedItemDataSchema } from './schemas.js';
 
 export type { ParsedRentalData, ParsedItemData } from '../types.js';
 
@@ -113,7 +114,13 @@ ${(listing.description || 'No description provided').slice(0, 8000)}`;
     model: MODEL,
     max_tokens: 2048,
     temperature: 0,
-    system: RENTAL_PROMPT,
+    system: [
+      {
+        type: 'text' as const,
+        text: RENTAL_PROMPT,
+        cache_control: { type: 'ephemeral' as const },
+      },
+    ],
     messages: [{ role: 'user', content: userMessage }],
   }, { timeout: 30_000 });
 
@@ -133,9 +140,10 @@ ${(listing.description || 'No description provided').slice(0, 8000)}`;
 
   let parsed: ParsedRentalData;
   try {
-    parsed = JSON.parse(jsonStr);
+    const raw = JSON.parse(jsonStr);
+    parsed = ParsedRentalDataSchema.parse(raw) as ParsedRentalData;
   } catch (parseErr) {
-    console.error('[parse-listing] Failed to parse AI JSON:', jsonStr.slice(0, 200));
+    console.error('[parse-listing] Failed to parse/validate AI JSON:', jsonStr.slice(0, 200));
     throw new Error('AI returned invalid JSON');
   }
 
@@ -203,7 +211,13 @@ ${(item.description || 'No description provided').slice(0, 8000)}`;
     model: MODEL,
     max_tokens: 1024,
     temperature: 0,
-    system: ITEM_PROMPT,
+    system: [
+      {
+        type: 'text' as const,
+        text: ITEM_PROMPT,
+        cache_control: { type: 'ephemeral' as const },
+      },
+    ],
     messages: [{ role: 'user', content: userMessage }],
   }, { timeout: 30_000 });
 
@@ -221,9 +235,10 @@ ${(item.description || 'No description provided').slice(0, 8000)}`;
 
   let parsed: ParsedItemData;
   try {
-    parsed = JSON.parse(jsonStr);
+    const raw = JSON.parse(jsonStr);
+    parsed = ParsedItemDataSchema.parse(raw) as ParsedItemData;
   } catch (parseErr) {
-    console.error('[parse-listing] Failed to parse AI item JSON:', jsonStr.slice(0, 200));
+    console.error('[parse-listing] Failed to parse/validate AI item JSON:', jsonStr.slice(0, 200));
     throw new Error('AI returned invalid JSON');
   }
 
