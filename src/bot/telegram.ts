@@ -69,16 +69,26 @@ marked.setOptions({ breaks: true, gfm: true });
 
 /** Convert Markdown (including raw HTML) to Telegram-safe HTML */
 function mdToHtml(text: string): string {
-  // marked converts MD → full HTML (supports *bold*, _italic_, `code`, [links](url), etc.)
-  // Also passes through any existing HTML tags Claude might use (<b>, <a>, etc.)
   const rawHtml = marked.parse(text, { async: false }) as string;
 
-  // sanitize-html strips everything except Telegram-supported tags
-  const clean = sanitizeHtml(rawHtml, {
+  // Pre-process: convert block elements to newlines before sanitize-html strips them
+  let processed = rawHtml
+    .replace(/<\/p>\s*<p>/g, '\n\n')        // paragraph breaks → double newline
+    .replace(/<p>/g, '')                     // opening <p>
+    .replace(/<\/p>/g, '\n')                 // closing <p> → newline
+    .replace(/<br\s*\/?>/g, '\n')            // <br> → newline
+    .replace(/<li>/g, '• ')                  // list items → bullet
+    .replace(/<\/li>/g, '\n')                // end list item → newline
+    .replace(/<\/?[uo]l>/g, '')              // strip <ul>/<ol> wrappers
+    .replace(/<h[1-6][^>]*>/g, '<b>')        // headers → bold
+    .replace(/<\/h[1-6]>/g, '</b>\n')        // close header → bold + newline
+    .replace(/<hr\s*\/?>/g, '────────\n');   // horizontal rule
+
+  // sanitize-html: keep only Telegram-supported tags
+  const clean = sanitizeHtml(processed, {
     allowedTags: ['b', 'strong', 'i', 'em', 'u', 'ins', 's', 'strike', 'del',
                   'a', 'code', 'pre', 'blockquote'],
     allowedAttributes: { 'a': ['href'] },
-    // Convert <strong> → <b>, <em> → <i> (Telegram prefers short tags)
     transformTags: {
       'strong': 'b',
       'em': 'i',
@@ -88,7 +98,6 @@ function mdToHtml(text: string): string {
     },
   });
 
-  // Clean up: remove empty lines from marked's paragraph breaks, trim
   return clean.replace(/\n{3,}/g, '\n\n').trim();
 }
 

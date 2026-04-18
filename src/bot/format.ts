@@ -222,21 +222,20 @@ export function formatItemCard(
 ): string {
   const lines: string[] = [];
 
-  lines.push(`<b>\uD83D\uDECD ${esc(item.title)}</b>`);
+  // PRICE + CONDITION first (most important info)
+  lines.push(`<b>\uD83D\uDCB0 ${pln(item.price)}${item.negotiable ? ' (negotiable)' : ''}</b>`);
+  if (item.condition) lines.push(`<b>${esc(item.condition)}</b>`);
+  lines.push('');
+
+  // Title + link
+  lines.push(`\uD83D\uDECD ${esc(item.title)}`);
   lines.push(item.url);
   lines.push('');
 
-  // AI summary
-  if (parsed?.descriptionSummary) {
-    lines.push(`\uD83D\uDCDD ${esc(parsed.descriptionSummary)}`);
-    lines.push('');
-  }
-
-  // Price
-  lines.push(`\uD83D\uDCB0 ${pln(item.price)}${item.negotiable ? ' (negotiable)' : ''}`);
-  if (item.condition) lines.push(`\uD83D\uDCE6 Condition: ${esc(item.condition)}`);
-  if (parsed?.actualCondition) lines.push(`\uD83D\uDD0D AI assessment: ${esc(parsed.actualCondition)}`);
+  // AI assessment
+  if (parsed?.actualCondition) lines.push(`\uD83D\uDD0D ${esc(parsed.actualCondition)}`);
   if (parsed?.priceAssessment) lines.push(`\uD83D\uDCA1 ${esc(parsed.priceAssessment)}`);
+  if (parsed?.descriptionSummary) lines.push(`\uD83D\uDCDD ${esc(parsed.descriptionSummary)}`);
   lines.push('');
 
   // Details
