@@ -441,7 +441,7 @@ async function execFindRentals(
   // ---- Step B: Send progress message ----
   const debugLimit = process.env.DEBUG_LIMIT ? parseInt(process.env.DEBUG_LIMIT, 10) : 0;
   const candidateCount = debugLimit > 0 ? Math.min(deduped.length, debugLimit) : Math.min(deduped.length, 25);
-  try { await sendFn(ctx.chatId, `Found ${deduped.length} listings. Analyzing top ${candidateCount}...`, { parse_mode: undefined }); } catch {}
+  try { await sendFn(ctx.chatId, `Found ${deduped.length} listings. Analyzing top ${candidateCount}...`, { parse_mode: undefined }); } catch (e) { console.error('[tools] send failed:', e instanceof Error ? e.message : e); }
 
   // ---- Step C: Analyze top candidates ----
   const candidates = deduped.slice(0, candidateCount);
@@ -462,7 +462,7 @@ async function execFindRentals(
 
     // Send progress update every 3-4 listings
     if (i > 0 && i % 3 === 0) {
-      try { await sendFn(ctx.chatId, `Analyzing listing ${i + 1}/${candidateCount}...`, { parse_mode: undefined }); } catch {}
+      try { await sendFn(ctx.chatId, `Analyzing listing ${i + 1}/${candidateCount}...`, { parse_mode: undefined }); } catch (e) { console.error('[tools] send failed:', e instanceof Error ? e.message : e); }
     }
 
     // Stop if we have enough accepted results
@@ -600,7 +600,7 @@ async function execFindRentals(
       await sendFn(ctx.chatId, card);
     } catch (cardErr) {
       // fallback: send minimal plain text
-      try { await sendFn(ctx.chatId, `${listing.title}\n${listing.url}\nPrice: ${listing.price} PLN`, { parse_mode: undefined }); } catch {}
+      try { await sendFn(ctx.chatId, `${listing.title}\n${listing.url}\nPrice: ${listing.price} PLN`, { parse_mode: undefined }); } catch (e) { console.error('[tools] send failed:', e instanceof Error ? e.message : e); }
     }
 
     // Then photos
@@ -661,7 +661,7 @@ async function execFindItems(
   const candidates = result.items.slice(0, candidateLimit); // get extra for potential filtering
   ctx.lastSearchResults = candidates;
 
-  try { await sendFn(ctx.chatId, `Found ${result.totalAvailable} items. Analyzing top ${Math.min(candidates.length, maxResults)}...`, { parse_mode: undefined }); } catch {}
+  try { await sendFn(ctx.chatId, `Found ${result.totalAvailable} items. Analyzing top ${Math.min(candidates.length, maxResults)}...`, { parse_mode: undefined }); } catch (e) { console.error('[tools] send failed:', e instanceof Error ? e.message : e); }
 
   const shown: ItemListing[] = [];
 
@@ -695,7 +695,7 @@ async function execFindItems(
       await sendFn(ctx.chatId, card);
     } catch (cardErr) {
       // fallback: send minimal plain text
-      try { await sendFn(ctx.chatId, `${enrichedItem.title}\n${enrichedItem.url}\nPrice: ${enrichedItem.price} PLN`, { parse_mode: undefined }); } catch {}
+      try { await sendFn(ctx.chatId, `${enrichedItem.title}\n${enrichedItem.url}\nPrice: ${enrichedItem.price} PLN`, { parse_mode: undefined }); } catch (e) { console.error('[tools] send failed:', e instanceof Error ? e.message : e); }
     }
 
     // Then photos

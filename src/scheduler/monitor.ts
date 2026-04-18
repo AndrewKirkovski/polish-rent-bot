@@ -104,10 +104,9 @@ export async function runMonitor(monitor: MonitorRow): Promise<(Listing | ItemLi
       allResults.push(...otodomResult.listings);
     }
 
-    // Dedupe and filter to unseen
+    // Filter to unseen — DON'T mark as seen yet (mark AFTER successful notification)
     for (const listing of allResults) {
       if (!isListingSeen(monitor.id, listing.platform, listing.platformId)) {
-        markListingSeen(monitor.id, listing.platform, listing.platformId, listing.url, listing.title, listing.price);
         newListings.push(listing);
       }
     }
@@ -125,7 +124,6 @@ export async function runMonitor(monitor: MonitorRow): Promise<(Listing | ItemLi
 
     for (const item of result.items) {
       if (!isListingSeen(monitor.id, item.platform, item.platformId)) {
-        markListingSeen(monitor.id, item.platform, item.platformId, item.url, item.title, item.price);
         newListings.push(item);
       }
     }
@@ -217,8 +215,10 @@ export function startScheduler(
             }
 
             await notifyFn(monitor.user_id, listing, parsedData, locationScore);
+            // Mark as seen ONLY after successful notification — prevents permanent data loss
+            markListingSeen(monitor.id, listing.platform, listing.platformId, listing.url, listing.title, listing.price);
           } catch (notifyErr) {
-            console.error(`[scheduler] Notify failed for user ${monitor.user_id}:`, notifyErr);
+            console.error(`[scheduler] Notify failed for user ${monitor.user_id} — listing NOT marked as seen (will retry next cycle):`, notifyErr);
           }
         }
       }

@@ -69,7 +69,7 @@ export function buildOtodomUrl(params: OtodomSearchParams): string {
   if (params.roomsFrom) {
     const values: string[] = [];
     const from = params.roomsFrom;
-    const to = params.roomsTo ?? params.roomsFrom;
+    const to = params.roomsTo ?? 6; // default to max — "at least N rooms"
     for (let i = from; i <= to && i <= 6; i++) {
       if (ROOM_ENUM_OTODOM[i]) values.push(ROOM_ENUM_OTODOM[i]);
     }

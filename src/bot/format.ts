@@ -131,8 +131,8 @@ export function formatRentalCard(
   if (listing.rooms != null) details.push(`${listing.rooms} rooms`);
   if (listing.area != null) details.push(`${listing.area} m\u00B2`);
   if (listing.floor != null) details.push(`floor ${listing.floor}`);
-  if (listing.buildingType) details.push(listing.buildingType);
-  if (listing.heating) details.push(listing.heating);
+  if (listing.buildingType) details.push(esc(listing.buildingType));
+  if (listing.heating) details.push(esc(listing.heating));
   if (details.length > 0) lines.push(details.join(' | '));
 
   if (parsed?.kitchenDetails) lines.push(`\uD83C\uDF73 Kitchen: ${esc(parsed.kitchenDetails)}`);
@@ -167,13 +167,13 @@ export function formatRentalCard(
     if (locationScore.commute) {
       lines.push(`\uD83C\uDFE2 \u2192 ${locationScore.commute.duration} by ${locationScore.commute.mode} (${locationScore.commute.distance})`);
     }
-    if (listing.district) lines.push(`\uD83D\uDCCD ${listing.district}, ${listing.city}`);
+    if (listing.district) lines.push(`\uD83D\uDCCD ${esc(listing.district)}, ${esc(listing.city)}`);
     lines.push(locationScore.mapsLink);
   } else if (listing.lat && listing.lng) {
-    lines.push(`\uD83D\uDCCD ${listing.district ? listing.district + ', ' : ''}${listing.city}`);
+    lines.push(`\uD83D\uDCCD ${listing.district ? esc(listing.district) + ', ' : ''}${esc(listing.city)}`);
     lines.push(`https://www.google.com/maps?q=${listing.lat},${listing.lng}`);
   } else {
-    lines.push(`\uD83D\uDCCD ${listing.district ? listing.district + ', ' : ''}${listing.city}`);
+    lines.push(`\uD83D\uDCCD ${listing.district ? esc(listing.district) + ', ' : ''}${esc(listing.city)}`);
   }
   lines.push('');
 
@@ -224,7 +224,7 @@ export function formatItemCard(
   const lines: string[] = [];
 
   lines.push(`*\uD83D\uDECD ${esc(item.title)}*`);
-  lines.push(item.url);
+  lines.push(`\`${item.url}\``);
   lines.push('');
 
   // AI summary
@@ -269,7 +269,7 @@ export function formatItemCard(
 
   // Location + contact
   lines.push('');
-  if (item.city) lines.push(`\uD83D\uDCCD ${item.district ? item.district + ', ' : ''}${item.city}`);
+  if (item.city) lines.push(`\uD83D\uDCCD ${item.district ? esc(item.district) + ', ' : ''}${esc(item.city)}`);
   if (item.phone) lines.push(`\uD83D\uDCDE ${item.phone}`);
   if (item.contactName) lines.push(`\uD83D\uDC64 ${esc(item.contactName)}${item.isBusiness ? ' (business)' : ''}`);
   lines.push(`\uD83D\uDCF8 ${item.photos.length} photos`);
