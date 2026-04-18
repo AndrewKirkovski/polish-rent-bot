@@ -2,8 +2,19 @@
 // Uses HTML parse_mode — sanitize user/AI text with esc()
 
 import type TelegramBot from 'node-telegram-bot-api';
+import sanitizeHtml from 'sanitize-html';
 import type { Listing, ParsedRentalData, ParsedItemData, LocationScore } from '../types.js';
 import type { ItemListing } from '../crawlers/olx-items.js';
+
+/** Repair broken HTML from message splitting — close unclosed tags, strip orphan close tags */
+function sanitizeChunk(html: string): string {
+  return sanitizeHtml(html, {
+    allowedTags: ['b', 'strong', 'i', 'em', 'u', 'ins', 's', 'strike', 'del',
+                  'a', 'code', 'pre', 'blockquote', 'tg-emoji'],
+    allowedAttributes: { 'a': ['href'], 'tg-emoji': ['emoji-id'] },
+    transformTags: { 'strong': 'b', 'em': 'i', 'ins': 'u', 'strike': 's', 'del': 's' },
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -34,7 +45,8 @@ function listItems(items: string[] | undefined, prefix = '\u2022 '): string {
   return items.map(i => `${prefix}${esc(i)}`).join('\n');
 }
 
-/** Split text into chunks that fit Telegram's 4096 char limit. HTML-tag-aware. */
+/** Split text into chunks that fit Telegram's 4096 char limit.
+ *  Each chunk is passed through sanitize-html to repair any broken HTML from the split. */
 export function splitMessage(text: string, limit = 4000): string[] {
   if (text.length <= limit) return [text];
 
@@ -44,24 +56,15 @@ export function splitMessage(text: string, limit = 4000): string[] {
   while (remaining.length > limit) {
     let splitAt = remaining.lastIndexOf('\n\n', limit);
     if (splitAt <= 0) splitAt = remaining.lastIndexOf('\n', limit);
-    if (splitAt <= 0) {
-      // Hard split — but avoid splitting inside an HTML tag
-      splitAt = limit;
-      // Scan backwards to find a position outside any < > tag
-      const lastOpen = remaining.lastIndexOf('<', splitAt);
-      const lastClose = remaining.lastIndexOf('>', splitAt);
-      if (lastOpen > lastClose) {
-        // We're inside a tag — back up to before the tag opens
-        splitAt = lastOpen;
-      }
-    }
-    if (splitAt <= 0) splitAt = limit; // absolute fallback
+    if (splitAt <= 0) splitAt = limit;
 
     chunks.push(remaining.slice(0, splitAt).trim());
     remaining = remaining.slice(splitAt).trim();
   }
   if (remaining) chunks.push(remaining);
-  return chunks;
+
+  // Repair any broken HTML in each chunk (unclosed tags get closed, orphan close tags stripped)
+  return chunks.map(chunk => sanitizeChunk(chunk));
 }
 
 // ---------------------------------------------------------------------------
