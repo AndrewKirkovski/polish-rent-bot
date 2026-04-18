@@ -23,6 +23,8 @@ RENTAL SEARCH FLOW — ALWAYS follow this:
    - Keep confirmation SHORT — 2-3 lines max, not a wall of text
 
 3. Call find_rentals AFTER brief confirmation. Don't over-ask. One round of clarification max.
+   - When user says "3 rooms", set BOTH roomsFrom AND roomsTo to 3 (exact match).
+     Only use a range if user explicitly says "3-4 rooms" or "at least 3 rooms".
    - If the user specifies exclusion criteria (e.g. "no ground floor", "must have balcony"), pass them as rejectionCriteria. The AI will evaluate each listing and reject ones that don't match.
 
 4. After results come in, present the summary and offer to:

@@ -357,6 +357,18 @@ export function cleanExpiredMapsCache(maxAgeDays = 7): number {
   return result.changes;
 }
 
+/** Delete cache entries where the stored result has empty places (error-cached data). */
+export function clearEmptyMapsCache(): number {
+  const db = getDb();
+  // Matches cached AmenityResult objects where places array is empty: "places":[]
+  const result = db.prepare(`
+    DELETE FROM maps_cache
+    WHERE cache_key LIKE 'nearby%'
+      AND result LIKE '%"places":[]%'
+  `).run();
+  return result.changes;
+}
+
 // ---------------------------------------------------------------------------
 // Monitor config update
 // ---------------------------------------------------------------------------

@@ -34,10 +34,24 @@ function listItems(items: string[] | undefined, prefix = '\u2022 '): string {
   return items.map(i => `${prefix}${esc(i)}`).join('\n');
 }
 
-/** Telegram message limit is 4096; truncate with a marker so we never exceed it */
-function truncate(text: string, limit = 4000): string {
-  if (text.length <= limit) return text;
-  return text.slice(0, limit) + '\n\u2026 <i>(truncated)</i>';
+/** Split text into chunks that fit Telegram's 4096 char limit */
+export function splitMessage(text: string, limit = 4000): string[] {
+  if (text.length <= limit) return [text];
+
+  const chunks: string[] = [];
+  let remaining = text;
+
+  while (remaining.length > limit) {
+    // Find last double-newline before the limit
+    let splitAt = remaining.lastIndexOf('\n\n', limit);
+    if (splitAt <= 0) splitAt = remaining.lastIndexOf('\n', limit);
+    if (splitAt <= 0) splitAt = limit; // hard split as last resort
+
+    chunks.push(remaining.slice(0, splitAt).trim());
+    remaining = remaining.slice(splitAt).trim();
+  }
+  if (remaining) chunks.push(remaining);
+  return chunks;
 }
 
 // ---------------------------------------------------------------------------
@@ -83,8 +97,13 @@ export function formatRentalCard(
 ): string {
   const lines: string[] = [];
 
+  // ---- TOTAL COST — ALWAYS FIRST LINE ----
+  const totalCost = parsed?.totalMonthlyCost
+    ?? (listing.price + (listing.rent ?? 0));
+  lines.push(`<b>${CE.price} TOTAL: ~${pln(totalCost)}/month</b>`);
+
   // Header
-  lines.push(`<b>${CE.house} ${esc(listing.title)}</b>`);
+  lines.push(`${CE.house} ${esc(listing.title)}`);
   lines.push(listing.url);
   lines.push('');
 
@@ -94,39 +113,35 @@ export function formatRentalCard(
     lines.push('');
   }
 
-  // ---- COSTS (CRITICAL) ----
-  lines.push(`<b>${CE.price} COSTS</b>`);
-  lines.push(`Rent:        ${pln(listing.price)}`);
+  // ---- COST BREAKDOWN ----
+  lines.push(`<b>\uD83D\uDCCB Cost breakdown:</b>`);
+  lines.push(`  Rent:         ${pln(listing.price)}`);
   if (parsed?.adminFee != null) {
-    lines.push(`Czynsz admin: ${pln(parsed.adminFee)}`);
+    lines.push(`  Czynsz admin: ${pln(parsed.adminFee)}`);
   } else if (listing.rent != null) {
-    lines.push(`Czynsz admin: ${pln(listing.rent)}`);
+    lines.push(`  Czynsz admin: ${pln(listing.rent)}`);
   }
   if (parsed?.totalBreakdown) {
-    lines.push(`${esc(parsed.totalBreakdown)}`);
-  }
-  if (parsed?.totalMonthlyCost != null) {
-    lines.push(`\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500`);
-    lines.push(`TOTAL/month: ~${pln(parsed.totalMonthlyCost)}`);
+    lines.push(`  ${esc(parsed.totalBreakdown)}`);
   }
 
   // Kaucja
   if (parsed?.depositNote) {
-    lines.push(`Kaucja: ${esc(parsed.depositNote)}`);
+    lines.push(`  Kaucja: ${esc(parsed.depositNote)}`);
   } else if (parsed?.deposit != null) {
-    lines.push(`Kaucja: ${pln(parsed.deposit)}`);
+    lines.push(`  Kaucja: ${pln(parsed.deposit)}`);
   } else if (listing.deposit != null) {
-    lines.push(`Kaucja: ${pln(listing.deposit)}`);
+    lines.push(`  Kaucja: ${pln(listing.deposit)}`);
   } else {
-    lines.push(`Kaucja: ${CE.warning} not specified \u2014 ask landlord`);
+    lines.push(`  Kaucja: ${CE.warning} not specified \u2014 ask landlord`);
   }
 
   // What's included / tenant pays
   if (parsed?.adminFeeIncludes) {
-    lines.push(`Included in czynsz: ${esc(parsed.adminFeeIncludes)}`);
+    lines.push(`  Included in czynsz: ${esc(parsed.adminFeeIncludes)}`);
   }
   if (parsed?.tenantPays) {
-    lines.push(`Tenant pays extra: ${esc(parsed.tenantPays)}`);
+    lines.push(`  Tenant pays extra: ${esc(parsed.tenantPays)}`);
   }
   lines.push('');
 
@@ -170,35 +185,41 @@ export function formatRentalCard(
   if (parsed?.bathroomDetails) lines.push(`${CE.bathroom} Bathroom: ${esc(parsed.bathroomDetails)}`);
   if (parsed?.internetReady) lines.push(`${CE.ac} Internet: ${esc(parsed.internetReady)}`);
 
+  // Equipment: truncate to 5 items max
   const furnitureList = parsed?.furnitureAndEquipment ?? [];
   if (furnitureList.length > 0) {
-    lines.push(`\uD83E\uDE91 Equipment: ${furnitureList.map(f => esc(f)).join(', ')}`);
+    const shown = furnitureList.slice(0, 5).map(f => esc(f));
+    const suffix = furnitureList.length > 5 ? `, and ${furnitureList.length - 5} more` : '';
+    lines.push(`\uD83E\uDE91 Equipment: ${shown.join(', ')}${suffix}`);
   }
   lines.push('');
 
   // ---- LOCATION ----
   if (locationScore) {
     lines.push(`<b>\uD83D\uDCCD LOCATION (${locationScore.overallScore}/100)</b>`);
+    // Combine district + city on one line
+    if (listing.district) {
+      lines.push(`\uD83D\uDCCD ${esc(listing.district)}, ${esc(listing.city)}`);
+    } else {
+      lines.push(`\uD83D\uDCCD ${esc(listing.city)}`);
+    }
     const icons: Record<string, string> = {
       metro: '\uD83D\uDE87', tram: '\uD83D\uDE8B', gym: '\uD83C\uDFCB\uFE0F', pool: '\uD83C\uDFCA', supermarket: '\uD83D\uDED2', park: '\uD83C\uDF33', pharmacy: '\uD83D\uDC8A',
     };
+    // Show only nearest place per amenity type
     for (const a of locationScore.amenities) {
       const icon = icons[a.type] ?? '\uD83D\uDCCD';
       if (a.places.length > 0) {
-        // Show all found places for this amenity type
-        for (const p of a.places) {
-          const isNearest = p === a.places[0];
-          const mark = isNearest ? (a.withinLimit ? ' \u2713' : ' \u26A0\uFE0F') : '';
-          lines.push(`${icon} ${esc(p.name)} \u2014 ${p.walkingMinutes} min (${p.distance})${mark}`);
-        }
+        const p = a.places[0];
+        const mark = a.withinLimit ? ' \u2713' : ' \u26A0\uFE0F';
+        lines.push(`${icon} ${esc(p.name)} \u2014 ${p.walkingMinutes} min${mark}`);
       } else {
-        lines.push(`${icon} ${a.type}: not found within 3 km`);
+        lines.push(`${icon} ${a.type}: not found nearby`);
       }
     }
     if (locationScore.commute) {
-      lines.push(`\uD83C\uDFE2 \u2192 ${locationScore.commute.duration} by ${locationScore.commute.mode} (${locationScore.commute.distance})`);
+      lines.push(`\uD83C\uDFE2 \u2192 ${locationScore.commute.duration} by ${locationScore.commute.mode}`);
     }
-    if (listing.district) lines.push(`\uD83D\uDCCD ${esc(listing.district)}, ${esc(listing.city)}`);
     lines.push(locationScore.mapsLink);
   } else if (listing.lat && listing.lng) {
     lines.push(`\uD83D\uDCCD ${listing.district ? esc(listing.district) + ', ' : ''}${esc(listing.city)}`);
@@ -223,10 +244,7 @@ export function formatRentalCard(
   if (redFlags.length > 0) {
     lines.push(`${CE.cons} ${redFlags.map(f => esc(f)).join(', ')}`);
   }
-  const additionalNotes = parsed?.additionalNotes ?? [];
-  if (additionalNotes.length > 0) {
-    lines.push(additionalNotes.map(n => esc(n)).join(', '));
-  }
+  // additionalNotes removed — rarely useful, adds verbosity
 
   // Contact
   lines.push('');
@@ -237,7 +255,7 @@ export function formatRentalCard(
   if (listing.agencyName) contactParts.push(esc(listing.agencyName));
   if (contactParts.length > 0) lines.push(contactParts.join(' | '));
 
-  return truncate(lines.join('\n'));
+  return lines.join('\n');
 }
 
 // Backward-compatible alias
@@ -301,9 +319,8 @@ export function formatItemCard(
   if (item.city) lines.push(`\uD83D\uDCCD ${item.district ? esc(item.district) + ', ' : ''}${esc(item.city)}`);
   if (item.phone) lines.push(`${CE.phone} ${item.phone}`);
   if (item.contactName) lines.push(`${CE.person} ${esc(item.contactName)}${item.isBusiness ? ' (business)' : ''}`);
-  lines.push(`\uD83D\uDCF8 ${item.photos.length} photos`);
 
-  return truncate(lines.join('\n'));
+  return lines.join('\n');
 }
 
 // Backward-compatible alias

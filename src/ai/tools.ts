@@ -9,7 +9,7 @@ import { searchOtodom, fetchOtodomDetail } from '../crawlers/otodom.js';
 import { parseRentalListing, parseItemListing } from './parse-listing.js';
 import { scoreLocation } from './maps.js';
 import type { AmenityPreference } from './maps.js';
-import { formatRichRentalNotification, formatRichItemNotification } from '../bot/format.js';
+import { formatRichRentalNotification, formatRichItemNotification, splitMessage } from '../bot/format.js';
 import {
   addMonitor,
   getMonitors,
@@ -518,20 +518,22 @@ async function execFindRentals(
           parsedData = await parseRentalListing(enrichedListing, rejectionCriteria);
           console.log(`[find_rentals] AI parsed: total=${parsedData?.totalMonthlyCost}, contract=${parsedData?.contractType}, kaucja=${parsedData?.deposit}`);
         } catch (parseErr) {
-          console.error(`[find_rentals] AI parse failed (showing listing anyway):`, parseErr);
+          console.error(`[find_rentals] AI parse FAILED for "${enrichedListing.title}":`, parseErr instanceof Error ? parseErr.message : parseErr);
+          // Continue without parsed data — budget filter will use fallback
         }
       }
 
-      // Budget filter: check if estimated total exceeds budget
-      if (priceTo != null && parsedData?.totalMonthlyCost != null) {
-        if (parsedData.totalMonthlyCost > priceTo) {
-          rejected.push({
-            url: enrichedListing.url,
-            title: enrichedListing.title,
-            reason: `estimated total ${parsedData.totalMonthlyCost} PLN exceeds budget ${priceTo} PLN`,
-          });
-          continue;
-        }
+      // Budget filter — use AI total if available, fallback to rent + czynsz
+      const estimatedTotal = parsedData?.totalMonthlyCost
+        ?? (enrichedListing.price + (enrichedListing.rent ?? 0));
+
+      if (priceTo != null && estimatedTotal > priceTo) {
+        rejected.push({
+          url: enrichedListing.url,
+          title: enrichedListing.title,
+          reason: `estimated total ${estimatedTotal} PLN exceeds budget ${priceTo} PLN`,
+        });
+        continue;
       }
 
       // Contract preference filter
@@ -631,8 +633,11 @@ async function execFindRentals(
       locationScore ?? undefined,
     );
 
-    // Send photos with card as caption if short enough, otherwise card then photos
-    if (card.length <= CAPTION_LIMIT && listing.photos.length > 0) {
+    // Send card — split into multiple messages if needed
+    const cardChunks = splitMessage(card);
+
+    // If single chunk fits caption limit, send with photos
+    if (cardChunks.length === 1 && card.length <= CAPTION_LIMIT && listing.photos.length > 0) {
       try {
         await sendPhotosFn(ctx.chatId, listing.photos.slice(0, 10), card);
       } catch (e) {
@@ -641,10 +646,14 @@ async function execFindRentals(
         try { await sendFn(ctx.chatId, card); } catch (e2) { console.error('[tools] send failed:', e2 instanceof Error ? e2.message : e2); }
       }
     } else {
-      try {
-        await sendFn(ctx.chatId, card);
-      } catch (cardErr) {
-        try { await sendFn(ctx.chatId, `${listing.title}\n${listing.url}\nPrice: ${listing.price} PLN`, { parse_mode: undefined }); } catch (e) { console.error('[tools] send failed:', e instanceof Error ? e.message : e); }
+      // Send all chunks
+      for (const chunk of cardChunks) {
+        try {
+          await sendFn(ctx.chatId, chunk);
+        } catch (cardErr) {
+          try { await sendFn(ctx.chatId, `${listing.title}\n${listing.url}\nPrice: ${listing.price} PLN`, { parse_mode: undefined }); } catch (e) { console.error('[tools] send failed:', e instanceof Error ? e.message : e); }
+          break;
+        }
       }
       if (listing.photos.length > 0) {
         try {
@@ -743,7 +752,8 @@ async function execFindItems(
       try {
         parsedData = await parseItemListing(item, rejectionCriteria);
       } catch (parseErr) {
-        console.error(`[find_items] Parse error for ${item.url}:`, parseErr);
+        console.error(`[find_items] AI parse FAILED for "${item.title}":`, parseErr instanceof Error ? parseErr.message : parseErr);
+        // Continue without parsed data
       }
     }
 
@@ -770,9 +780,10 @@ async function execFindItems(
 
     const card = formatRichItemNotification(enrichedItem, parsedData ?? undefined);
     const ITEM_CAPTION_LIMIT = 1024;
+    const itemChunks = splitMessage(card);
 
-    // Send photos with card as caption if short enough, otherwise card then photos
-    if (card.length <= ITEM_CAPTION_LIMIT && enrichedItem.photos.length > 0) {
+    // If single chunk fits caption limit, send with photos
+    if (itemChunks.length === 1 && card.length <= ITEM_CAPTION_LIMIT && enrichedItem.photos.length > 0) {
       try {
         await sendPhotosFn(ctx.chatId, enrichedItem.photos.slice(0, 10), card);
       } catch (e) {
@@ -780,10 +791,13 @@ async function execFindItems(
         try { await sendFn(ctx.chatId, card); } catch (e2) { console.error('[tools] send failed:', e2 instanceof Error ? e2.message : e2); }
       }
     } else {
-      try {
-        await sendFn(ctx.chatId, card);
-      } catch (cardErr) {
-        try { await sendFn(ctx.chatId, `${enrichedItem.title}\n${enrichedItem.url}\nPrice: ${enrichedItem.price} PLN`, { parse_mode: undefined }); } catch (e) { console.error('[tools] send failed:', e instanceof Error ? e.message : e); }
+      for (const chunk of itemChunks) {
+        try {
+          await sendFn(ctx.chatId, chunk);
+        } catch (cardErr) {
+          try { await sendFn(ctx.chatId, `${enrichedItem.title}\n${enrichedItem.url}\nPrice: ${enrichedItem.price} PLN`, { parse_mode: undefined }); } catch (e) { console.error('[tools] send failed:', e instanceof Error ? e.message : e); }
+          break;
+        }
       }
       if (enrichedItem.photos.length > 0) {
         try {
