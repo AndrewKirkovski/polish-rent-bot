@@ -1,19 +1,18 @@
 // AI-powered comprehensive listing analysis using Claude
 // Produces deep, human-readable assessments — not just field extraction
 
-import Anthropic from '@anthropic-ai/sdk';
 import { createHash } from 'node:crypto';
 import type { Listing, ParsedRentalData, ParsedItemData, RejectionResult } from '../types.js';
 import type { ItemListing } from '../crawlers/olx-items.js';
 import { getParsedListing, saveParsedListing, getRejectionCache, saveRejectionCache } from '../storage/db.js';
 import { ParsedRentalDataSchema, ParsedItemDataSchema, RejectionResultSchema } from './schemas.js';
+import { createMessageTracked, recordLocalCacheHit } from './client.js';
 
 export type { ParsedRentalData, ParsedItemData } from '../types.js';
 
-let _client: Anthropic | null = null;
-function getClient(): Anthropic {
-  if (!_client) _client = new Anthropic();
-  return _client;
+export interface AiCallCtx {
+  userId?: number;
+  monitorId?: number;
 }
 
 const MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-6';
@@ -84,13 +83,19 @@ Return ONLY valid JSON (no markdown fences):
   "additionalNotes": ["anything else noteworthy"]
 }`;
 
-export async function parseRentalListing(listing: Listing): Promise<ParsedRentalData> {
+export async function parseRentalListing(listing: Listing, ctx: AiCallCtx = {}): Promise<ParsedRentalData> {
   const descHash = hashText(listing.description || listing.title);
 
   // Check cache
   const cached = getParsedListing(listing.platform, listing.platformId);
   if (cached && cached.description_hash === descHash) {
-    try { return JSON.parse(cached.parsed_data); } catch { /* re-parse below */ }
+    try {
+      const parsed = JSON.parse(cached.parsed_data);
+      recordLocalCacheHit({ feature: 'parse_rental', ...ctx }, MODEL);
+      return parsed;
+    } catch {
+      console.warn(`[parse-listing] Corrupt cache entry for ${listing.platform}:${listing.platformId}, re-parsing`);
+    }
   }
 
   const userMessage = `Title: ${listing.title}
@@ -110,7 +115,7 @@ Coordinates: ${listing.lat ?? 'unknown'}, ${listing.lng ?? 'unknown'}
 Full description (Polish):
 ${(listing.description || 'No description provided').slice(0, 8000)}`;
 
-  const response = await getClient().messages.create({
+  const response = await createMessageTracked({
     model: MODEL,
     max_tokens: 2048,
     temperature: 0,
@@ -122,9 +127,9 @@ ${(listing.description || 'No description provided').slice(0, 8000)}`;
       },
     ],
     messages: [{ role: 'user', content: userMessage }],
-  }, { timeout: 30_000 });
+  }, { feature: 'parse_rental', ...ctx }); // uses client defaults: 120s timeout, 3 retries
 
-  const textBlock = response.content.find((b) => b.type === 'text');
+  const textBlock = response.content.find((b: { type: string }) => b.type === 'text');
   if (!textBlock || textBlock.type !== 'text') {
     throw new Error('No text in Claude response');
   }
@@ -189,12 +194,18 @@ Return ONLY valid JSON (no markdown fences):
   "additionalNotes": ["anything else noteworthy"]
 }`;
 
-export async function parseItemListing(item: ItemListing): Promise<ParsedItemData> {
+export async function parseItemListing(item: ItemListing, ctx: AiCallCtx = {}): Promise<ParsedItemData> {
   const descHash = hashText(item.description || item.title);
 
   const cached = getParsedListing(item.platform, item.platformId);
   if (cached && cached.description_hash === descHash) {
-    try { return JSON.parse(cached.parsed_data); } catch { /* re-parse below */ }
+    try {
+      const parsed = JSON.parse(cached.parsed_data);
+      recordLocalCacheHit({ feature: 'parse_item', ...ctx }, MODEL);
+      return parsed;
+    } catch {
+      console.warn(`[parse-listing] Corrupt cache entry for ${item.platform}:${item.platformId}, re-parsing`);
+    }
   }
 
   const userMessage = `Title: ${item.title}
@@ -207,7 +218,7 @@ Category params: ${Object.entries(item.params).filter(([k]) => k !== 'price').ma
 Full description (Polish):
 ${(item.description || 'No description provided').slice(0, 8000)}`;
 
-  const response = await getClient().messages.create({
+  const response = await createMessageTracked({
     model: MODEL,
     max_tokens: 1024,
     temperature: 0,
@@ -219,9 +230,9 @@ ${(item.description || 'No description provided').slice(0, 8000)}`;
       },
     ],
     messages: [{ role: 'user', content: userMessage }],
-  }, { timeout: 30_000 });
+  }, { feature: 'parse_item', ...ctx }); // uses client defaults: 120s timeout, 3 retries
 
-  const textBlock = response.content.find((b) => b.type === 'text');
+  const textBlock = response.content.find((b: { type: string }) => b.type === 'text');
   if (!textBlock || textBlock.type !== 'text') {
     throw new Error('No text in Claude response');
   }
@@ -265,21 +276,32 @@ ${(item.description || 'No description provided').slice(0, 8000)}`;
 
 const REJECTION_PROMPT = `You evaluate rental/item listings against user rejection criteria.
 Given a listing summary and the user's criteria, determine if the listing should be rejected.
+
+CRITICAL RULES:
+- ONLY reject if the listing EXPLICITLY contradicts a criterion (e.g. criterion says "no ground floor" and listing says "floor: 0")
+- NEVER reject because information is MISSING or not mentioned. Absence of info is NOT a reason to reject.
+- If the listing doesn't mention something the criteria asks about, assume it PASSES (benefit of the doubt).
+- Be conservative: when in doubt, do NOT reject.
+
 Return ONLY valid JSON (no markdown fences):
 {"rejected": true/false, "rejectionReason": "reason string or null"}
-Set rejected=true and provide rejectionReason if the listing fails ANY of the criteria.
-If the listing passes all criteria, set rejected=false and rejectionReason=null.`;
+Set rejected=true ONLY if the listing clearly violates a criterion.
+If the listing passes or info is unclear, set rejected=false and rejectionReason=null.`;
 
 export async function evaluateRejection(
   listing: { platform: string; platformId: string; title: string },
   universalParse: ParsedRentalData | ParsedItemData,
   rejectionCriteria: string,
+  ctx: AiCallCtx = {},
 ): Promise<RejectionResult> {
   const criteriaHash = hashText(rejectionCriteria);
 
   // Check rejection cache
   const cached = getRejectionCache(listing.platform, listing.platformId, criteriaHash);
-  if (cached) return cached;
+  if (cached) {
+    recordLocalCacheHit({ feature: 'rejection_eval', ...ctx }, MODEL);
+    return cached;
+  }
 
   // Build a compact summary from listing + universal parse for the rejection prompt
   const summaryParts: string[] = [`Title: ${listing.title}`];
@@ -343,15 +365,15 @@ ${summaryParts.join('\n')}
 USER REJECTION CRITERIA:
 ${rejectionCriteria}`;
 
-  const response = await getClient().messages.create({
+  const response = await createMessageTracked({
     model: MODEL,
     max_tokens: 256,
     temperature: 0,
-    system: REJECTION_PROMPT,
+    system: [{ type: 'text' as const, text: REJECTION_PROMPT, cache_control: { type: 'ephemeral' as const } }],
     messages: [{ role: 'user', content: userMessage }],
-  }, { timeout: 15_000 });
+  }, { feature: 'rejection_eval', ...ctx }, { timeout: 45_000 }); // shorter timeout OK for tiny call
 
-  const textBlock = response.content.find((b) => b.type === 'text');
+  const textBlock = response.content.find((b: { type: string }) => b.type === 'text');
   if (!textBlock || textBlock.type !== 'text') {
     throw new Error('No text in Claude rejection response');
   }

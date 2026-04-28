@@ -53,18 +53,12 @@ interface OlxSearchParams {
   districtId?: number;  // OLX district ID
 }
 
-async function fetchJson<T>(url: string): Promise<T | null> {
-  try {
-    const res = await fetch(url, { headers: HEADERS, signal: AbortSignal.timeout(15_000) });
-    if (!res.ok) {
-      console.error(`OLX API ${res.status}: ${url.slice(0, 120)}`);
-      return null;
-    }
-    return await res.json() as T;
-  } catch (err) {
-    console.error(`OLX fetch error: ${err}`);
-    return null;
+async function fetchJson<T>(url: string): Promise<T> {
+  const res = await fetch(url, { headers: HEADERS, signal: AbortSignal.timeout(15_000) });
+  if (!res.ok) {
+    throw new Error(`OLX API ${res.status}: ${url.slice(0, 120)}`);
   }
+  return await res.json() as T;
 }
 
 function buildSearchUrl(params: OlxSearchParams): string {
@@ -188,9 +182,14 @@ export async function searchOlx(params: OlxSearchParams): Promise<CrawlResult> {
 }
 
 export async function fetchOlxPhone(offerId: string): Promise<string | null> {
-  const data = await fetchJson<any>(`${OLX_API}/offers/${offerId}/phones/`);
-  const phones = data?.data?.phones;
-  return phones?.length ? phones[0] : null;
+  try {
+    const data = await fetchJson<any>(`${OLX_API}/offers/${offerId}/phones/`);
+    const phones = data?.data?.phones;
+    return phones?.length ? phones[0] : null;
+  } catch {
+    // Phone API returns 400 for many listings (protected/no phone) — expected, not an error
+    return null;
+  }
 }
 
 export async function fetchAllPages(params: OlxSearchParams, maxPages = 25): Promise<Listing[]> {

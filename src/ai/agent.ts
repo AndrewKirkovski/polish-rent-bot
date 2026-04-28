@@ -1,7 +1,6 @@
 // Core agent loop — orchestrates Claude API calls, tool execution, and Telegram messaging
 
-import Anthropic from '@anthropic-ai/sdk';
-import type { MessageParam, ContentBlockParam, ToolResultBlockParam } from '@anthropic-ai/sdk/resources/messages.js';
+import type { MessageParam, ContentBlockParam, ToolResultBlockParam, ToolUseBlock, TextBlock } from '@anthropic-ai/sdk/resources/messages.js';
 import { SYSTEM_PROMPT } from './prompts.js';
 import { TOOL_DEFINITIONS, executeTool, getOrCreateContext } from './tools.js';
 import {
@@ -9,6 +8,7 @@ import {
   getConversationHistory as getConversationHistoryFromDb,
 } from '../storage/db.js';
 import { AsyncMutex } from '../utils/mutex.js';
+import { createMessageTracked } from './client.js';
 
 // Per-user mutex — prevents concurrent message handling for the same user
 const userMutexes = new Map<number, AsyncMutex>();
@@ -19,10 +19,9 @@ function getUserMutex(userId: number): AsyncMutex {
 }
 
 // ---------------------------------------------------------------------------
-// Anthropic client
+// Anthropic client config
 // ---------------------------------------------------------------------------
 
-const client = new Anthropic();
 const MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-6';
 const MAX_TOKENS = 2048;
 const MAX_TOOL_ROUNDS = 10;
@@ -114,7 +113,7 @@ export async function handleUserMessage(
           ? { ...tool, cache_control: { type: 'ephemeral' as const } }
           : tool,
       );
-      let response = await client.messages.create({
+      let response = await createMessageTracked({
         model: MODEL,
         max_tokens: MAX_TOKENS,
         system: [
@@ -126,7 +125,7 @@ export async function handleUserMessage(
         ],
         tools: cachedTools,
         messages,
-      }, { timeout: 60_000 }); // 60s timeout — longer than parse-listing since tool loops take time
+      }, { feature: 'agent_initial', userId }); // client defaults: 120s timeout, 3 retries
 
       // 7. Tool-use loop
       let rounds = 0;
@@ -135,7 +134,7 @@ export async function handleUserMessage(
 
         // Extract tool use blocks from the response
         const toolUseBlocks = response.content.filter(
-          (block): block is Anthropic.Messages.ToolUseBlock => block.type === 'tool_use',
+          (block): block is ToolUseBlock => block.type === 'tool_use',
         );
 
         if (toolUseBlocks.length === 0) break;
@@ -172,7 +171,7 @@ export async function handleUserMessage(
         });
 
         // Call Claude again with the updated messages (reuses cached system + tools)
-        response = await client.messages.create({
+        response = await createMessageTracked({
           model: MODEL,
           max_tokens: MAX_TOKENS,
           system: [
@@ -184,12 +183,12 @@ export async function handleUserMessage(
           ],
           tools: cachedTools,
           messages,
-        }, { timeout: 60_000 });
+        }, { feature: 'agent_tool_loop', userId }); // client defaults: 120s timeout, 3 retries
       }
 
       // 8. Extract final text response
       const textBlocks = response.content.filter(
-        (block): block is Anthropic.Messages.TextBlock => block.type === 'text',
+        (block): block is TextBlock => block.type === 'text',
       );
       const finalText = textBlocks.map((b) => b.text).join('\n\n');
 

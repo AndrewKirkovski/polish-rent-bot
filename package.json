@@ -4,6 +4,10 @@
   "type": "module",
   "scripts": {
     "start": "tsx src/main.ts",
+    "typecheck": "tsc --noEmit",
+    "dashboard:install": "pnpm --dir dashboard install",
+    "dashboard:dev": "pnpm --dir dashboard dev",
+    "dashboard:build": "pnpm --dir dashboard build",
     "recon:olx": "tsx src/experiments/recon-olx.ts",
     "recon:otodom": "tsx src/experiments/recon-otodom.ts",
     "test:stealth": "tsx src/experiments/test-stealth.ts",
@@ -11,19 +15,24 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.90.0",
+    "@hono/node-server": "^2.0.0",
     "better-sqlite3": "^12.9.0",
     "crawlee": "^3.12.0",
     "dotenv": "^16.4.0",
+    "hono": "^4.12.15",
     "marked": "^18.0.1",
+    "nanoid": "^5.1.9",
     "node-telegram-bot-api": "^0.67.0",
     "playwright": "^1.50.0",
     "playwright-extra": "^4.3.0",
     "puppeteer-extra-plugin-stealth": "^2.11.0",
     "sanitize-html": "^2.17.3",
+    "tsx": "^4.7.0",
     "zod": "^4.3.6"
   },
   "pnpm": {
     "onlyBuiltDependencies": [
+      "@tailwindcss/oxide",
       "better-sqlite3",
       "esbuild"
     ]
@@ -33,7 +42,6 @@
     "@types/node": "^22.0.0",
     "@types/node-telegram-bot-api": "^0.64.14",
     "@types/sanitize-html": "^2.16.1",
-    "tsx": "^4.7.0",
     "typescript": "^5.4.0"
   }
 }

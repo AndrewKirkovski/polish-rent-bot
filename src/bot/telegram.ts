@@ -7,7 +7,7 @@ type Msg = TelegramBot.Message;
 import type { Listing } from '../types.js';
 import type { ItemListing } from '../crawlers/olx-items.js';
 import { handleUserMessage } from '../ai/agent.js';
-import { sendPhotoAlbum, formatRichRentalNotification, formatRichItemNotification } from './format.js';
+import { sendPhotoAlbum, formatRichRentalNotification, formatRichItemNotification, splitMessage } from './format.js';
 import {
   isUserAuthorized,
   authorizeUser,
@@ -87,8 +87,8 @@ function mdToHtml(text: string): string {
   // sanitize-html: keep only Telegram-supported tags
   const clean = sanitizeHtml(processed, {
     allowedTags: ['b', 'strong', 'i', 'em', 'u', 'ins', 's', 'strike', 'del',
-                  'a', 'code', 'pre', 'blockquote', 'tg-emoji'],
-    allowedAttributes: { 'a': ['href'], 'tg-emoji': ['emoji-id'] },
+                  'a', 'code', 'pre', 'blockquote', 'tg-emoji', 'tg-spoiler', 'span'],
+    allowedAttributes: { 'a': ['href'], 'tg-emoji': ['emoji-id'], 'code': ['class'], 'span': ['class'], 'blockquote': ['expandable'] },
     transformTags: {
       'strong': 'b',
       'em': 'i',
@@ -104,6 +104,23 @@ function mdToHtml(text: string): string {
 // ---------------------------------------------------------------------------
 // Enriched notification sender (used by scheduler)
 // ---------------------------------------------------------------------------
+
+/** Send message that MUST succeed — throws if both HTML and plain text fallback fail.
+ *  Used by scheduler where failure must prevent markListingSeen. */
+async function mustSend(bot: TelegramBot, chatId: number | string, text: string, opts?: TelegramBot.SendMessageOptions): Promise<void> {
+  try {
+    await bot.sendMessage(chatId, text, opts);
+  } catch (err) {
+    console.error('[telegram] mustSend failed:', err instanceof Error ? err.message : err);
+    if (opts?.parse_mode && err instanceof Error && err.message.includes("can't parse entities")) {
+      // Retry as plain text — if this also fails, let it throw
+      const plain = stripHtml(text);
+      await bot.sendMessage(chatId, plain);
+    } else {
+      throw err; // re-throw non-parse errors (network, blocked, etc.)
+    }
+  }
+}
 
 export async function sendEnrichedNotification(
   chatId: number | string,
@@ -121,22 +138,27 @@ export async function sendEnrichedNotification(
     text = formatRichRentalNotification(listing as Listing, parsedData as ParsedRentalData | undefined, locationScore ?? undefined);
   }
 
-  // Send photos with card as caption if short enough, otherwise card then photos
+  // Split long cards to stay under Telegram's 4096 char limit
+  const chunks = splitMessage(text);
   const photos = listing.photos;
   const CAPTION_LIMIT = 1024;
-  if (photos.length > 0 && text.length <= CAPTION_LIMIT) {
+
+  // Try photo+caption for short single-chunk cards
+  if (chunks.length === 1 && text.length <= CAPTION_LIMIT && photos.length > 0) {
     try {
       await sendPhotoAlbum(bot, chatId, photos, text);
+      return;
     } catch {
-      // Fallback: send card and photos separately
-      await safeSend(bot, chatId, text, { parse_mode: 'HTML', disable_web_page_preview: false });
-      try { await sendPhotoAlbum(bot, chatId, photos); } catch { /* best-effort */ }
+      // Fallback to text + separate photos below
     }
-  } else {
-    await safeSend(bot, chatId, text, { parse_mode: 'HTML', disable_web_page_preview: false });
-    if (photos.length > 0) {
-      try { await sendPhotoAlbum(bot, chatId, photos); } catch { /* best-effort */ }
-    }
+  }
+
+  // Send text chunks — mustSend throws on total failure so scheduler retries next cycle
+  for (const chunk of chunks) {
+    await mustSend(bot, chatId, chunk, { parse_mode: 'HTML', disable_web_page_preview: false });
+  }
+  if (photos.length > 0) {
+    try { await sendPhotoAlbum(bot, chatId, photos); } catch { /* photos are best-effort */ }
   }
 }
 
@@ -147,16 +169,27 @@ export async function sendEnrichedNotification(
 type SendFn = (chatId: number | string, text: string, opts?: Record<string, unknown>) => Promise<void>;
 type SendPhotosFn = (chatId: number | string, urls: string[], caption?: string) => Promise<void>;
 
-// Safe sendMessage wrapper — catches errors, retries without parse_mode on parse failures
+/** Strip all HTML tags for plain text fallback — never show raw <tg-emoji> to user.
+ *  Uses sanitize-html with allowedTags:[] to handle all edge cases (unclosed, nested, malformed). */
+function stripHtml(html: string): string {
+  // First: convert tg-emoji to their fallback emoji text before stripping
+  const withFallbackEmoji = html.replace(/<tg-emoji[^>]*>([^<]*)<\/tg-emoji>/g, '$1');
+  // Then: strip ALL remaining tags using sanitize-html (handles malformed/unclosed tags correctly)
+  return sanitizeHtml(withFallbackEmoji, { allowedTags: [], allowedAttributes: {} })
+    .replace(/\n{3,}/g, '\n\n').trim();
+}
+
+// Safe sendMessage wrapper — catches errors, retries with stripped HTML on parse failures
 async function safeSend(bot: TelegramBot, chatId: number | string, text: string, opts?: TelegramBot.SendMessageOptions): Promise<void> {
   try {
     await bot.sendMessage(chatId, text, opts);
   } catch (err) {
     console.error('[telegram] sendMessage failed:', err instanceof Error ? err.message : err);
-    // If HTML parsing failed, retry without parse_mode
+    // If HTML parsing failed, retry as plain text (strip all tags)
     if (opts?.parse_mode && err instanceof Error && err.message.includes("can't parse entities")) {
       try {
-        await bot.sendMessage(chatId, text); // plain text fallback
+        const plain = stripHtml(text);
+        await bot.sendMessage(chatId, plain);
       } catch (retryErr) {
         console.error('[telegram] Plain text fallback also failed:', retryErr instanceof Error ? retryErr.message : retryErr);
       }

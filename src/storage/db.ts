@@ -113,6 +113,43 @@ const SCHEMA = `
     cached_at        TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (platform, platform_id, criteria_hash)
   );
+
+  CREATE TABLE IF NOT EXISTS ai_usage (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts                    TEXT NOT NULL DEFAULT (datetime('now')),
+    feature               TEXT NOT NULL,
+    model                 TEXT NOT NULL,
+    input_tokens          INTEGER NOT NULL DEFAULT 0,
+    output_tokens         INTEGER NOT NULL DEFAULT 0,
+    cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens     INTEGER NOT NULL DEFAULT 0,
+    cost_usd              REAL NOT NULL DEFAULT 0,
+    local_cache_hit       INTEGER NOT NULL DEFAULT 0,
+    duration_ms           INTEGER,
+    monitor_id            INTEGER,
+    user_id               INTEGER,
+    error_message         TEXT
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_ai_usage_ts
+    ON ai_usage(ts);
+
+  CREATE INDEX IF NOT EXISTS idx_ai_usage_feature_ts
+    ON ai_usage(feature, ts);
+
+  CREATE TABLE IF NOT EXISTS monitor_runs (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    monitor_id          INTEGER NOT NULL,
+    started_at          TEXT NOT NULL DEFAULT (datetime('now')),
+    finished_at         TEXT,
+    listings_found      INTEGER NOT NULL DEFAULT 0,  -- total candidates after dedup
+    listings_unseen     INTEGER NOT NULL DEFAULT 0,  -- not in seen_listings yet
+    listings_delivered  INTEGER NOT NULL DEFAULT 0,  -- actually sent to user (post-filter)
+    error_message       TEXT
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_monitor_runs_started
+    ON monitor_runs(monitor_id, started_at DESC);
 `;
 
 // ---------------------------------------------------------------------------
@@ -136,7 +173,27 @@ export function initDb(dbPath?: string): Database.Database {
 
   db.exec(SCHEMA);
 
+  runMigrations(db);
+
   return db;
+}
+
+// ---------------------------------------------------------------------------
+// Migrations — additive in-place changes when the bootstrap CREATE TABLE
+// IF NOT EXISTS misses a column on a pre-existing table.
+// ---------------------------------------------------------------------------
+
+function runMigrations(db: Database.Database): void {
+  // 2026-04-28: monitor_runs renamed `listings_new` -> `listings_unseen` and added
+  // `listings_delivered` so the dashboard can show "actually sent" vs "fetched but filtered".
+  const cols = db.prepare(`PRAGMA table_info(monitor_runs)`).all() as Array<{ name: string }>;
+  const names = new Set(cols.map((c) => c.name));
+  if (names.has('listings_new') && !names.has('listings_unseen')) {
+    db.exec(`ALTER TABLE monitor_runs RENAME COLUMN listings_new TO listings_unseen`);
+  }
+  if (!names.has('listings_delivered')) {
+    db.exec(`ALTER TABLE monitor_runs ADD COLUMN listings_delivered INTEGER NOT NULL DEFAULT 0`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -426,4 +483,366 @@ export function updateMonitorConfig(monitorId: number, config: Record<string, un
   db.prepare(
     'UPDATE monitors SET config = ? WHERE id = ?',
   ).run(JSON.stringify(config), monitorId);
+}
+
+// ---------------------------------------------------------------------------
+// AI usage tracking
+// ---------------------------------------------------------------------------
+
+export interface AiUsageRow {
+  feature: string;
+  model: string;
+  inputTokens: number;
+  outputTokens: number;
+  cacheCreationTokens: number;
+  cacheReadTokens: number;
+  costUsd: number;
+  localCacheHit: 0 | 1;
+  durationMs: number | null;
+  monitorId: number | null;
+  userId: number | null;
+  errorMessage: string | null;
+}
+
+export function insertAiUsage(row: AiUsageRow): void {
+  const db = getDb();
+  db.prepare(`
+    INSERT INTO ai_usage (
+      feature, model,
+      input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens,
+      cost_usd, local_cache_hit, duration_ms,
+      monitor_id, user_id, error_message
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    row.feature, row.model,
+    row.inputTokens, row.outputTokens, row.cacheCreationTokens, row.cacheReadTokens,
+    row.costUsd, row.localCacheHit, row.durationMs,
+    row.monitorId, row.userId, row.errorMessage,
+  );
+}
+
+export type UsageRange = '24h' | '7d' | '30d' | 'all';
+
+function rangeToSqliteModifier(range: UsageRange): string | null {
+  switch (range) {
+    case '24h': return '-1 days';
+    case '7d':  return '-7 days';
+    case '30d': return '-30 days';
+    case 'all': return null;
+  }
+}
+
+// Bind helper: return params for a parameterised `WHERE ts >= datetime('now', ?)`
+// or `null` to skip the filter entirely.
+function rangeBind(range: UsageRange): string | null {
+  return rangeToSqliteModifier(range);
+}
+
+export interface UsageSummary {
+  range: UsageRange;
+  costUsd: number;
+  apiCalls: number;
+  localCacheHits: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheCreationTokens: number;
+  cacheReadTokens: number;
+  errorCount: number;
+}
+
+export function getUsageSummary(range: UsageRange): UsageSummary {
+  const db = getDb();
+  const bind = rangeBind(range);
+  const where = bind ? `WHERE ts >= datetime('now', ?)` : '';
+  const sql = `
+    SELECT
+      COALESCE(SUM(cost_usd), 0)                                    AS cost_usd,
+      COALESCE(SUM(CASE WHEN local_cache_hit = 0 THEN 1 ELSE 0 END), 0) AS api_calls,
+      COALESCE(SUM(local_cache_hit), 0)                             AS local_cache_hits,
+      COALESCE(SUM(input_tokens), 0)                                AS input_tokens,
+      COALESCE(SUM(output_tokens), 0)                               AS output_tokens,
+      COALESCE(SUM(cache_creation_tokens), 0)                       AS cache_creation_tokens,
+      COALESCE(SUM(cache_read_tokens), 0)                           AS cache_read_tokens,
+      COALESCE(SUM(CASE WHEN error_message IS NOT NULL THEN 1 ELSE 0 END), 0) AS error_count
+    FROM ai_usage ${where}
+  `;
+  const stmt = db.prepare(sql);
+  const row = (bind ? stmt.get(bind) : stmt.get()) as Record<string, number>;
+  return {
+    range,
+    costUsd: row.cost_usd,
+    apiCalls: row.api_calls,
+    localCacheHits: row.local_cache_hits,
+    inputTokens: row.input_tokens,
+    outputTokens: row.output_tokens,
+    cacheCreationTokens: row.cache_creation_tokens,
+    cacheReadTokens: row.cache_read_tokens,
+    errorCount: row.error_count,
+  };
+}
+
+export interface UsageBucket {
+  bucket: string;        // ISO-ish timestamp anchored to bucket start
+  feature: string;
+  calls: number;
+  localCacheHits: number;
+  costUsd: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheCreationTokens: number;
+  cacheReadTokens: number;
+}
+
+export function getUsageTimeSeries(
+  range: UsageRange,
+  bucket: 'hour' | 'day',
+): UsageBucket[] {
+  const db = getDb();
+  const bind = rangeBind(range);
+  const where = bind ? `WHERE ts >= datetime('now', ?)` : '';
+  // bucket is gated by a typed union literal on input; safe to interpolate.
+  const fmt = bucket === 'hour' ? "%Y-%m-%dT%H:00:00" : "%Y-%m-%d";
+  const sql = `
+    SELECT
+      strftime('${fmt}', ts) AS bucket,
+      feature                AS feature,
+      COALESCE(SUM(CASE WHEN local_cache_hit = 0 THEN 1 ELSE 0 END), 0) AS calls,
+      COALESCE(SUM(local_cache_hit), 0)        AS local_cache_hits,
+      COALESCE(SUM(cost_usd), 0)               AS cost_usd,
+      COALESCE(SUM(input_tokens), 0)           AS input_tokens,
+      COALESCE(SUM(output_tokens), 0)          AS output_tokens,
+      COALESCE(SUM(cache_creation_tokens), 0)  AS cache_creation_tokens,
+      COALESCE(SUM(cache_read_tokens), 0)      AS cache_read_tokens
+    FROM ai_usage
+    ${where}
+    GROUP BY bucket, feature
+    ORDER BY bucket ASC, feature ASC
+  `;
+  const stmt = db.prepare(sql);
+  const rows = (bind ? stmt.all(bind) : stmt.all()) as Array<Record<string, string | number>>;
+  return rows.map((r) => ({
+    bucket: String(r.bucket),
+    feature: String(r.feature),
+    calls: Number(r.calls),
+    localCacheHits: Number(r.local_cache_hits),
+    costUsd: Number(r.cost_usd),
+    inputTokens: Number(r.input_tokens),
+    outputTokens: Number(r.output_tokens),
+    cacheCreationTokens: Number(r.cache_creation_tokens),
+    cacheReadTokens: Number(r.cache_read_tokens),
+  }));
+}
+
+export interface RecentUsageRow {
+  id: number;
+  ts: string;
+  feature: string;
+  model: string;
+  inputTokens: number;
+  outputTokens: number;
+  cacheCreationTokens: number;
+  cacheReadTokens: number;
+  costUsd: number;
+  localCacheHit: number;
+  durationMs: number | null;
+  monitorId: number | null;
+  userId: number | null;
+  errorMessage: string | null;
+}
+
+export function getRecentUsage(limit = 100): RecentUsageRow[] {
+  const db = getDb();
+  const rows = db.prepare(`
+    SELECT
+      id, ts, feature, model,
+      input_tokens          AS inputTokens,
+      output_tokens         AS outputTokens,
+      cache_creation_tokens AS cacheCreationTokens,
+      cache_read_tokens     AS cacheReadTokens,
+      cost_usd              AS costUsd,
+      local_cache_hit       AS localCacheHit,
+      duration_ms           AS durationMs,
+      monitor_id            AS monitorId,
+      user_id               AS userId,
+      error_message         AS errorMessage
+    FROM ai_usage
+    ORDER BY id DESC
+    LIMIT ?
+  `).all(limit) as RecentUsageRow[];
+  return rows;
+}
+
+// ---------------------------------------------------------------------------
+// Cache stats (parsed_listings, rejection_cache, maps_cache)
+// ---------------------------------------------------------------------------
+
+export interface CacheStats {
+  parsedListings: { count: number; oldestTs: string | null; newestTs: string | null };
+  rejectionCache: { count: number; oldestTs: string | null; newestTs: string | null };
+  mapsCache: { count: number; oldestTs: string | null; newestTs: string | null; expiredCount: number };
+  localHitRate24h: number; // 0..1
+}
+
+export function getCacheStats(mapsTtlDays = 7): CacheStats {
+  const db = getDb();
+  const parsed = db.prepare(`SELECT COUNT(*) AS c, MIN(parsed_at) AS oldest, MAX(parsed_at) AS newest FROM parsed_listings`).get() as { c: number; oldest: string | null; newest: string | null };
+  const rejection = db.prepare(`SELECT COUNT(*) AS c, MIN(cached_at) AS oldest, MAX(cached_at) AS newest FROM rejection_cache`).get() as { c: number; oldest: string | null; newest: string | null };
+  const maps = db.prepare(`SELECT COUNT(*) AS c, MIN(cached_at) AS oldest, MAX(cached_at) AS newest FROM maps_cache`).get() as { c: number; oldest: string | null; newest: string | null };
+  const expired = db.prepare(`SELECT COUNT(*) AS c FROM maps_cache WHERE cached_at < datetime('now', ? || ' days')`).get(`-${mapsTtlDays}`) as { c: number };
+
+  const hitRow = db.prepare(`
+    SELECT
+      COALESCE(SUM(local_cache_hit), 0) AS hits,
+      COUNT(*)                          AS total
+    FROM ai_usage
+    WHERE ts >= datetime('now', '-1 days')
+  `).get() as { hits: number; total: number };
+  const localHitRate24h = hitRow.total > 0 ? hitRow.hits / hitRow.total : 0;
+
+  return {
+    parsedListings: { count: parsed.c, oldestTs: parsed.oldest, newestTs: parsed.newest },
+    rejectionCache: { count: rejection.c, oldestTs: rejection.oldest, newestTs: rejection.newest },
+    mapsCache: { count: maps.c, oldestTs: maps.oldest, newestTs: maps.newest, expiredCount: expired.c },
+    localHitRate24h,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Monitor runs tracking
+// ---------------------------------------------------------------------------
+
+export function startMonitorRun(monitorId: number): number {
+  const db = getDb();
+  const result = db.prepare(`
+    INSERT INTO monitor_runs (monitor_id) VALUES (?)
+  `).run(monitorId);
+  return Number(result.lastInsertRowid);
+}
+
+export interface MonitorRunFinish {
+  listingsFound: number;
+  listingsUnseen: number;
+  listingsDelivered: number;
+  errorMessage?: string | null;
+}
+
+export function finishMonitorRun(runId: number, finish: MonitorRunFinish): void {
+  const db = getDb();
+  db.prepare(`
+    UPDATE monitor_runs
+    SET finished_at        = datetime('now'),
+        listings_found     = ?,
+        listings_unseen    = ?,
+        listings_delivered = ?,
+        error_message      = ?
+    WHERE id = ?
+  `).run(
+    finish.listingsFound,
+    finish.listingsUnseen,
+    finish.listingsDelivered,
+    finish.errorMessage ?? null,
+    runId,
+  );
+}
+
+export interface MonitorRunRow {
+  id: number;
+  monitorId: number;
+  startedAt: string;
+  finishedAt: string | null;
+  listingsFound: number;
+  listingsUnseen: number;
+  listingsDelivered: number;
+  errorMessage: string | null;
+  durationMs: number | null;
+}
+
+export function getMonitorRuns(monitorId: number, limit = 50): MonitorRunRow[] {
+  const db = getDb();
+  const rows = db.prepare(`
+    SELECT
+      id,
+      monitor_id         AS monitorId,
+      started_at         AS startedAt,
+      finished_at        AS finishedAt,
+      listings_found     AS listingsFound,
+      listings_unseen    AS listingsUnseen,
+      listings_delivered AS listingsDelivered,
+      error_message      AS errorMessage,
+      CASE
+        WHEN finished_at IS NULL THEN NULL
+        ELSE CAST((julianday(finished_at) - julianday(started_at)) * 86400000 AS INTEGER)
+      END AS durationMs
+    FROM monitor_runs
+    WHERE monitor_id = ?
+    ORDER BY id DESC
+    LIMIT ?
+  `).all(monitorId, limit) as MonitorRunRow[];
+  return rows;
+}
+
+export interface MonitorWithStats {
+  id: number;
+  userId: number;
+  type: string;
+  platform: string;
+  config: string;
+  active: number;
+  createdAt: string;
+  lastRunAt: string | null;
+  lastRunDelivered: number | null;
+  lastRunError: string | null;
+  listingsSeenTotal: number;
+  costUsd30d: number;
+}
+
+export function getMonitorsWithStats(): MonitorWithStats[] {
+  const db = getDb();
+  const rows = db.prepare(`
+    SELECT
+      m.id           AS id,
+      m.user_id      AS userId,
+      m.type         AS type,
+      m.platform     AS platform,
+      m.config       AS config,
+      m.active       AS active,
+      m.created_at   AS createdAt,
+      (SELECT started_at         FROM monitor_runs WHERE monitor_id = m.id ORDER BY id DESC LIMIT 1) AS lastRunAt,
+      (SELECT listings_delivered FROM monitor_runs WHERE monitor_id = m.id ORDER BY id DESC LIMIT 1) AS lastRunDelivered,
+      (SELECT error_message      FROM monitor_runs WHERE monitor_id = m.id ORDER BY id DESC LIMIT 1) AS lastRunError,
+      (SELECT COUNT(*)           FROM seen_listings WHERE monitor_id = m.id) AS listingsSeenTotal,
+      (SELECT COALESCE(SUM(cost_usd), 0) FROM ai_usage WHERE monitor_id = m.id AND ts >= datetime('now', '-30 days')) AS costUsd30d
+    FROM monitors m
+    ORDER BY m.active DESC, m.id DESC
+  `).all() as MonitorWithStats[];
+  return rows;
+}
+
+export interface SeenListingDetail {
+  id: number;
+  monitorId: number;
+  platform: string;
+  platformId: string;
+  url: string;
+  title: string;
+  price: number | null;
+  firstSeenAt: string;
+}
+
+export function getMonitorListings(monitorId: number, limit = 50): SeenListingDetail[] {
+  const db = getDb();
+  const rows = db.prepare(`
+    SELECT
+      id,
+      monitor_id    AS monitorId,
+      platform,
+      platform_id   AS platformId,
+      url, title, price,
+      first_seen_at AS firstSeenAt
+    FROM seen_listings
+    WHERE monitor_id = ?
+    ORDER BY id DESC
+    LIMIT ?
+  `).all(monitorId, limit) as SeenListingDetail[];
+  return rows;
 }

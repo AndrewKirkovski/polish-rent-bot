@@ -33,6 +33,7 @@ export interface ItemListing {
   categoryId: number;
   categoryName: string | null;
   params: Record<string, string>; // all raw params as key-value
+  shipping: boolean;              // delivery/przesyłka available
   createdAt: string;
   scrapedAt: string;
 }
@@ -115,6 +116,7 @@ function parseItemOffer(raw: any): ItemListing {
     categoryId: raw.category?.id ?? 0,
     categoryName: raw.category?.name ?? null,
     params: paramMap,
+    shipping: raw.delivery?.rock?.active === true,
     createdAt: raw.created_time ?? raw.last_refresh_time ?? '',
     scrapedAt: new Date().toISOString(),
   };
@@ -124,18 +126,11 @@ function parseItemOffer(raw: any): ItemListing {
 
 export async function searchItems(params: ItemSearchParams): Promise<ItemCrawlResult> {
   const url = buildItemSearchUrl(params);
-  let data: any;
-  try {
-    const res = await fetch(url, { headers: HEADERS, signal: AbortSignal.timeout(15_000) });
-    if (!res.ok) {
-      console.error(`OLX items API ${res.status}: ${url.slice(0, 120)}`);
-      return { items: [], totalAvailable: 0, page: 0, hasNextPage: false, nextPageUrl: null };
-    }
-    data = await res.json();
-  } catch (err) {
-    console.error(`OLX items fetch error: ${err}`);
-    return { items: [], totalAvailable: 0, page: 0, hasNextPage: false, nextPageUrl: null };
+  const res = await fetch(url, { headers: HEADERS, signal: AbortSignal.timeout(15_000) });
+  if (!res.ok) {
+    throw new Error(`OLX items API ${res.status}: ${url.slice(0, 120)}`);
   }
+  const data = await res.json();
 
   if (!data?.data) {
     return { items: [], totalAvailable: 0, page: 0, hasNextPage: false, nextPageUrl: null };
@@ -161,7 +156,8 @@ export async function fetchItemPhone(offerId: string): Promise<string | null> {
     if (!res.ok) return null;
     const data = await res.json();
     return data?.data?.phones?.[0] ?? null;
-  } catch {
+  } catch (err) {
+    console.warn(`[olx-items] Phone fetch failed for ${offerId}:`, err instanceof Error ? err.message : err);
     return null;
   }
 }

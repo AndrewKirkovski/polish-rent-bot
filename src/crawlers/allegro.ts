@@ -223,6 +223,7 @@ function parseAllegroOffer(item: any): ItemListing {
       ...(delivery ? { deliveryPrice: `${delivery.amount} ${delivery.currency}` } : {}),
       freeDelivery: String(item.delivery?.availableForFree ?? false),
     },
+    shipping: item.delivery?.availableForFree === true || delivery != null,
     createdAt: '', // not in listing response
     scrapedAt: new Date().toISOString(),
   };

@@ -122,11 +122,17 @@ async function dismissCookieConsent(page: Page): Promise<void> {
 // --- __NEXT_DATA__ Extraction ---
 
 async function extractNextData(page: Page): Promise<any | null> {
-  return page.evaluate(() => {
+  const raw = await page.evaluate(() => {
     const el = document.getElementById('__NEXT_DATA__');
-    if (!el?.textContent) return null;
-    try { return JSON.parse(el.textContent); } catch { return null; }
+    return el?.textContent ?? null;
   });
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch (err) {
+    console.error(`[otodom] Malformed __NEXT_DATA__ JSON (${raw.length} chars):`, err instanceof Error ? err.message : err);
+    return null;
+  }
 }
 
 // --- Listing Parsing ---
@@ -251,7 +257,7 @@ export async function searchOtodom(params: OtodomSearchParams): Promise<CrawlRes
 
     const nextData = await extractNextData(page);
     if (!nextData) {
-      console.error('  Otodom: no __NEXT_DATA__ found');
+      console.error(`  Otodom: no __NEXT_DATA__ found at ${url.slice(0, 120)}`);
       return { platform: 'otodom', listings: [], totalAvailable: 0, page: 0, hasNextPage: false, nextPageUrl: null };
     }
 
@@ -291,7 +297,7 @@ export async function fetchOtodomDetail(listingUrl: string): Promise<Listing | n
       const nextData = await extractNextData(page);
       const ad = nextData?.props?.pageProps?.ad;
       if (!ad) {
-        console.error('  Otodom: no ad data in __NEXT_DATA__');
+        console.error(`  Otodom: no ad data in __NEXT_DATA__ at ${listingUrl.slice(0, 120)}`);
         return null;
       }
 

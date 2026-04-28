@@ -136,6 +136,10 @@ export interface NearbyPlace {
   name: string;
   walkingMinutes: number;
   distance: string;
+  transitMinutes?: number;      // for airport, groceries transit fallback
+  drivingMinutes?: number;      // for airport (taxi estimate)
+  frequencyMinutes?: number;    // service frequency at stop (metro/tram/bus)
+  lineName?: string;            // transit line name (e.g. "M1", "T15", "175")
 }
 
 export interface AmenityResult {

@@ -10,8 +10,8 @@ import type { ItemListing } from '../crawlers/olx-items.js';
 function sanitizeChunk(html: string): string {
   return sanitizeHtml(html, {
     allowedTags: ['b', 'strong', 'i', 'em', 'u', 'ins', 's', 'strike', 'del',
-                  'a', 'code', 'pre', 'blockquote', 'tg-emoji'],
-    allowedAttributes: { 'a': ['href'], 'tg-emoji': ['emoji-id'] },
+                  'a', 'code', 'pre', 'blockquote', 'tg-emoji', 'tg-spoiler', 'span'],
+    allowedAttributes: { 'a': ['href'], 'tg-emoji': ['emoji-id'], 'code': ['class'], 'span': ['class'], 'blockquote': ['expandable'] },
     transformTags: { 'strong': 'b', 'em': 'i', 'ins': 'u', 'strike': 's', 'del': 's' },
   });
 }
@@ -47,7 +47,7 @@ function listItems(items: string[] | undefined, prefix = '\u2022 '): string {
 
 /** Split text into chunks that fit Telegram's 4096 char limit.
  *  Each chunk is passed through sanitize-html to repair any broken HTML from the split. */
-export function splitMessage(text: string, limit = 4000): string[] {
+export function splitMessage(text: string, limit = 3500): string[] {
   if (text.length <= limit) return [text];
 
   const chunks: string[] = [];
@@ -224,22 +224,36 @@ export function formatRentalCard(
     }
     // Amenity icons — use custom emoji where available, fallback to Unicode
     const icons: Record<string, string> = {
-      metro: '\uD83D\uDE87', tram: '\uD83D\uDE8B',
+      metro: '\uD83D\uDE87', tram: '\uD83D\uDE8B', bus: '\uD83D\uDE8C',
+      airport: '\u2708\uFE0F', groceries: '\uD83D\uDED2',
       gym: CE.gym, pool: CE.pool, pharmacy: CE.pharmacy,
       supermarket: '\uD83D\uDED2', park: '\uD83C\uDF33',
     };
     for (const a of locationScore.amenities) {
       const icon = icons[a.type] ?? CE.location;
       if (a.places.length > 0) {
-        const p = a.places[0];
         const mark = a.withinLimit ? ` ${CE.yes}` : ` ${CE.warning}`;
-        lines.push(`${icon} ${esc(p.name)} \u2014 ${p.walkingMinutes} min${mark}`);
+        lines.push(`${icon} <b>${esc(a.type)}</b>${mark}`);
+        for (const p of a.places) {
+          const parts: string[] = [esc(p.name)];
+          // Walking time (most amenities)
+          if (p.walkingMinutes >= 0) parts.push(`${p.walkingMinutes} min walk`);
+          // Frequency info (metro/tram/bus)
+          if (p.frequencyMinutes) {
+            parts.push(`${p.lineName ? esc(p.lineName) + ' ' : ''}every ~${p.frequencyMinutes} min`);
+          }
+          // Transit time (airport, groceries fallback)
+          if (p.transitMinutes) parts.push(`${p.transitMinutes} min transit`);
+          // Driving time (airport taxi)
+          if (p.drivingMinutes) parts.push(`${p.drivingMinutes} min taxi`);
+          lines.push(`  \u2022 ${parts.join(' \u2014 ')}`);
+        }
       } else {
-        lines.push(`${icon} ${a.type}: not found nearby`);
+        lines.push(`${icon} ${esc(a.type)}: not found nearby`);
       }
     }
     if (locationScore.commute) {
-      lines.push(`\u2192 ${locationScore.commute.duration} by ${locationScore.commute.mode}`);
+      lines.push(`\u2192 ${esc(locationScore.commute.duration)} by ${esc(locationScore.commute.mode)}`);
     }
     lines.push(locationScore.mapsLink);
   } else if (listing.lat && listing.lng) {
@@ -270,7 +284,7 @@ export function formatRentalCard(
   // Contact
   lines.push('');
   const contactParts: string[] = [];
-  if (listing.phone) contactParts.push(`${CE.phone} ${listing.phone}`);
+  if (listing.phone) contactParts.push(`${CE.phone} ${esc(listing.phone)}`);
   if (listing.contactName) contactParts.push(`${CE.person} ${esc(listing.contactName)}`);
   if (listing.advertiserType) contactParts.push(listing.advertiserType);
   if (listing.agencyName) contactParts.push(esc(listing.agencyName));
@@ -335,10 +349,13 @@ export function formatItemCard(
     lines.push(`\u2699\uFE0F ${paramEntries.slice(0, 5).map(([k, v]) => `${k}: ${esc(v)}`).join(', ')}`);
   }
 
-  // Location + contact
+  // Location + shipping + contact
   lines.push('');
-  if (item.city) lines.push(`${CE.location} ${item.district ? esc(item.district) + ', ' : ''}${esc(item.city)}`);
-  if (item.phone) lines.push(`${CE.phone} ${item.phone}`);
+  const locationParts: string[] = [];
+  if (item.city) locationParts.push(`${CE.location} ${item.district ? esc(item.district) + ', ' : ''}${esc(item.city)}`);
+  locationParts.push(item.shipping ? `\uD83D\uDCE6 Shipping available` : `\uD83D\uDCCD Local pickup only`);
+  lines.push(locationParts.join(' | '));
+  if (item.phone) lines.push(`${CE.phone} ${esc(item.phone)}`);
   if (item.contactName) lines.push(`${CE.person} ${esc(item.contactName)}${item.isBusiness ? ' (business)' : ''}`);
 
   return lines.join('\n');

@@ -1,6 +1,7 @@
 // Tool definitions for the Claude API + dispatcher that executes them
 // Deep pipeline tools: find_rentals, find_items, create_monitor, update_monitor, delete_monitor, list_monitors
 import type { Tool } from '@anthropic-ai/sdk/resources/messages.js';
+import { customAlphabet } from 'nanoid';
 
 import { searchOlx, fetchOlxPhone, OLX_CATEGORIES, OLX_CITIES, OLX_DISTRICTS } from '../crawlers/olx.js';
 import { searchItems, fetchItemPhone } from '../crawlers/olx-items.js';
@@ -21,12 +22,22 @@ import {
 import type { Listing, ParsedRentalData, LocationScore } from '../types.js';
 
 // ---------------------------------------------------------------------------
+// Short human-readable ID generator (nanoid, unambiguous alphabet)
+// ---------------------------------------------------------------------------
+
+// Unambiguous alphabet: removed 0/O, 1/I/L, U/V confusion
+const genId = customAlphabet('23456789ABCDEFGHJKMNPQRSTVWXYZ', 6);
+
+// ---------------------------------------------------------------------------
 // User context -- tracks state across the conversation for a single user
 // ---------------------------------------------------------------------------
 
 export interface UserContext {
   lastSearchResults: Array<Listing | ItemListing>;
   lastDetailListing: Listing | null;
+  lastSearchId: string | null;
+  /** Maps result ID → listing for reference by Claude */
+  resultMap: Map<string, Listing | ItemListing>;
   userId: number;
   chatId: number;
 }
@@ -36,7 +47,7 @@ const contexts = new Map<number, UserContext>();
 export function getOrCreateContext(userId: number, chatId: number): UserContext {
   let ctx = contexts.get(userId);
   if (!ctx) {
-    ctx = { lastSearchResults: [], lastDetailListing: null, userId, chatId };
+    ctx = { lastSearchResults: [], lastDetailListing: null, lastSearchId: null, resultMap: new Map(), userId, chatId };
     contexts.set(userId, ctx);
   }
   // Always keep chatId up to date (user may message from different chats)
@@ -132,7 +143,7 @@ export const TOOL_DEFINITIONS: Tool[] = [
           items: {
             type: 'object',
             properties: {
-              type: { type: 'string', enum: ['metro', 'gym', 'pool', 'supermarket', 'park', 'pharmacy'], description: 'Amenity type' },
+              type: { type: 'string', enum: ['metro', 'tram', 'bus', 'gym', 'pool', 'supermarket', 'groceries', 'park', 'pharmacy', 'airport'], description: 'Amenity type' },
               maxMinutes: { type: 'number', description: 'Maximum walking minutes to this amenity' },
             },
             required: ['type', 'maxMinutes'],
@@ -224,7 +235,7 @@ export const TOOL_DEFINITIONS: Tool[] = [
           items: {
             type: 'object',
             properties: {
-              type: { type: 'string' },
+              type: { type: 'string', enum: ['metro', 'tram', 'bus', 'gym', 'pool', 'supermarket', 'groceries', 'park', 'pharmacy', 'airport'] },
               maxMinutes: { type: 'number' },
             },
             required: ['type', 'maxMinutes'],
@@ -240,6 +251,11 @@ export const TOOL_DEFINITIONS: Tool[] = [
         },
         // Item search params
         query: { type: 'string', description: 'Search keywords (for item monitors)' },
+        mandatoryKeywords: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Keywords that MUST appear in listing title (for item monitors). Same as find_items.',
+        },
       },
       required: ['type'],
     },
@@ -323,6 +339,8 @@ async function execFindRentals(
   const contractPreference = input.contractPreference as string | undefined;
   const rejectionCriteria = input.rejectionCriteria as string | undefined;
 
+  console.log(`[find_rentals] Params: city=${city}, districts=${districts.join(',')}, rooms=${roomsFrom}-${roomsTo}, priceTo=${priceTo}, rejection=${rejectionCriteria ?? 'none'}`);
+
   const doOlx = platformsInput === 'olx' || platformsInput === 'all';
   const doOtodom = platformsInput === 'otodom' || platformsInput === 'all';
 
@@ -357,17 +375,19 @@ async function execFindRentals(
           limit: 40,
         });
         const results = [...page1.listings];
-        // Fetch page 2 if available
+        // Fetch page 2 if available — wrapped so page 1 results survive if page 2 fails
         if (page1.hasNextPage) {
-          const page2 = await searchOlx({
-            categoryId: OLX_CATEGORIES.MIESZKANIA_WYNAJEM,
-            cityId,
-            rooms: roomsFrom,
-            districtId: olxDistrictId,
-            limit: 40,
-            offset: 40,
-          });
-          results.push(...page2.listings);
+          try {
+            const page2 = await searchOlx({
+              categoryId: OLX_CATEGORIES.MIESZKANIA_WYNAJEM,
+              cityId,
+              rooms: roomsFrom,
+              districtId: olxDistrictId,
+              limit: 40,
+              offset: 40,
+            });
+            results.push(...page2.listings);
+          } catch (e) { console.error('[find_rentals] OLX page 2 failed:', e instanceof Error ? e.message : e); }
         }
         return results;
       })(),
@@ -409,7 +429,6 @@ async function execFindRentals(
   }
 
   console.log(`[find_rentals] Search results: ${allListings.length} total (OLX: ${doOlx}, Otodom: ${doOtodom})`);
-  console.log(`[find_rentals] Params: city=${city}, districts=${districts.join(',')}, rooms=${roomsFrom}-${roomsTo}, priceTo=${priceTo}`);
 
   // ---- Filter by rooms/area (for OLX which doesn't filter well) ----
   let filtered = allListings;
@@ -465,29 +484,74 @@ async function execFindRentals(
   // ---- Step B: Send progress message ----
   const debugLimit = process.env.DEBUG_LIMIT ? parseInt(process.env.DEBUG_LIMIT, 10) : 0;
   const candidateCount = debugLimit > 0 ? Math.min(deduped.length, debugLimit) : Math.min(deduped.length, 25);
-  try { await sendFn(ctx.chatId, `Found ${deduped.length} listings. Analyzing top ${candidateCount}...`, { parse_mode: undefined }); } catch (e) { console.error('[tools] send failed:', e instanceof Error ? e.message : e); }
+  const searchId = genId();
+  ctx.lastSearchId = searchId;
+  // Don't clear resultMap — old IDs stay resolvable across searches
+  try { await sendFn(ctx.chatId, `Found ${deduped.length} listings. Analyzing top ${candidateCount}\u2026 Results will appear as they\u2019re ready. [search <b>${searchId}</b>]`, { parse_mode: 'HTML' }); } catch (e) { console.error('[tools] send failed:', e instanceof Error ? e.message : e); }
 
-  // ---- Step C: Analyze top candidates ----
+  // ---- Step C: Analyze candidates and STREAM results to user ----
   const candidates = deduped.slice(0, candidateCount);
-  const accepted: Array<{
-    listing: Listing;
-    parsedData: ParsedRentalData | null;
-    locationScore: LocationScore | null;
-  }> = [];
+  const accepted: Listing[] = [];
+  const acceptedIds: string[] = [];
   const rejected: RejectionReason[] = [];
+  const CAPTION_LIMIT = 1024;
 
-  // Store all candidates in context for later reference
+  // Helper: send a rejection one-liner immediately
+  const sendRejection = async (url: string, title: string, reason: string) => {
+    try {
+      await sendFn(ctx.chatId, `\u274C <a href="${url}">${escHtml(title.slice(0, 60))}</a> \u2014 ${escHtml(reason)}`, { parse_mode: 'HTML' });
+    } catch (e) { console.error('[tools] rejection send failed:', e instanceof Error ? e.message : e); }
+  };
+
+  // Helper: send a card with photos immediately, prepend result ID
+  const idPrefix = (id: string) => `<b>[${id}]</b>\n`;
+  const sendCard = async (resultId: string, listing: Listing, parsedData: ParsedRentalData | null, locationScore: LocationScore | null) => {
+    const rawCard = formatRichRentalNotification(
+      listing,
+      parsedData ?? undefined,
+      locationScore ?? undefined,
+    );
+    const card = idPrefix(resultId) + rawCard;
+
+    // Check caption fit against rawCard (without ID prefix) to avoid regression
+    if (rawCard.length <= CAPTION_LIMIT && listing.photos.length > 0) {
+      // Caption: use short ID prefix [ABCDEF] (fits within Telegram's limit)
+      const caption = `[${resultId}] ${rawCard}`;
+      if (caption.length <= CAPTION_LIMIT) {
+        try {
+          await sendPhotosFn(ctx.chatId, listing.photos.slice(0, 10), caption);
+          return;
+        } catch (e) {
+          console.error('[tools] photo+caption failed:', e instanceof Error ? e.message : e);
+        }
+      }
+    }
+
+    // Text + separate photos fallback
+    const cardChunks = splitMessage(card);
+    for (const chunk of cardChunks) {
+      try {
+        await sendFn(ctx.chatId, chunk, { parse_mode: 'HTML' });
+      } catch (cardErr) {
+        try { await sendFn(ctx.chatId, `[${resultId}] ${listing.title}\n${listing.url}\nPrice: ${listing.price} PLN`, { parse_mode: undefined }); } catch (e) { console.error('[tools] send failed:', e instanceof Error ? e.message : e); }
+        break;
+      }
+    }
+    if (listing.photos.length > 0) {
+      try {
+        await sendPhotosFn(ctx.chatId, listing.photos.slice(0, 10));
+      } catch (photoErr) {
+        console.error(`[find_rentals] Photo send error for ${listing.url}:`, photoErr);
+      }
+    }
+  };
+
   ctx.lastSearchResults = candidates;
 
   let actualAnalyzed = 0;
   for (let i = 0; i < candidates.length; i++) {
     const listing = candidates[i];
     actualAnalyzed++;
-
-    // Send progress update every 3-4 listings
-    if (i > 0 && i % 3 === 0) {
-      try { await sendFn(ctx.chatId, `Analyzing listing ${i + 1}/${candidateCount}...`, { parse_mode: undefined }); } catch (e) { console.error('[tools] send failed:', e instanceof Error ? e.message : e); }
-    }
 
     // Stop if we have enough accepted results
     if (accepted.length >= maxResults) break;
@@ -507,7 +571,7 @@ async function execFindRentals(
         try {
           const phone = await fetchOlxPhone(listing.platformId);
           if (phone) enrichedListing = { ...listing, phone };
-        } catch { /* phone is optional */ }
+        } catch (e) { console.warn(`[find_rentals] Phone fetch failed for ${listing.platformId}:`, e instanceof Error ? e.message : e); }
       }
 
       // AI extraction — best effort, don't block on failure
@@ -515,11 +579,10 @@ async function execFindRentals(
       if (enrichedListing.description) {
         try {
           console.log(`[find_rentals] AI parsing...`);
-          parsedData = await parseRentalListing(enrichedListing);
+          parsedData = await parseRentalListing(enrichedListing, { userId: ctx.userId });
           console.log(`[find_rentals] AI parsed: total=${parsedData?.totalMonthlyCost}, contract=${parsedData?.contractType}, kaucja=${parsedData?.deposit}`);
         } catch (parseErr) {
           console.error(`[find_rentals] AI parse FAILED for "${enrichedListing.title}":`, parseErr instanceof Error ? parseErr.message : parseErr);
-          // Continue without parsed data — budget filter will use fallback
         }
       }
 
@@ -528,11 +591,9 @@ async function execFindRentals(
         ?? (enrichedListing.price + (enrichedListing.rent ?? 0));
 
       if (priceTo != null && estimatedTotal > priceTo) {
-        rejected.push({
-          url: enrichedListing.url,
-          title: enrichedListing.title,
-          reason: `estimated total ${estimatedTotal} PLN exceeds budget ${priceTo} PLN`,
-        });
+        const reason = `estimated total ${estimatedTotal} PLN exceeds budget ${priceTo} PLN`;
+        rejected.push({ url: enrichedListing.url, title: enrichedListing.title, reason });
+        await sendRejection(enrichedListing.url, enrichedListing.title, reason);
         continue;
       }
 
@@ -542,29 +603,24 @@ async function execFindRentals(
         parsedData?.contractType != null &&
         parsedData.contractType !== 'najem_okazjonalny'
       ) {
-        rejected.push({
-          url: enrichedListing.url,
-          title: enrichedListing.title,
-          reason: `contract type "${parsedData.contractType}" does not match preference "najem_okazjonalny"`,
-        });
+        const reason = `contract type "${parsedData.contractType}" does not match preference "najem_okazjonalny"`;
+        rejected.push({ url: enrichedListing.url, title: enrichedListing.title, reason });
+        await sendRejection(enrichedListing.url, enrichedListing.title, reason);
         continue;
       }
 
       // AI rejection criteria filter (two-tier: separate tiny call, cached per criteria)
       if (rejectionCriteria && parsedData) {
         try {
-          const rejectionResult = await evaluateRejection(enrichedListing, parsedData, rejectionCriteria);
+          const rejectionResult = await evaluateRejection(enrichedListing, parsedData, rejectionCriteria, { userId: ctx.userId });
           if (rejectionResult.rejected) {
-            rejected.push({
-              url: enrichedListing.url,
-              title: enrichedListing.title,
-              reason: rejectionResult.rejectionReason ?? 'Rejected by AI criteria',
-            });
+            const reason = rejectionResult.rejectionReason ?? 'Rejected by AI criteria';
+            rejected.push({ url: enrichedListing.url, title: enrichedListing.title, reason });
+            await sendRejection(enrichedListing.url, enrichedListing.title, reason);
             continue;
           }
         } catch (rejErr) {
           console.error(`[find_rentals] Rejection eval failed for "${enrichedListing.title}":`, rejErr instanceof Error ? rejErr.message : rejErr);
-          // Don't reject on evaluation failure — let it through
         }
       }
 
@@ -575,14 +631,13 @@ async function execFindRentals(
       const wantLocation = amenities.length > 0 || workAddress;
 
       if (!lat || !lng) {
-        // Try to geocode from address info
         try {
           const { geocodeAddress, buildAddressFromListing } = await import('./maps.js');
           const addr = buildAddressFromListing(enrichedListing);
           console.log(`[find_rentals] No coords, geocoding: "${addr}"`);
           const geo = await geocodeAddress(addr);
           if (geo) { lat = geo.lat; lng = geo.lng; }
-        } catch { /* geocoding is best-effort */ }
+        } catch (e) { console.warn(`[find_rentals] Geocoding failed:`, e instanceof Error ? e.message : e); }
       }
 
       if (lat && lng && wantLocation) {
@@ -591,39 +646,27 @@ async function execFindRentals(
             type: a.type,
             maxMinutes: a.maxMinutes,
           }));
-
-          locationScore = await scoreLocation(
-            lat,
-            lng,
-            amenityPrefs,
-            workAddress,
-            commuteMode,
-          );
-
-          // Amenity check is SOFT — don't reject, just note in the score
-          // The card will show ✓/⚠️ per amenity, AI summarizes at the end
+          locationScore = await scoreLocation(lat, lng, amenityPrefs, workAddress, commuteMode);
         } catch (locErr) {
           console.error(`[find_rentals] Location scoring error for ${enrichedListing.url}:`, locErr);
-          // Don't reject, just skip location data
         }
       }
 
-      accepted.push({
-        listing: enrichedListing,
-        parsedData,
-        locationScore,
-      });
+      // ---- STREAM: send card to user immediately ----
+      const resultId = genId();
+      await sendCard(resultId, enrichedListing, parsedData, locationScore);
+      accepted.push(enrichedListing);
+      acceptedIds.push(resultId);
+      ctx.resultMap.set(resultId, enrichedListing);
     } catch (err) {
       console.error(`[find_rentals] Error processing ${listing.url}:`, err);
-      rejected.push({
-        url: listing.url,
-        title: listing.title,
-        reason: `processing error: ${err instanceof Error ? err.message : String(err)}`,
-      });
+      const reason = `processing error: ${err instanceof Error ? err.message : String(err)}`;
+      rejected.push({ url: listing.url, title: listing.title, reason });
+      await sendRejection(listing.url, listing.title, reason);
     }
   }
 
-  // ---- Step D: Send results to user ----
+  // ---- Step D: Summary ----
   if (accepted.length === 0) {
     const rejectionSummary = rejected.length > 0
       ? `\nRejection reasons:\n${rejected.map((r) => `- ${r.title}: ${r.reason}`).join('\n')}`
@@ -631,71 +674,22 @@ async function execFindRentals(
     return `Analyzed ${candidateCount} listings but none passed the filters.${rejectionSummary}\nTry increasing the budget, relaxing amenity requirements, or broadening the search area.`;
   }
 
-  const CAPTION_LIMIT = 1024;
-  for (let i = 0; i < accepted.length; i++) {
-    const { listing, parsedData, locationScore } = accepted[i];
+  // Send a brief "done" summary
+  try { await sendFn(ctx.chatId, `Done [${searchId}]: showed ${accepted.length}, rejected ${rejected.length}.`, { parse_mode: undefined }); } catch (e) { console.error('[tools] send failed:', e instanceof Error ? e.message : e); }
 
-    const card = formatRichRentalNotification(
-      listing,
-      parsedData ?? undefined,
-      locationScore ?? undefined,
-    );
-
-    // Send card — split into multiple messages if needed
-    const cardChunks = splitMessage(card);
-
-    // If single chunk fits caption limit, send with photos
-    if (cardChunks.length === 1 && card.length <= CAPTION_LIMIT && listing.photos.length > 0) {
-      try {
-        await sendPhotosFn(ctx.chatId, listing.photos.slice(0, 10), card);
-      } catch (e) {
-        console.error('[tools] photo+caption failed:', e instanceof Error ? e.message : e);
-        // Fallback: send separately
-        try { await sendFn(ctx.chatId, card, { parse_mode: 'HTML' }); } catch (e2) { console.error('[tools] send failed:', e2 instanceof Error ? e2.message : e2); }
-      }
-    } else {
-      // Send all chunks — pass parse_mode: 'HTML' to bypass mdToHtml (cards are already HTML)
-      for (const chunk of cardChunks) {
-        try {
-          await sendFn(ctx.chatId, chunk, { parse_mode: 'HTML' });
-        } catch (cardErr) {
-          try { await sendFn(ctx.chatId, `${listing.title}\n${listing.url}\nPrice: ${listing.price} PLN`, { parse_mode: undefined }); } catch (e) { console.error('[tools] send failed:', e instanceof Error ? e.message : e); }
-          break;
-        }
-      }
-      if (listing.photos.length > 0) {
-        try {
-          await sendPhotosFn(ctx.chatId, listing.photos.slice(0, 10));
-        } catch (photoErr) {
-          console.error(`[find_rentals] Photo send error for ${listing.url}:`, photoErr);
-        }
-      }
-    }
-  }
-
-  // Send rejected listings as brief one-line messages (no photos, no AI analysis)
-  if (rejected.length > 0) {
-    const rejectionLines = rejected.slice(0, 10).map(r =>
-      `\u274C <a href="${r.url}">${escHtml(r.title.slice(0, 60))}</a> \u2014 ${escHtml(r.reason)}`
-    );
-    const rejectionText = `<b>Didn't match:</b>\n${rejectionLines.join('\n')}`;
-    try { await sendFn(ctx.chatId, rejectionText); } catch (e) {
-      console.error('[tools] rejection send failed:', e instanceof Error ? e.message : e);
-    }
-  }
-
-  // Update context with the accepted listings for later reference
-  ctx.lastSearchResults = accepted.map((a) => a.listing);
+  // Update context
+  ctx.lastSearchResults = accepted;
   if (accepted.length > 0) {
-    ctx.lastDetailListing = accepted[0].listing;
+    ctx.lastDetailListing = accepted[0];
   }
 
-  // ---- Step E: Return summary to Claude ----
+  // Return summary to Claude — include IDs so it can reference specific results
   const rejectionBreakdown = rejected.length > 0
     ? `\nRejected ${rejected.length}: ${rejected.map((r) => r.reason).join('; ')}`
     : '';
+  const idList = acceptedIds.map((id, i) => `${id}: "${accepted[i]?.title?.slice(0, 50) ?? '?'}"`).join(', ');
 
-  return `Showed ${accepted.length} listing(s) to the user with photos and detailed evaluation cards. Analyzed ${actualAnalyzed} of ${deduped.length} candidates. ${rejectionBreakdown}\n\nIMPORTANT: The user has ALREADY seen full details, photos, prices, and cards. Do NOT repeat listing details. Just offer next steps (monitor, adjust search, etc.).`;
+  return `Search ${searchId}: showed ${accepted.length} listing(s). Result IDs: ${idList}. Analyzed ${actualAnalyzed} of ${deduped.length} candidates.${rejectionBreakdown}\n\nIMPORTANT: The user has ALREADY seen full details. When they reference a result by ID (e.g. "${acceptedIds[0] ?? 'ABC123'}"), use that ID. Do NOT repeat listing details. Just offer next steps.`;
 }
 
 // ---------------------------------------------------------------------------
@@ -715,6 +709,8 @@ async function execFindItems(
   const priceTo = input.priceTo as number | undefined;
   const maxResults = Math.min(Math.max((input.maxResults as number) || 5, 1), 10);
   const rejectionCriteria = input.rejectionCriteria as string | undefined;
+
+  console.log(`[find_items] Params: query=${query}, city=${city ?? 'any'}, mandatory=${(input.mandatoryKeywords as string[] ?? []).join(',')}, rejection=${rejectionCriteria ?? 'none'}`);
 
   const result = await searchItems({
     query,
@@ -746,9 +742,13 @@ async function execFindItems(
   ctx.lastSearchResults = candidates;
 
   const displayTotal = mandatoryKeywords.length > 0 ? filteredItems.length : result.totalAvailable;
-  try { await sendFn(ctx.chatId, `Found ${displayTotal} items${mandatoryKeywords.length > 0 ? ` (filtered from ${result.totalAvailable})` : ''}. Analyzing top ${Math.min(candidates.length, maxResults)}...`, { parse_mode: undefined }); } catch (e) { console.error('[tools] send failed:', e instanceof Error ? e.message : e); }
+  const searchId = genId();
+  ctx.lastSearchId = searchId;
+  // Don't clear resultMap — old IDs stay resolvable across searches
+  try { await sendFn(ctx.chatId, `Found ${displayTotal} items${mandatoryKeywords.length > 0 ? ` (filtered from ${result.totalAvailable})` : ''}. Results will appear as they\u2019re ready. [search <b>${searchId}</b>]`, { parse_mode: 'HTML' }); } catch (e) { console.error('[tools] send failed:', e instanceof Error ? e.message : e); }
 
   const shown: ItemListing[] = [];
+  const shownIds: string[] = [];
   const itemRejected: RejectionReason[] = [];
 
   for (let i = 0; i < candidates.length && shown.length < maxResults; i++) {
@@ -758,93 +758,94 @@ async function execFindItems(
     let parsedData = null;
     if (item.description) {
       try {
-        parsedData = await parseItemListing(item);
+        parsedData = await parseItemListing(item, { userId: ctx.userId });
       } catch (parseErr) {
         console.error(`[find_items] AI parse FAILED for "${item.title}":`, parseErr instanceof Error ? parseErr.message : parseErr);
-        // Continue without parsed data
       }
     }
 
-    // AI rejection criteria filter (two-tier: separate tiny call, cached per criteria)
+    // AI rejection criteria filter — send rejection inline
     if (rejectionCriteria && parsedData) {
       try {
-        const rejectionResult = await evaluateRejection(item, parsedData, rejectionCriteria);
+        const rejectionResult = await evaluateRejection(item, parsedData, rejectionCriteria, { userId: ctx.userId });
         if (rejectionResult.rejected) {
-          itemRejected.push({
-            url: item.url,
-            title: item.title,
-            reason: rejectionResult.rejectionReason ?? 'Rejected by AI criteria',
-          });
+          const reason = rejectionResult.rejectionReason ?? 'Rejected by AI criteria';
+          itemRejected.push({ url: item.url, title: item.title, reason });
+          try {
+            await sendFn(ctx.chatId, `\u274C <a href="${item.url}">${escHtml(item.title.slice(0, 60))}</a> \u2014 ${escHtml(reason)}`, { parse_mode: 'HTML' });
+          } catch (e) { console.error('[tools] rejection send failed:', e instanceof Error ? e.message : e); }
           continue;
         }
       } catch (rejErr) {
         console.error(`[find_items] Rejection eval failed for "${item.title}":`, rejErr instanceof Error ? rejErr.message : rejErr);
-        // Don't reject on evaluation failure — let it through
       }
     }
 
-    // Fetch phone if not available — don't mutate original item
+    // Fetch phone if not available
     let enrichedItem = item;
     if (!item.phone) {
       try {
         const phone = await fetchItemPhone(item.platformId);
         if (phone) enrichedItem = { ...item, phone };
-      } catch {
-        // ignore phone fetch errors
+      } catch (e) { console.warn(`[find_items] Phone fetch failed for ${item.platformId}:`, e instanceof Error ? e.message : e); }
+    }
+
+    // Send card immediately with result ID
+    const resultId = genId();
+    const rawCard = formatRichItemNotification(enrichedItem, parsedData ?? undefined);
+    const card = `<b>[${resultId}]</b>\n${rawCard}`;
+    const ITEM_CAPTION_LIMIT = 1024;
+
+    // Try caption with short ID prefix first
+    if (enrichedItem.photos.length > 0) {
+      const caption = `[${resultId}] ${rawCard}`;
+      if (caption.length <= ITEM_CAPTION_LIMIT) {
+        try {
+          await sendPhotosFn(ctx.chatId, enrichedItem.photos.slice(0, 10), caption);
+          shown.push(enrichedItem);
+          shownIds.push(resultId);
+          ctx.resultMap.set(resultId, enrichedItem);
+          continue;
+        } catch (e) {
+          console.error('[tools] photo+caption failed:', e instanceof Error ? e.message : e);
+        }
       }
     }
 
-    const card = formatRichItemNotification(enrichedItem, parsedData ?? undefined);
-    const ITEM_CAPTION_LIMIT = 1024;
+    // Text + separate photos fallback
     const itemChunks = splitMessage(card);
-
-    // If single chunk fits caption limit, send with photos
-    if (itemChunks.length === 1 && card.length <= ITEM_CAPTION_LIMIT && enrichedItem.photos.length > 0) {
+    for (const chunk of itemChunks) {
       try {
-        await sendPhotosFn(ctx.chatId, enrichedItem.photos.slice(0, 10), card);
-      } catch (e) {
-        console.error('[tools] photo+caption failed:', e instanceof Error ? e.message : e);
-        try { await sendFn(ctx.chatId, card, { parse_mode: 'HTML' }); } catch (e2) { console.error('[tools] send failed:', e2 instanceof Error ? e2.message : e2); }
+        await sendFn(ctx.chatId, chunk, { parse_mode: 'HTML' });
+      } catch (cardErr) {
+        try { await sendFn(ctx.chatId, `[${resultId}] ${enrichedItem.title}\n${enrichedItem.url}\nPrice: ${enrichedItem.price} PLN`, { parse_mode: undefined }); } catch (e) { console.error('[tools] send failed:', e instanceof Error ? e.message : e); }
+        break;
       }
-    } else {
-      for (const chunk of itemChunks) {
-        try {
-          await sendFn(ctx.chatId, chunk, { parse_mode: 'HTML' });
-        } catch (cardErr) {
-          try { await sendFn(ctx.chatId, `${enrichedItem.title}\n${enrichedItem.url}\nPrice: ${enrichedItem.price} PLN`, { parse_mode: undefined }); } catch (e) { console.error('[tools] send failed:', e instanceof Error ? e.message : e); }
-          break;
-        }
-      }
-      if (enrichedItem.photos.length > 0) {
-        try {
-          await sendPhotosFn(ctx.chatId, enrichedItem.photos.slice(0, 10));
-        } catch (photoErr) {
-          console.error(`[find_items] Photo send error for ${enrichedItem.url}:`, photoErr);
-        }
+    }
+    if (enrichedItem.photos.length > 0) {
+      try {
+        await sendPhotosFn(ctx.chatId, enrichedItem.photos.slice(0, 10));
+      } catch (photoErr) {
+        console.error(`[find_items] Photo send error for ${enrichedItem.url}:`, photoErr);
       }
     }
 
     shown.push(enrichedItem);
+    shownIds.push(resultId);
+    ctx.resultMap.set(resultId, enrichedItem);
   }
 
-  // Send rejected items as brief one-line messages
-  if (itemRejected.length > 0) {
-    const rejectionLines = itemRejected.slice(0, 10).map(r =>
-      `\u274C <a href="${r.url}">${escHtml(r.title.slice(0, 60))}</a> \u2014 ${escHtml(r.reason)}`
-    );
-    const rejectionText = `<b>Didn't match:</b>\n${rejectionLines.join('\n')}`;
-    try { await sendFn(ctx.chatId, rejectionText); } catch (e) {
-      console.error('[tools] item rejection send failed:', e instanceof Error ? e.message : e);
-    }
-  }
+  // Done summary
+  try { await sendFn(ctx.chatId, `Done [${searchId}]: showed ${shown.length}, rejected ${itemRejected.length}.`, { parse_mode: undefined }); } catch (e) { console.error('[tools] send failed:', e instanceof Error ? e.message : e); }
 
   ctx.lastSearchResults = shown;
 
   const itemRejectionBreakdown = itemRejected.length > 0
     ? `\nRejected ${itemRejected.length}: ${itemRejected.map((r) => r.reason).join('; ')}`
     : '';
+  const idList = shownIds.map((id, i) => `${id}: "${shown[i]?.title?.slice(0, 50) ?? '?'}"`).join(', ');
 
-  return `Showed ${shown.length} item(s) to the user with photos and detailed condition analysis cards. Total available: ${displayTotal}${mandatoryKeywords.length > 0 ? ` (filtered from ${result.totalAvailable} by mandatory keywords)` : ''}.${itemRejectionBreakdown}\n\nIMPORTANT: The user has ALREADY seen full details, photos, prices, and cards. Do NOT repeat listing details. Just offer next steps.`;
+  return `Search ${searchId}: showed ${shown.length} item(s). Result IDs: ${idList}. Total available: ${displayTotal}${mandatoryKeywords.length > 0 ? ` (filtered from ${result.totalAvailable} by mandatory keywords)` : ''}.${itemRejectionBreakdown}\n\nIMPORTANT: The user has ALREADY seen full details. When they reference a result by ID (e.g. "${shownIds[0] ?? 'ABC123'}"), use that ID. Do NOT repeat listing details. Just offer next steps.`;
 }
 
 // ---------------------------------------------------------------------------
@@ -864,7 +865,7 @@ async function execCreateMonitor(
   const configKeys = [
     'city', 'districts', 'province', 'priceFrom', 'priceTo',
     'roomsFrom', 'roomsTo', 'areaFrom', 'areaTo', 'ownerType',
-    'query', 'workAddress', 'commuteMode', 'amenities',
+    'query', 'mandatoryKeywords', 'workAddress', 'commuteMode', 'amenities',
     'contractPreference', 'platforms', 'rejectionCriteria',
   ];
   for (const key of configKeys) {
@@ -982,6 +983,8 @@ async function execListMonitors(
     }
     if (config.workAddress) parts.push(`  Commute to: ${config.workAddress}`);
     if (config.contractPreference) parts.push(`  Contract: ${config.contractPreference}`);
+    if (config.rejectionCriteria) parts.push(`  Rejection criteria: "${config.rejectionCriteria}"`);
+    if (config.mandatoryKeywords) parts.push(`  Mandatory keywords: ${(config.mandatoryKeywords as string[]).join(', ')}`);
     parts.push(`  Listings seen: ${seenCount}`);
     parts.push(`  Created: ${m.created_at}`);
 
