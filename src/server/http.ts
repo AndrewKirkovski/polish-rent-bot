@@ -17,6 +17,11 @@ import {
   getMonitorsWithStats,
   getMonitorRuns,
   getMonitorListings,
+  listParsedListings,
+  getParsedListingDetail,
+  listRejectionCache,
+  listMapsCache,
+  getMapsCacheDetail,
   type UsageRange,
 } from '../storage/db.js';
 
@@ -99,6 +104,43 @@ export function startHttpServer(): HttpServerHandle | null {
   });
 
   app.get('/api/cache', (c) => c.json(getCacheStats()));
+
+  app.get('/api/cache/parsed-listings', (c) => {
+    const limit = parseLimit(c.req.query('limit'), 50, 500);
+    const offset = parseLimit(c.req.query('offset'), 0, 100_000);
+    const platform = c.req.query('platform') || undefined;
+    const parseType = c.req.query('type') || undefined;
+    return c.json(listParsedListings({ limit, offset, platform, parseType }));
+  });
+
+  app.get('/api/cache/parsed-listings/:platform/:platformId', (c) => {
+    const platform = c.req.param('platform');
+    const platformId = c.req.param('platformId');
+    const detail = getParsedListingDetail(platform, platformId);
+    if (!detail) return c.json({ error: 'not found' }, 404);
+    return c.json(detail);
+  });
+
+  app.get('/api/cache/rejection', (c) => {
+    const limit = parseLimit(c.req.query('limit'), 50, 500);
+    const offset = parseLimit(c.req.query('offset'), 0, 100_000);
+    const rejectedOnly = c.req.query('rejectedOnly') === '1';
+    return c.json(listRejectionCache({ limit, offset, rejectedOnly }));
+  });
+
+  app.get('/api/cache/maps', (c) => {
+    const limit = parseLimit(c.req.query('limit'), 50, 500);
+    const offset = parseLimit(c.req.query('offset'), 0, 100_000);
+    const prefix = c.req.query('prefix') || undefined;
+    return c.json(listMapsCache({ limit, offset, prefix }));
+  });
+
+  app.get('/api/cache/maps/:cacheKey', (c) => {
+    const cacheKey = decodeURIComponent(c.req.param('cacheKey'));
+    const detail = getMapsCacheDetail(cacheKey);
+    if (!detail) return c.json({ error: 'not found' }, 404);
+    return c.json(detail);
+  });
 
   app.get('/api/monitors', (c) => c.json(getMonitorsWithStats()));
 

@@ -18,8 +18,12 @@ import {
   deactivateMonitor,
   getSeenCount,
   updateMonitorConfig,
+  cacheListing,
+  getCachedListingByResultId,
+  getCachedListingByPlatform,
+  getParsedListing,
 } from '../storage/db.js';
-import type { Listing, ParsedRentalData, LocationScore } from '../types.js';
+import type { Listing, ParsedRentalData, ParsedItemData, LocationScore } from '../types.js';
 
 // ---------------------------------------------------------------------------
 // Short human-readable ID generator (nanoid, unambiguous alphabet)
@@ -300,13 +304,157 @@ export const TOOL_DEFINITIONS: Tool[] = [
       properties: {},
     },
   },
+
+  // ---- 7. get_listing ----
+  {
+    name: 'get_listing',
+    description:
+      'Fetch the full details of a previously-seen listing (accepted OR rejected). ' +
+      'Use this when the user asks a question about a specific listing without asking to see it again — ' +
+      'e.g. "how many rooms did the Wola one have?", "what was the contract type on R1?". ' +
+      'Returns the full Listing JSON + AI parse so YOU can answer the question. Does NOT send anything to the user.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        resultId: { type: 'string', description: 'Result ID shown to the user (e.g. "ABC123") in cards or rejection messages' },
+      },
+      required: ['resultId'],
+    },
+  },
+
+  // ---- 8. show_listing ----
+  {
+    name: 'show_listing',
+    description:
+      'Re-send the full rich card with photos for a previously-seen listing (accepted OR rejected) directly to the user. ' +
+      'Use this when the user asks to SEE the listing — e.g. "show me R1", "show the Wola one", "can I see the rejected one again". ' +
+      'The card and photos go straight to the user; do NOT also describe the listing in your reply — just confirm briefly.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        resultId: { type: 'string', description: 'Result ID shown to the user (e.g. "ABC123") in cards or rejection messages' },
+      },
+      required: ['resultId'],
+    },
+  },
 ];
+
+// ---------------------------------------------------------------------------
+// Send helpers — module-level so execShowListing can re-use them
+// ---------------------------------------------------------------------------
+
+const CAPTION_LIMIT = 1024;
+
+async function sendRejection(
+  chatId: number,
+  sendFn: SendFn,
+  resultId: string,
+  url: string,
+  title: string,
+  reason: string,
+): Promise<void> {
+  try {
+    await sendFn(
+      chatId,
+      `❌ [<b>${resultId}</b>] <a href="${url}">${escHtml(title.slice(0, 60))}</a> — ${escHtml(reason)}`,
+      { parse_mode: 'HTML' },
+    );
+  } catch (e) { console.error('[tools] rejection send failed:', e instanceof Error ? e.message : e); }
+}
+
+async function sendRentalCard(
+  chatId: number,
+  sendFn: SendFn,
+  sendPhotosFn: SendPhotosFn,
+  resultId: string,
+  listing: Listing,
+  parsedData: ParsedRentalData | null,
+  locationScore: LocationScore | null,
+): Promise<void> {
+  const rawCard = formatRichRentalNotification(
+    listing,
+    parsedData ?? undefined,
+    locationScore ?? undefined,
+  );
+  const card = `<b>[${resultId}]</b>\n${rawCard}`;
+
+  if (rawCard.length <= CAPTION_LIMIT && listing.photos.length > 0) {
+    const caption = `[${resultId}] ${rawCard}`;
+    if (caption.length <= CAPTION_LIMIT) {
+      try {
+        await sendPhotosFn(chatId, listing.photos.slice(0, 10), caption);
+        return;
+      } catch (e) {
+        console.error('[tools] photo+caption failed:', e instanceof Error ? e.message : e);
+      }
+    }
+  }
+
+  const cardChunks = splitMessage(card);
+  for (const chunk of cardChunks) {
+    try {
+      await sendFn(chatId, chunk, { parse_mode: 'HTML' });
+    } catch (cardErr) {
+      try { await sendFn(chatId, `[${resultId}] ${listing.title}\n${listing.url}\nPrice: ${listing.price} PLN`, { parse_mode: undefined }); } catch (e) { console.error('[tools] send failed:', e instanceof Error ? e.message : e); }
+      break;
+    }
+  }
+  if (listing.photos.length > 0) {
+    try {
+      await sendPhotosFn(chatId, listing.photos.slice(0, 10));
+    } catch (photoErr) {
+      console.error(`[sendRentalCard] Photo send error for ${listing.url}:`, photoErr);
+    }
+  }
+}
+
+async function sendItemCard(
+  chatId: number,
+  sendFn: SendFn,
+  sendPhotosFn: SendPhotosFn,
+  resultId: string,
+  item: ItemListing,
+  parsedData: ParsedItemData | null,
+): Promise<void> {
+  const rawCard = formatRichItemNotification(item, parsedData ?? undefined);
+  const card = `<b>[${resultId}]</b>\n${rawCard}`;
+
+  if (item.photos.length > 0) {
+    const caption = `[${resultId}] ${rawCard}`;
+    if (caption.length <= CAPTION_LIMIT) {
+      try {
+        await sendPhotosFn(chatId, item.photos.slice(0, 10), caption);
+        return;
+      } catch (e) {
+        console.error('[tools] photo+caption failed:', e instanceof Error ? e.message : e);
+      }
+    }
+  }
+
+  const itemChunks = splitMessage(card);
+  for (const chunk of itemChunks) {
+    try {
+      await sendFn(chatId, chunk, { parse_mode: 'HTML' });
+    } catch (cardErr) {
+      try { await sendFn(chatId, `[${resultId}] ${item.title}\n${item.url}\nPrice: ${item.price} PLN`, { parse_mode: undefined }); } catch (e) { console.error('[tools] send failed:', e instanceof Error ? e.message : e); }
+      break;
+    }
+  }
+  if (item.photos.length > 0) {
+    try {
+      await sendPhotosFn(chatId, item.photos.slice(0, 10));
+    } catch (photoErr) {
+      console.error(`[sendItemCard] Photo send error for ${item.url}:`, photoErr);
+    }
+  }
+}
 
 // ---------------------------------------------------------------------------
 // 1. find_rentals -- THE BIG ONE
 // ---------------------------------------------------------------------------
 
 interface RejectionReason {
+  id: string;
   url: string;
   title: string;
   reason: string;
@@ -494,57 +642,6 @@ async function execFindRentals(
   const accepted: Listing[] = [];
   const acceptedIds: string[] = [];
   const rejected: RejectionReason[] = [];
-  const CAPTION_LIMIT = 1024;
-
-  // Helper: send a rejection one-liner immediately
-  const sendRejection = async (url: string, title: string, reason: string) => {
-    try {
-      await sendFn(ctx.chatId, `\u274C <a href="${url}">${escHtml(title.slice(0, 60))}</a> \u2014 ${escHtml(reason)}`, { parse_mode: 'HTML' });
-    } catch (e) { console.error('[tools] rejection send failed:', e instanceof Error ? e.message : e); }
-  };
-
-  // Helper: send a card with photos immediately, prepend result ID
-  const idPrefix = (id: string) => `<b>[${id}]</b>\n`;
-  const sendCard = async (resultId: string, listing: Listing, parsedData: ParsedRentalData | null, locationScore: LocationScore | null) => {
-    const rawCard = formatRichRentalNotification(
-      listing,
-      parsedData ?? undefined,
-      locationScore ?? undefined,
-    );
-    const card = idPrefix(resultId) + rawCard;
-
-    // Check caption fit against rawCard (without ID prefix) to avoid regression
-    if (rawCard.length <= CAPTION_LIMIT && listing.photos.length > 0) {
-      // Caption: use short ID prefix [ABCDEF] (fits within Telegram's limit)
-      const caption = `[${resultId}] ${rawCard}`;
-      if (caption.length <= CAPTION_LIMIT) {
-        try {
-          await sendPhotosFn(ctx.chatId, listing.photos.slice(0, 10), caption);
-          return;
-        } catch (e) {
-          console.error('[tools] photo+caption failed:', e instanceof Error ? e.message : e);
-        }
-      }
-    }
-
-    // Text + separate photos fallback
-    const cardChunks = splitMessage(card);
-    for (const chunk of cardChunks) {
-      try {
-        await sendFn(ctx.chatId, chunk, { parse_mode: 'HTML' });
-      } catch (cardErr) {
-        try { await sendFn(ctx.chatId, `[${resultId}] ${listing.title}\n${listing.url}\nPrice: ${listing.price} PLN`, { parse_mode: undefined }); } catch (e) { console.error('[tools] send failed:', e instanceof Error ? e.message : e); }
-        break;
-      }
-    }
-    if (listing.photos.length > 0) {
-      try {
-        await sendPhotosFn(ctx.chatId, listing.photos.slice(0, 10));
-      } catch (photoErr) {
-        console.error(`[find_rentals] Photo send error for ${listing.url}:`, photoErr);
-      }
-    }
-  };
 
   ctx.lastSearchResults = candidates;
 
@@ -555,6 +652,10 @@ async function execFindRentals(
 
     // Stop if we have enough accepted results
     if (accepted.length >= maxResults) break;
+
+    // Reserve a result ID for this candidate up-front so even rejection paths
+    // (and the catch-all error handler below) can reference it.
+    const resultId = genId();
 
     try {
       // Fetch detail page for richer data
@@ -574,6 +675,21 @@ async function execFindRentals(
         } catch (e) { console.warn(`[find_rentals] Phone fetch failed for ${listing.platformId}:`, e instanceof Error ? e.message : e); }
       }
 
+      // Cache the enriched Listing immediately so show_listing / get_listing
+      // can recall it later — including rejected ones.
+      try {
+        cacheListing({
+          platform: enrichedListing.platform,
+          platformId: enrichedListing.platformId,
+          kind: 'rental',
+          resultId,
+          listing: enrichedListing,
+        });
+      } catch (cacheErr) {
+        console.error('[find_rentals] cacheListing failed:', cacheErr instanceof Error ? cacheErr.message : cacheErr);
+      }
+      ctx.resultMap.set(resultId, enrichedListing);
+
       // AI extraction — best effort, don't block on failure
       let parsedData: ParsedRentalData | null = null;
       if (enrichedListing.description) {
@@ -592,8 +708,8 @@ async function execFindRentals(
 
       if (priceTo != null && estimatedTotal > priceTo) {
         const reason = `estimated total ${estimatedTotal} PLN exceeds budget ${priceTo} PLN`;
-        rejected.push({ url: enrichedListing.url, title: enrichedListing.title, reason });
-        await sendRejection(enrichedListing.url, enrichedListing.title, reason);
+        rejected.push({ id: resultId, url: enrichedListing.url, title: enrichedListing.title, reason });
+        await sendRejection(ctx.chatId, sendFn, resultId, enrichedListing.url, enrichedListing.title, reason);
         continue;
       }
 
@@ -604,8 +720,8 @@ async function execFindRentals(
         parsedData.contractType !== 'najem_okazjonalny'
       ) {
         const reason = `contract type "${parsedData.contractType}" does not match preference "najem_okazjonalny"`;
-        rejected.push({ url: enrichedListing.url, title: enrichedListing.title, reason });
-        await sendRejection(enrichedListing.url, enrichedListing.title, reason);
+        rejected.push({ id: resultId, url: enrichedListing.url, title: enrichedListing.title, reason });
+        await sendRejection(ctx.chatId, sendFn, resultId, enrichedListing.url, enrichedListing.title, reason);
         continue;
       }
 
@@ -615,8 +731,8 @@ async function execFindRentals(
           const rejectionResult = await evaluateRejection(enrichedListing, parsedData, rejectionCriteria, { userId: ctx.userId });
           if (rejectionResult.rejected) {
             const reason = rejectionResult.rejectionReason ?? 'Rejected by AI criteria';
-            rejected.push({ url: enrichedListing.url, title: enrichedListing.title, reason });
-            await sendRejection(enrichedListing.url, enrichedListing.title, reason);
+            rejected.push({ id: resultId, url: enrichedListing.url, title: enrichedListing.title, reason });
+            await sendRejection(ctx.chatId, sendFn, resultId, enrichedListing.url, enrichedListing.title, reason);
             continue;
           }
         } catch (rejErr) {
@@ -653,16 +769,14 @@ async function execFindRentals(
       }
 
       // ---- STREAM: send card to user immediately ----
-      const resultId = genId();
-      await sendCard(resultId, enrichedListing, parsedData, locationScore);
+      await sendRentalCard(ctx.chatId, sendFn, sendPhotosFn, resultId, enrichedListing, parsedData, locationScore);
       accepted.push(enrichedListing);
       acceptedIds.push(resultId);
-      ctx.resultMap.set(resultId, enrichedListing);
     } catch (err) {
       console.error(`[find_rentals] Error processing ${listing.url}:`, err);
       const reason = `processing error: ${err instanceof Error ? err.message : String(err)}`;
-      rejected.push({ url: listing.url, title: listing.title, reason });
-      await sendRejection(listing.url, listing.title, reason);
+      rejected.push({ id: resultId, url: listing.url, title: listing.title, reason });
+      await sendRejection(ctx.chatId, sendFn, resultId, listing.url, listing.title, reason);
     }
   }
 
@@ -754,85 +868,69 @@ async function execFindItems(
   for (let i = 0; i < candidates.length && shown.length < maxResults; i++) {
     const item = candidates[i];
 
-    // AI condition analysis
-    let parsedData = null;
-    if (item.description) {
-      try {
-        parsedData = await parseItemListing(item, { userId: ctx.userId });
-      } catch (parseErr) {
-        console.error(`[find_items] AI parse FAILED for "${item.title}":`, parseErr instanceof Error ? parseErr.message : parseErr);
-      }
-    }
-
-    // AI rejection criteria filter — send rejection inline
-    if (rejectionCriteria && parsedData) {
-      try {
-        const rejectionResult = await evaluateRejection(item, parsedData, rejectionCriteria, { userId: ctx.userId });
-        if (rejectionResult.rejected) {
-          const reason = rejectionResult.rejectionReason ?? 'Rejected by AI criteria';
-          itemRejected.push({ url: item.url, title: item.title, reason });
-          try {
-            await sendFn(ctx.chatId, `\u274C <a href="${item.url}">${escHtml(item.title.slice(0, 60))}</a> \u2014 ${escHtml(reason)}`, { parse_mode: 'HTML' });
-          } catch (e) { console.error('[tools] rejection send failed:', e instanceof Error ? e.message : e); }
-          continue;
-        }
-      } catch (rejErr) {
-        console.error(`[find_items] Rejection eval failed for "${item.title}":`, rejErr instanceof Error ? rejErr.message : rejErr);
-      }
-    }
-
-    // Fetch phone if not available
-    let enrichedItem = item;
-    if (!item.phone) {
-      try {
-        const phone = await fetchItemPhone(item.platformId);
-        if (phone) enrichedItem = { ...item, phone };
-      } catch (e) { console.warn(`[find_items] Phone fetch failed for ${item.platformId}:`, e instanceof Error ? e.message : e); }
-    }
-
-    // Send card immediately with result ID
+    // Reserve a result ID up-front so even rejection paths can reference it.
     const resultId = genId();
-    const rawCard = formatRichItemNotification(enrichedItem, parsedData ?? undefined);
-    const card = `<b>[${resultId}]</b>\n${rawCard}`;
-    const ITEM_CAPTION_LIMIT = 1024;
 
-    // Try caption with short ID prefix first
-    if (enrichedItem.photos.length > 0) {
-      const caption = `[${resultId}] ${rawCard}`;
-      if (caption.length <= ITEM_CAPTION_LIMIT) {
+    try {
+      // Fetch phone if not available
+      let enrichedItem = item;
+      if (!item.phone) {
         try {
-          await sendPhotosFn(ctx.chatId, enrichedItem.photos.slice(0, 10), caption);
-          shown.push(enrichedItem);
-          shownIds.push(resultId);
-          ctx.resultMap.set(resultId, enrichedItem);
-          continue;
-        } catch (e) {
-          console.error('[tools] photo+caption failed:', e instanceof Error ? e.message : e);
+          const phone = await fetchItemPhone(item.platformId);
+          if (phone) enrichedItem = { ...item, phone };
+        } catch (e) { console.warn(`[find_items] Phone fetch failed for ${item.platformId}:`, e instanceof Error ? e.message : e); }
+      }
+
+      // Cache the enriched item immediately so show_listing / get_listing
+      // can recall it later — including rejected ones.
+      try {
+        cacheListing({
+          platform: enrichedItem.platform,
+          platformId: enrichedItem.platformId,
+          kind: 'item',
+          resultId,
+          listing: enrichedItem,
+        });
+      } catch (cacheErr) {
+        console.error('[find_items] cacheListing failed:', cacheErr instanceof Error ? cacheErr.message : cacheErr);
+      }
+      ctx.resultMap.set(resultId, enrichedItem);
+
+      // AI condition analysis
+      let parsedData: ParsedItemData | null = null;
+      if (enrichedItem.description) {
+        try {
+          parsedData = await parseItemListing(enrichedItem, { userId: ctx.userId });
+        } catch (parseErr) {
+          console.error(`[find_items] AI parse FAILED for "${enrichedItem.title}":`, parseErr instanceof Error ? parseErr.message : parseErr);
         }
       }
-    }
 
-    // Text + separate photos fallback
-    const itemChunks = splitMessage(card);
-    for (const chunk of itemChunks) {
-      try {
-        await sendFn(ctx.chatId, chunk, { parse_mode: 'HTML' });
-      } catch (cardErr) {
-        try { await sendFn(ctx.chatId, `[${resultId}] ${enrichedItem.title}\n${enrichedItem.url}\nPrice: ${enrichedItem.price} PLN`, { parse_mode: undefined }); } catch (e) { console.error('[tools] send failed:', e instanceof Error ? e.message : e); }
-        break;
+      // AI rejection criteria filter — send rejection inline
+      if (rejectionCriteria && parsedData) {
+        try {
+          const rejectionResult = await evaluateRejection(enrichedItem, parsedData, rejectionCriteria, { userId: ctx.userId });
+          if (rejectionResult.rejected) {
+            const reason = rejectionResult.rejectionReason ?? 'Rejected by AI criteria';
+            itemRejected.push({ id: resultId, url: enrichedItem.url, title: enrichedItem.title, reason });
+            await sendRejection(ctx.chatId, sendFn, resultId, enrichedItem.url, enrichedItem.title, reason);
+            continue;
+          }
+        } catch (rejErr) {
+          console.error(`[find_items] Rejection eval failed for "${enrichedItem.title}":`, rejErr instanceof Error ? rejErr.message : rejErr);
+        }
       }
-    }
-    if (enrichedItem.photos.length > 0) {
-      try {
-        await sendPhotosFn(ctx.chatId, enrichedItem.photos.slice(0, 10));
-      } catch (photoErr) {
-        console.error(`[find_items] Photo send error for ${enrichedItem.url}:`, photoErr);
-      }
-    }
 
-    shown.push(enrichedItem);
-    shownIds.push(resultId);
-    ctx.resultMap.set(resultId, enrichedItem);
+      // Send card immediately with result ID
+      await sendItemCard(ctx.chatId, sendFn, sendPhotosFn, resultId, enrichedItem, parsedData);
+      shown.push(enrichedItem);
+      shownIds.push(resultId);
+    } catch (err) {
+      console.error(`[find_items] Error processing ${item.url}:`, err);
+      const reason = `processing error: ${err instanceof Error ? err.message : String(err)}`;
+      itemRejected.push({ id: resultId, url: item.url, title: item.title, reason });
+      await sendRejection(ctx.chatId, sendFn, resultId, item.url, item.title, reason);
+    }
   }
 
   // Done summary
@@ -995,6 +1093,94 @@ async function execListMonitors(
 }
 
 // ---------------------------------------------------------------------------
+// 7. get_listing — return cached listing JSON + AI parse to the agent
+// ---------------------------------------------------------------------------
+
+interface CachedLookupResult {
+  kind: 'rental' | 'item';
+  listing: Listing | ItemListing;
+}
+
+function lookupCachedListing(resultId: string, ctx: UserContext): CachedLookupResult | null {
+  // Fast path: in-memory result map (current process)
+  const inMem = ctx.resultMap.get(resultId);
+  if (inMem) {
+    // Heuristic: rental Listings have `rooms`/`area` props; ItemListings don't.
+    const kind: 'rental' | 'item' = 'rooms' in inMem || 'area' in inMem ? 'rental' : 'item';
+    return { kind, listing: inMem };
+  }
+
+  // Disk fallback: cached_listings table (survives restarts)
+  const onDisk = getCachedListingByResultId(resultId);
+  if (!onDisk) return null;
+
+  // Re-populate in-memory map so follow-ups skip the disk hit.
+  ctx.resultMap.set(resultId, onDisk.listing);
+  return { kind: onDisk.kind, listing: onDisk.listing };
+}
+
+async function execGetListing(
+  input: Record<string, unknown>,
+  ctx: UserContext,
+): Promise<string> {
+  const resultId = String(input.resultId ?? '').trim();
+  if (!resultId) return 'resultId is required.';
+
+  const found = lookupCachedListing(resultId, ctx);
+  if (!found) {
+    return `No cached listing found for result ID "${resultId}". The user may be referencing an ID from a different session, a typo, or a listing that was never fetched. Ask them to re-run the search or paste a URL.`;
+  }
+
+  const { kind, listing } = found;
+  const parsedRow = getParsedListing(listing.platform, listing.platformId);
+  let parsedData: ParsedRentalData | ParsedItemData | null = null;
+  if (parsedRow?.parsed_data) {
+    try { parsedData = JSON.parse(parsedRow.parsed_data); } catch { /* ignore */ }
+  }
+
+  return JSON.stringify({ resultId, kind, listing, parsed: parsedData }, null, 2);
+}
+
+// ---------------------------------------------------------------------------
+// 8. show_listing — re-send the rich card + photos to the user
+// ---------------------------------------------------------------------------
+
+async function execShowListing(
+  input: Record<string, unknown>,
+  ctx: UserContext,
+  sendFn: SendFn,
+  sendPhotosFn: SendPhotosFn,
+): Promise<string> {
+  const resultId = String(input.resultId ?? '').trim();
+  if (!resultId) return 'resultId is required.';
+
+  const found = lookupCachedListing(resultId, ctx);
+  if (!found) {
+    try { await sendFn(ctx.chatId, `No cached listing for [<b>${resultId}</b>]. It may be from a previous session or a typo.`, { parse_mode: 'HTML' }); } catch (e) { console.error('[tools] send failed:', e instanceof Error ? e.message : e); }
+    return `No cached listing for "${resultId}". Told the user.`;
+  }
+
+  const { kind, listing } = found;
+  const parsedRow = getParsedListing(listing.platform, listing.platformId);
+  let parsedData: ParsedRentalData | ParsedItemData | null = null;
+  if (parsedRow?.parsed_data) {
+    try { parsedData = JSON.parse(parsedRow.parsed_data); } catch { /* ignore */ }
+  }
+
+  if (kind === 'rental') {
+    const rental = listing as Listing;
+    await sendRentalCard(ctx.chatId, sendFn, sendPhotosFn, resultId, rental, parsedData as ParsedRentalData | null, null);
+    const photoCount = rental.photos?.length ?? 0;
+    return `Sent rental card [${resultId}] — "${rental.title.slice(0, 60)}" — ${photoCount} photo(s).`;
+  } else {
+    const item = listing as ItemListing;
+    await sendItemCard(ctx.chatId, sendFn, sendPhotosFn, resultId, item, parsedData as ParsedItemData | null);
+    const photoCount = item.photos?.length ?? 0;
+    return `Sent item card [${resultId}] — "${item.title.slice(0, 60)}" — ${photoCount} photo(s).`;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Tool dispatcher
 // ---------------------------------------------------------------------------
 
@@ -1021,6 +1207,10 @@ export async function executeTool(
         return await execDeleteMonitor(input, context);
       case 'list_monitors':
         return await execListMonitors(context);
+      case 'get_listing':
+        return await execGetListing(input, context);
+      case 'show_listing':
+        return await execShowListing(input, context, sendFn, sendPhotosFn);
       default:
         return `Unknown tool: ${name}`;
     }

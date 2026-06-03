@@ -5,3 +5,4 @@ dashboard/node_modules/
 dashboard/dist/
 data/
 .cache/
+.claude/

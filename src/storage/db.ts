@@ -1,6 +1,8 @@
 import Database from 'better-sqlite3';
 import { mkdirSync, existsSync } from 'node:fs';
 import { dirname } from 'node:path';
+import type { Listing } from '../types.js';
+import type { ItemListing } from '../crawlers/olx-items.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -150,6 +152,22 @@ const SCHEMA = `
 
   CREATE INDEX IF NOT EXISTS idx_monitor_runs_started
     ON monitor_runs(monitor_id, started_at DESC);
+
+  CREATE TABLE IF NOT EXISTS cached_listings (
+    platform     TEXT NOT NULL,
+    platform_id  TEXT NOT NULL,
+    result_id    TEXT,
+    kind         TEXT NOT NULL CHECK (kind IN ('rental','item')),
+    listing_json TEXT NOT NULL,
+    cached_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (platform, platform_id)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_cached_listings_result_id
+    ON cached_listings(result_id);
+
+  CREATE INDEX IF NOT EXISTS idx_cached_listings_cached_at
+    ON cached_listings(cached_at DESC);
 `;
 
 // ---------------------------------------------------------------------------
@@ -845,4 +863,235 @@ export function getMonitorListings(monitorId: number, limit = 50): SeenListingDe
     LIMIT ?
   `).all(monitorId, limit) as SeenListingDetail[];
   return rows;
+}
+
+// ---------------------------------------------------------------------------
+// Cache browsing — list + detail endpoints for the dashboard
+// ---------------------------------------------------------------------------
+
+export interface ParsedListingSummary {
+  platform: string;
+  platformId: string;
+  parseType: string;
+  descriptionHash: string;
+  parsedAt: string;
+  title: string | null;        // from seen_listings if any monitor saw it
+  url: string | null;
+  byteSize: number;            // length of parsed_data JSON
+}
+
+export interface ParsedListingDetail extends ParsedListingSummary {
+  parsedData: string;          // raw JSON string
+}
+
+export function listParsedListings(opts: {
+  limit: number;
+  offset?: number;
+  platform?: string;
+  parseType?: string;
+}): ParsedListingSummary[] {
+  const db = getDb();
+  const where: string[] = [];
+  const binds: unknown[] = [];
+  if (opts.platform)  { where.push('p.platform = ?');    binds.push(opts.platform); }
+  if (opts.parseType) { where.push('p.parse_type = ?');  binds.push(opts.parseType); }
+  const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  const sql = `
+    SELECT
+      p.platform                  AS platform,
+      p.platform_id               AS platformId,
+      p.parse_type                AS parseType,
+      p.description_hash          AS descriptionHash,
+      p.parsed_at                 AS parsedAt,
+      LENGTH(p.parsed_data)       AS byteSize,
+      (SELECT title FROM seen_listings s WHERE s.platform = p.platform AND s.platform_id = p.platform_id ORDER BY s.id DESC LIMIT 1) AS title,
+      (SELECT url   FROM seen_listings s WHERE s.platform = p.platform AND s.platform_id = p.platform_id ORDER BY s.id DESC LIMIT 1) AS url
+    FROM parsed_listings p
+    ${whereSql}
+    ORDER BY p.parsed_at DESC
+    LIMIT ? OFFSET ?
+  `;
+  binds.push(opts.limit, opts.offset ?? 0);
+  return db.prepare(sql).all(...binds) as ParsedListingSummary[];
+}
+
+export function getParsedListingDetail(
+  platform: string,
+  platformId: string,
+): ParsedListingDetail | undefined {
+  const db = getDb();
+  const row = db.prepare(`
+    SELECT
+      p.platform            AS platform,
+      p.platform_id         AS platformId,
+      p.parse_type          AS parseType,
+      p.description_hash    AS descriptionHash,
+      p.parsed_at           AS parsedAt,
+      p.parsed_data         AS parsedData,
+      LENGTH(p.parsed_data) AS byteSize,
+      (SELECT title FROM seen_listings s WHERE s.platform = p.platform AND s.platform_id = p.platform_id ORDER BY s.id DESC LIMIT 1) AS title,
+      (SELECT url   FROM seen_listings s WHERE s.platform = p.platform AND s.platform_id = p.platform_id ORDER BY s.id DESC LIMIT 1) AS url
+    FROM parsed_listings p
+    WHERE p.platform = ? AND p.platform_id = ?
+  `).get(platform, platformId) as ParsedListingDetail | undefined;
+  return row;
+}
+
+export interface RejectionCacheRow {
+  platform: string;
+  platformId: string;
+  criteriaHash: string;
+  rejected: number;
+  rejectionReason: string | null;
+  cachedAt: string;
+  title: string | null;
+  url: string | null;
+}
+
+export function listRejectionCache(opts: {
+  limit: number;
+  offset?: number;
+  rejectedOnly?: boolean;
+}): RejectionCacheRow[] {
+  const db = getDb();
+  const where = opts.rejectedOnly ? 'WHERE r.rejected = 1' : '';
+  return db.prepare(`
+    SELECT
+      r.platform         AS platform,
+      r.platform_id      AS platformId,
+      r.criteria_hash    AS criteriaHash,
+      r.rejected         AS rejected,
+      r.rejection_reason AS rejectionReason,
+      r.cached_at        AS cachedAt,
+      (SELECT title FROM seen_listings s WHERE s.platform = r.platform AND s.platform_id = r.platform_id ORDER BY s.id DESC LIMIT 1) AS title,
+      (SELECT url   FROM seen_listings s WHERE s.platform = r.platform AND s.platform_id = r.platform_id ORDER BY s.id DESC LIMIT 1) AS url
+    FROM rejection_cache r
+    ${where}
+    ORDER BY r.cached_at DESC
+    LIMIT ? OFFSET ?
+  `).all(opts.limit, opts.offset ?? 0) as RejectionCacheRow[];
+}
+
+export interface MapsCacheRow {
+  cacheKey: string;
+  cachedAt: string;
+  byteSize: number;
+  expired: number; // 1 if older than ttlDays
+}
+
+export interface MapsCacheDetail extends MapsCacheRow {
+  result: string; // raw JSON string
+}
+
+export function listMapsCache(opts: {
+  limit: number;
+  offset?: number;
+  prefix?: string;
+  ttlDays?: number;
+}): MapsCacheRow[] {
+  const db = getDb();
+  const ttl = opts.ttlDays ?? 7;
+  const where: string[] = [];
+  const binds: unknown[] = [];
+  if (opts.prefix) {
+    where.push('cache_key LIKE ?');
+    binds.push(`${opts.prefix}%`);
+  }
+  const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  const sql = `
+    SELECT
+      cache_key  AS cacheKey,
+      cached_at  AS cachedAt,
+      LENGTH(result) AS byteSize,
+      CASE WHEN cached_at < datetime('now', ?) THEN 1 ELSE 0 END AS expired
+    FROM maps_cache
+    ${whereSql}
+    ORDER BY cached_at DESC
+    LIMIT ? OFFSET ?
+  `;
+  binds.unshift(`-${ttl} days`);
+  binds.push(opts.limit, opts.offset ?? 0);
+  return db.prepare(sql).all(...binds) as MapsCacheRow[];
+}
+
+export function getMapsCacheDetail(cacheKey: string, ttlDays = 7): MapsCacheDetail | undefined {
+  const db = getDb();
+  return db.prepare(`
+    SELECT
+      cache_key  AS cacheKey,
+      cached_at  AS cachedAt,
+      result     AS result,
+      LENGTH(result) AS byteSize,
+      CASE WHEN cached_at < datetime('now', ?) THEN 1 ELSE 0 END AS expired
+    FROM maps_cache
+    WHERE cache_key = ?
+  `).get(`-${ttlDays} days`, cacheKey) as MapsCacheDetail | undefined;
+}
+
+// ---------------------------------------------------------------------------
+// Cached listings — full Listing/ItemListing JSON keyed by (platform, platform_id)
+// so the agent can re-render past cards (with photos) on demand.
+// ---------------------------------------------------------------------------
+
+export interface CachedListingRecord<T = Listing | ItemListing> {
+  kind: 'rental' | 'item';
+  listing: T;
+  resultId: string | null;
+  cachedAt: string;
+}
+
+export function cacheListing(input: {
+  platform: string;
+  platformId: string;
+  kind: 'rental' | 'item';
+  resultId: string | null;
+  listing: Listing | ItemListing;
+}): void {
+  const db = getDb();
+  db.prepare(`
+    INSERT INTO cached_listings (platform, platform_id, result_id, kind, listing_json)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(platform, platform_id) DO UPDATE SET
+      result_id    = COALESCE(excluded.result_id, cached_listings.result_id),
+      kind         = excluded.kind,
+      listing_json = excluded.listing_json,
+      cached_at    = datetime('now')
+  `).run(
+    input.platform,
+    input.platformId,
+    input.resultId,
+    input.kind,
+    JSON.stringify(input.listing),
+  );
+}
+
+function decodeCached(row: { kind: string; listing_json: string; result_id: string | null; cached_at: string }): CachedListingRecord {
+  return {
+    kind: row.kind as 'rental' | 'item',
+    listing: JSON.parse(row.listing_json) as Listing | ItemListing,
+    resultId: row.result_id,
+    cachedAt: row.cached_at,
+  };
+}
+
+export function getCachedListingByResultId(resultId: string): CachedListingRecord | null {
+  const db = getDb();
+  const row = db.prepare(`
+    SELECT kind, listing_json, result_id, cached_at
+    FROM cached_listings
+    WHERE result_id = ?
+    ORDER BY cached_at DESC
+    LIMIT 1
+  `).get(resultId) as { kind: string; listing_json: string; result_id: string | null; cached_at: string } | undefined;
+  return row ? decodeCached(row) : null;
+}
+
+export function getCachedListingByPlatform(platform: string, platformId: string): CachedListingRecord | null {
+  const db = getDb();
+  const row = db.prepare(`
+    SELECT kind, listing_json, result_id, cached_at
+    FROM cached_listings
+    WHERE platform = ? AND platform_id = ?
+  `).get(platform, platformId) as { kind: string; listing_json: string; result_id: string | null; cached_at: string } | undefined;
+  return row ? decodeCached(row) : null;
 }

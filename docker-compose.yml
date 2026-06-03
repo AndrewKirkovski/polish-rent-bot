@@ -8,7 +8,9 @@ services:
       - bot-data:/app/data
     ports:
       # Bind dashboard to loopback only — reach via SSH tunnel.
-      - "127.0.0.1:8080:8080"
+      # Host 8080 is taken on the Revo box (host-network HTTP service alongside jellyfin),
+      # so publish on host 8090 → container 8080.
+      - "127.0.0.1:8090:8080"
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
 

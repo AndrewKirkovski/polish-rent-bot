@@ -4,7 +4,7 @@
 import { searchOlx, OLX_CATEGORIES, OLX_DISTRICTS } from '../crawlers/olx.js';
 import { searchItems } from '../crawlers/olx-items.js';
 import { searchOtodom } from '../crawlers/otodom.js';
-import { getMonitors, isListingSeen, markListingSeen, cleanOldSeen, startMonitorRun, finishMonitorRun, type MonitorRow } from '../storage/db.js';
+import { getMonitors, isListingSeen, markListingSeen, cleanOldSeen, startMonitorRun, finishMonitorRun, cacheListing, type MonitorRow } from '../storage/db.js';
 import type { Listing } from '../types.js';
 import type { ItemListing } from '../crawlers/olx-items.js';
 import { parseRentalListing, parseItemListing, evaluateRejection } from '../ai/parse-listing.js';
@@ -289,6 +289,20 @@ export function startScheduler(
               }
             } catch (parseErr) {
               console.error(`[scheduler] AI parse failed:`, parseErr);
+            }
+
+            // Cache the full listing so chat-side show_listing / get_listing can recall it.
+            // No resultId here — monitor deliveries don't go through the chat result-ID flow.
+            try {
+              cacheListing({
+                platform: listing.platform,
+                platformId: listing.platformId,
+                kind: monitor.type === 'rental' ? 'rental' : 'item',
+                resultId: null,
+                listing,
+              });
+            } catch (cacheErr) {
+              console.error(`[scheduler] cacheListing failed:`, cacheErr instanceof Error ? cacheErr.message : cacheErr);
             }
 
             // Budget check — reject if total cost exceeds priceTo (matches find_rentals logic)

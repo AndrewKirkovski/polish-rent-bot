@@ -50,6 +50,43 @@ export interface CacheStats {
   localHitRate24h: number;
 }
 
+export interface ParsedListingSummary {
+  platform: string;
+  platformId: string;
+  parseType: 'rental' | 'item' | string;
+  descriptionHash: string;
+  parsedAt: string;
+  title: string | null;
+  url: string | null;
+  byteSize: number;
+}
+
+export interface ParsedListingDetail extends ParsedListingSummary {
+  parsedData: string;
+}
+
+export interface RejectionCacheRow {
+  platform: string;
+  platformId: string;
+  criteriaHash: string;
+  rejected: number;
+  rejectionReason: string | null;
+  cachedAt: string;
+  title: string | null;
+  url: string | null;
+}
+
+export interface MapsCacheRow {
+  cacheKey: string;
+  cachedAt: string;
+  byteSize: number;
+  expired: number;
+}
+
+export interface MapsCacheDetail extends MapsCacheRow {
+  result: string;
+}
+
 export interface MonitorWithStats {
   id: number;
   userId: number;
@@ -106,6 +143,41 @@ export const fetchSummaryAll  = () => get<{ h24: UsageSummary; d7: UsageSummary;
 export const fetchSeries      = (range: Range, bucket: 'hour' | 'day') => get<UsageBucket[]>(`/api/usage/series?range=${range}&bucket=${bucket}`);
 export const fetchRecentUsage = (limit = 100) => get<RecentUsageRow[]>(`/api/usage/recent?limit=${limit}`);
 export const fetchCacheStats  = () => get<CacheStats>('/api/cache');
+
+export const fetchParsedListings = (params: { limit?: number; offset?: number; platform?: string; type?: string } = {}) => {
+  const q = new URLSearchParams();
+  if (params.limit != null) q.set('limit', String(params.limit));
+  if (params.offset != null) q.set('offset', String(params.offset));
+  if (params.platform) q.set('platform', params.platform);
+  if (params.type) q.set('type', params.type);
+  return get<ParsedListingSummary[]>(`/api/cache/parsed-listings?${q.toString()}`);
+};
+export const fetchParsedListingDetail = (platform: string, platformId: string) =>
+  get<ParsedListingDetail>(`/api/cache/parsed-listings/${encodeURIComponent(platform)}/${encodeURIComponent(platformId)}`);
+
+export const fetchRejectionCache = (params: { limit?: number; offset?: number; rejectedOnly?: boolean } = {}) => {
+  const q = new URLSearchParams();
+  if (params.limit != null) q.set('limit', String(params.limit));
+  if (params.offset != null) q.set('offset', String(params.offset));
+  if (params.rejectedOnly) q.set('rejectedOnly', '1');
+  return get<RejectionCacheRow[]>(`/api/cache/rejection?${q.toString()}`);
+};
+
+export const fetchMapsCache = (params: { limit?: number; offset?: number; prefix?: string } = {}) => {
+  const q = new URLSearchParams();
+  if (params.limit != null) q.set('limit', String(params.limit));
+  if (params.offset != null) q.set('offset', String(params.offset));
+  if (params.prefix) q.set('prefix', params.prefix);
+  return get<MapsCacheRow[]>(`/api/cache/maps?${q.toString()}`);
+};
+export const fetchMapsCacheDetail = (cacheKey: string) =>
+  get<MapsCacheDetail>(`/api/cache/maps/${encodeURIComponent(cacheKey)}`);
+
+export function fmtBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
 export const fetchMonitors    = () => get<MonitorWithStats[]>('/api/monitors');
 export const fetchMonitorRuns = (id: number, limit = 50) => get<MonitorRunRow[]>(`/api/monitors/${id}/runs?limit=${limit}`);
 export const fetchMonitorListings = (id: number, limit = 50) => get<SeenListingDetail[]>(`/api/monitors/${id}/listings?limit=${limit}`);
