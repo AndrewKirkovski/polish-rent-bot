@@ -7,6 +7,7 @@ import type { ItemListing } from '../crawlers/olx-items.js';
 import { getParsedListing, saveParsedListing, getRejectionCache, saveRejectionCache } from '../storage/db.js';
 import { ParsedRentalDataSchema, ParsedItemDataSchema, RejectionResultSchema } from './schemas.js';
 import { createMessageTracked, recordLocalCacheHit } from './client.js';
+import { computeRentalCost } from '../cost.js';
 
 export type { ParsedRentalData, ParsedItemData } from '../types.js';
 
@@ -32,9 +33,9 @@ Given the listing data below, produce a COMPREHENSIVE analysis in JSON. Read the
 CRITICAL fields to extract from the description:
 - Kaucja (deposit): Look for "kaucja", "depozyt", "zabezpieczenie", "kaucja zwrotna", amounts like "2x czynsz"
 - Contract type: "najem okazjonalny", "umowa najmu okazjonalnego", "najem instytucjonalny" — if NOT mentioned in the description, return null (do NOT assume najem zwykły)
-- Total monthly cost: rent + czynsz administracyjny + estimated utilities. Calculate this explicitly.
-- What's included in czynsz: often includes heating, garbage, water — extract this
-- What tenant pays separately: gas, electricity, internet — extract this
+- estimatedMedia: estimate the MONTHLY PLN cost of each utility the tenant pays SEPARATELY, on top of czynsz. If a utility is already included in czynsz (e.g. heating, water), leave it null here — do NOT also estimate it, or it gets double-counted. The app sums rent + czynsz + these to get the total, so keep the numbers realistic. (Do not compute the total yourself — the app does the arithmetic.)
+- What's included in czynsz: often includes heating, garbage, water — extract this into adminFeeIncludes
+- What tenant pays separately: gas, electricity, internet — extract this into tenantPays
 
 DEEP analysis to produce:
 - Translate and summarize the entire description into English — preserve ALL useful details
@@ -318,8 +319,18 @@ export async function evaluateRejection(
   if (l.rent != null) summaryParts.push(`Czynsz admin: ${l.rent} PLN`);
 
   // AI-parsed fields
-  if ('totalMonthlyCost' in universalParse && universalParse.totalMonthlyCost != null) {
-    summaryParts.push(`Total monthly cost: ${universalParse.totalMonthlyCost} PLN`);
+  // Total monthly cost is computed in code (rentals only) — the LLM's own total is unreliable.
+  if ('estimatedMedia' in universalParse) {
+    const cost = computeRentalCost(
+      {
+        price: typeof l.price === 'number' ? l.price : 0,
+        rent: typeof l.rent === 'number' ? l.rent : null,
+      },
+      universalParse as ParsedRentalData,
+    );
+    if (cost.total > 0) {
+      summaryParts.push(`Total monthly cost: ${cost.total} PLN`);
+    }
   }
   if ('contractType' in universalParse && universalParse.contractType != null) {
     summaryParts.push(`Contract type: ${universalParse.contractType}`);

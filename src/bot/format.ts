@@ -5,6 +5,7 @@ import type TelegramBot from 'node-telegram-bot-api';
 import sanitizeHtml from 'sanitize-html';
 import type { Listing, ParsedRentalData, ParsedItemData, LocationScore } from '../types.js';
 import type { ItemListing } from '../crawlers/olx-items.js';
+import { computeRentalCost } from '../cost.js';
 
 /** Repair broken HTML from message splitting — close unclosed tags, strip orphan close tags */
 function sanitizeChunk(html: string): string {
@@ -118,9 +119,9 @@ export function formatRentalCard(
   const lines: string[] = [];
 
   // ---- TOTAL COST — ALWAYS FIRST LINE ----
-  const totalCost = parsed?.totalMonthlyCost
-    ?? (listing.price + (listing.rent ?? 0));
-  lines.push(`<b>${CE.price} TOTAL: ~${pln(totalCost)}/month</b>`);
+  // Computed in code from structured fields — never trust the LLM's arithmetic.
+  const cost = computeRentalCost(listing, parsed);
+  lines.push(`<b>${CE.price} TOTAL: ~${pln(cost.total)}/month</b>`);
 
   // Header
   lines.push(`${CE.house} ${esc(listing.title)}`);
@@ -135,14 +136,20 @@ export function formatRentalCard(
 
   // ---- COST BREAKDOWN ----
   lines.push(`<b>${CE.costBreak} Cost breakdown:</b>`);
-  lines.push(`  Rent:         ${pln(listing.price)}`);
-  if (parsed?.adminFee != null) {
-    lines.push(`  Czynsz admin: ${pln(parsed.adminFee)}`);
-  } else if (listing.rent != null) {
-    lines.push(`  Czynsz admin: ${pln(listing.rent)}`);
+  lines.push(`  Rent:         ${pln(cost.najem)}`);
+  if (cost.czynsz > 0) {
+    lines.push(`  Czynsz admin: ${pln(cost.czynsz)}`);
   }
-  if (parsed?.totalBreakdown) {
-    lines.push(`  ${esc(parsed.totalBreakdown)}`);
+  // Deterministic formula built from structured numbers (replaces the LLM's
+  // free-text totalBreakdown, which had unreliable arithmetic).
+  if (cost.czynsz > 0 || cost.mediaSum > 0) {
+    const formula = [`${pln(cost.najem)} rent`];
+    if (cost.czynsz > 0) formula.push(`${pln(cost.czynsz)} czynsz`);
+    if (cost.mediaSum > 0) {
+      const detail = cost.mediaParts.map((p) => `${p.label} ~${p.value}`).join(', ');
+      formula.push(`~${pln(cost.mediaSum)} utilities (${detail})`);
+    }
+    lines.push(`  ${formula.join(' + ')} = ~${pln(cost.total)}`);
   }
 
   // Kaucja
