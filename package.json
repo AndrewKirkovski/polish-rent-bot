@@ -2,6 +2,7 @@
   "name": "polish-rent-bot",
   "version": "0.1.0",
   "type": "module",
+  "packageManager": "pnpm@10.24.0",
   "scripts": {
     "start": "tsx src/main.ts",
     "typecheck": "tsc --noEmit",
