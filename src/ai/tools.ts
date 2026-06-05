@@ -20,7 +20,6 @@ import {
   updateMonitorConfig,
   cacheListing,
   getCachedListingByResultId,
-  getCachedListingByPlatform,
   getParsedListing,
 } from '../storage/db.js';
 import type { Listing, ParsedRentalData, ParsedItemData, LocationScore } from '../types.js';
@@ -742,29 +741,25 @@ async function execFindRentals(
 
       // Location scoring — geocode if no coordinates
       let locationScore: LocationScore | null = null;
-      let lat = enrichedListing.lat;
-      let lng = enrichedListing.lng;
-      const wantLocation = amenities.length > 0 || workAddress;
+      const wantLocation = amenities.length > 0 || !!workAddress;
 
-      if (!lat || !lng) {
+      if (wantLocation) {
         try {
-          const { geocodeAddress, buildAddressFromListing } = await import('./maps.js');
-          const addr = buildAddressFromListing(enrichedListing);
-          console.log(`[find_rentals] No coords, geocoding: "${addr}"`);
-          const geo = await geocodeAddress(addr);
-          if (geo) { lat = geo.lat; lng = geo.lng; }
-        } catch (e) { console.warn(`[find_rentals] Geocoding failed:`, e instanceof Error ? e.message : e); }
-      }
-
-      if (lat && lng && wantLocation) {
-        try {
-          const amenityPrefs: AmenityPreference[] = amenities.map((a) => ({
-            type: a.type,
-            maxMinutes: a.maxMinutes,
-          }));
-          locationScore = await scoreLocation(lat, lng, amenityPrefs, workAddress, commuteMode);
+          const { enrichListingLocation } = await import('./location.js');
+          const enriched = await enrichListingLocation(enrichedListing, parsedData);
+          if (enriched.lat != null && enriched.lng != null) {
+            // Write the precise coords back so the cached listing + card map link benefit too.
+            enrichedListing.lat = enriched.lat;
+            enrichedListing.lng = enriched.lng;
+            const amenityPrefs: AmenityPreference[] = amenities.map((a) => ({
+              type: a.type,
+              maxMinutes: a.maxMinutes,
+            }));
+            locationScore = await scoreLocation(enriched.lat, enriched.lng, amenityPrefs, workAddress, commuteMode);
+            if (locationScore) locationScore.precision = enriched.precision;
+          }
         } catch (locErr) {
-          console.error(`[find_rentals] Location scoring error for ${enrichedListing.url}:`, locErr);
+          console.error(`[find_rentals] Location enrich/scoring error for ${enrichedListing.url}:`, locErr instanceof Error ? locErr.message : locErr);
         }
       }
 

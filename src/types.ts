@@ -75,6 +75,7 @@ export interface ParsedRentalData {
   adminFee: number | null;
   adminFeeIncludes: string | null;
   tenantPays: string | null;
+  addressHint: string | null;
   estimatedMedia: {
     water: number | null;
     electricity: number | null;
@@ -156,9 +157,12 @@ export interface CommuteResult {
   mode: string;
 }
 
+export type LocationPrecision = 'exact' | 'street' | 'district' | 'none';
+
 export interface LocationScore {
   amenities: AmenityResult[];
   commute: CommuteResult | null;
   overallScore: number;
   mapsLink: string;
+  precision?: LocationPrecision;
 }

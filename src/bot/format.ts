@@ -172,7 +172,9 @@ export function formatRentalCard(
   // Локация — одна строка на удобство (ближайшее место)
   if (locationScore) {
     const where = listing.district ? `${esc(listing.district)}, ${esc(listing.city)}` : esc(listing.city);
-    lines.push(`<b>${CE.location} ЛОКАЦИЯ ${locationScore.overallScore}/100</b> — ${where}`);
+    const prec = locationScore.precision;
+    const precBadge = prec === 'exact' ? ' · 📍 точно' : prec === 'street' ? ' · 📍 по улице' : prec === 'district' ? ' · 📍 примерно' : '';
+    lines.push(`<b>${CE.location} ЛОКАЦИЯ ${locationScore.overallScore}/100</b> — ${where}${precBadge}`);
     const ruLabel: Record<string, string> = {
       metro: 'метро', tram: 'трамвай', bus: 'автобус', airport: 'аэропорт',
       groceries: 'продукты', supermarket: 'супермаркет', gym: 'зал',

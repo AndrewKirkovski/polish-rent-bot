@@ -348,19 +348,25 @@ export function startScheduler(
               }
             }
 
-            // Score location if monitor has amenity prefs
+            // Location: resolve precise coords (Otodom detail / address geocode), then score.
+            // Previously skipped entirely when listing.lat/lng were null (OLX, Otodom search).
             let locationScore = null;
-            if (config.amenities && listing.lat && listing.lng) {
+            if (config.amenities) {
               try {
-                locationScore = await scoreLocation(
-                  listing.lat,
-                  listing.lng,
-                  config.amenities,
-                  config.workAddress,
-                  config.commuteMode,
-                );
+                const { enrichListingLocation } = await import('../ai/location.js');
+                const enriched = await enrichListingLocation(listing as Listing, parsedData as { addressHint?: string | null } | null);
+                if (enriched.lat != null && enriched.lng != null) {
+                  locationScore = await scoreLocation(
+                    enriched.lat,
+                    enriched.lng,
+                    config.amenities,
+                    config.workAddress,
+                    config.commuteMode,
+                  );
+                  if (locationScore) locationScore.precision = enriched.precision;
+                }
               } catch (mapErr) {
-                console.error(`[scheduler] Maps scoring failed:`, mapErr);
+                console.error(`[scheduler] Location enrich/scoring failed:`, mapErr);
               }
             }
 

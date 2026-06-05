@@ -36,6 +36,7 @@ CRITICAL fields to extract from the description:
 - estimatedMedia: estimate the MONTHLY PLN cost of each utility the tenant pays SEPARATELY, on top of czynsz. If a utility is already included in czynsz (e.g. heating, water), leave it null here — do NOT also estimate it, or it gets double-counted. The app sums rent + czynsz + these to get the total, so keep the numbers realistic. (Do not compute the total yourself — the app does the arithmetic.)
 - What's included in czynsz: often includes heating, garbage, water — extract this into adminFeeIncludes
 - What tenant pays separately: gas, electricity, internet — extract this into tenantPays
+- addressHint: the exact street/ulica (with building number if present) or a precise landmark from the description, for map geolocation. OLX hides the street in its API, but the description often names it. Null if nothing specific.
 
 DEEP analysis to produce:
 - Translate and summarize the entire description into Russian — preserve ALL useful details
@@ -60,6 +61,7 @@ Return ONLY valid JSON (no markdown fences):
     "internet": number or null,
     "heating": number or null
   },
+  "addressHint": "exact street/ulica + number or a clear landmark from the description, or null",
   "totalMonthlyCost": number or null,
   "totalBreakdown": "e.g. 2000 rent + 544 czynsz + ~200 utilities = ~2744 PLN",
   "contractType": "najem_okazjonalny" | "najem_zwykly" | "najem_instytucjonalny" | null,
