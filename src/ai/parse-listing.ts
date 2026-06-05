@@ -26,7 +26,7 @@ function hashText(text: string): string {
 // Rental listing — comprehensive AI analysis
 // ---------------------------------------------------------------------------
 
-const RENTAL_PROMPT = `You are an expert Polish real estate analyst helping an English-speaking renter evaluate apartments in Poland.
+const RENTAL_PROMPT = `You are an expert Polish real estate analyst helping a Russian-speaking renter evaluate apartments in Poland. Write all free-text fields in Russian.
 
 Given the listing data below, produce a COMPREHENSIVE analysis in JSON. Read the Polish description carefully — landlords hide crucial details there.
 
@@ -38,7 +38,7 @@ CRITICAL fields to extract from the description:
 - What tenant pays separately: gas, electricity, internet — extract this into tenantPays
 
 DEEP analysis to produce:
-- Translate and summarize the entire description into English — preserve ALL useful details
+- Translate and summarize the entire description into Russian — preserve ALL useful details
 - Assess the apartment's vibe/style (modern? renovated? old? communist-era?)
 - List ALL furniture and equipment mentioned
 - Note landlord's personality/flexibility from the text
@@ -71,7 +71,7 @@ Return ONLY valid JSON (no markdown fences):
   "furnished": "full" | "partial" | "none" | null,
   "parkingIncluded": true | false | null,
   "balcony": true | false | null,
-  "descriptionSummary": "2-4 sentence English summary of the apartment — vibe, style, key features",
+  "descriptionSummary": "2-4 sentence Russian summary of the apartment — vibe, style, key features",
   "furnitureAndEquipment": ["list every item mentioned: bed type, desk, wardrobe, appliances, etc."],
   "kitchenDetails": "what's in the kitchen",
   "bathroomDetails": "what's in the bathroom",
@@ -172,7 +172,7 @@ ${(listing.description || 'No description provided').slice(0, 8000)}`;
 // Item listing — condition and value analysis
 // ---------------------------------------------------------------------------
 
-const ITEM_PROMPT = `You are an expert at evaluating used items for sale. Given a Polish item listing, produce a comprehensive analysis in English.
+const ITEM_PROMPT = `You are an expert at evaluating used items for sale. Given a Polish item listing, produce a comprehensive analysis. Write all free-text fields in Russian.
 
 Read the Polish description carefully. Extract:
 - Real condition (not just the tag — what does the seller actually say?)
@@ -184,12 +184,12 @@ Read the Polish description carefully. Extract:
 
 Return ONLY valid JSON (no markdown fences):
 {
-  "actualCondition": "detailed English assessment from description",
+  "actualCondition": "detailed Russian assessment from description",
   "whySelling": "reason if mentioned, null otherwise",
   "defects": ["list of any issues mentioned"],
   "includedAccessories": ["charger", "original box", etc.],
   "priceAssessment": "seems fair / overpriced / good deal — brief note",
-  "descriptionSummary": "1-2 sentence English summary",
+  "descriptionSummary": "1-2 sentence Russian summary",
   "bestFor": "who should buy this",
   "redFlags": ["any concerns"],
   "additionalNotes": ["anything else noteworthy"]
