@@ -71,7 +71,7 @@ Return ONLY valid JSON (no markdown fences):
   "furnished": "full" | "partial" | "none" | null,
   "parkingIncluded": true | false | null,
   "balcony": true | false | null,
-  "descriptionSummary": "2-4 sentence Russian summary of the apartment — vibe, style, key features",
+  "descriptionSummary": "1-2 sentence Russian summary of the apartment — vibe, style, key features",
   "furnitureAndEquipment": ["list every item mentioned: bed type, desk, wardrobe, appliances, etc."],
   "kitchenDetails": "what's in the kitchen",
   "bathroomDetails": "what's in the bathroom",

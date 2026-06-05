@@ -118,184 +118,116 @@ export function formatRentalCard(
 ): string {
   const lines: string[] = [];
 
-  // ---- TOTAL COST — ALWAYS FIRST LINE ----
-  // Computed in code from structured fields — never trust the LLM's arithmetic.
+  // ---- ИТОГО — всегда первой строкой (считаем в коде, не доверяем арифметике LLM) ----
   const cost = computeRentalCost(listing, parsed);
-  lines.push(`<b>${CE.price} TOTAL: ~${pln(cost.total)}/month</b>`);
+  const num = (n: number) => n.toLocaleString('pl-PL');
+  const zl = (n: number) => `${num(n)} zł`;
+  lines.push(`<b>${CE.price} ИТОГО: ~${zl(cost.total)}/мес</b>`);
 
-  // Header
+  // Заголовок
   lines.push(`${CE.house} ${esc(listing.title)}`);
   lines.push(listing.url);
   lines.push('');
 
-  // AI Summary
+  // Краткое AI-резюме
   if (parsed?.descriptionSummary) {
     lines.push(`${CE.thinking} ${esc(parsed.descriptionSummary)}`);
     lines.push('');
   }
 
-  // ---- COST BREAKDOWN ----
-  lines.push(`<b>${CE.costBreak} Cost breakdown:</b>`);
-  lines.push(`  Rent:         ${pln(cost.najem)}`);
-  if (cost.czynsz > 0) {
-    lines.push(`  Czynsz admin: ${pln(cost.czynsz)}`);
-  }
-  // Deterministic formula built from structured numbers (replaces the LLM's
-  // free-text totalBreakdown, which had unreliable arithmetic).
-  if (cost.czynsz > 0 || cost.mediaSum > 0) {
-    const formula = [`${pln(cost.najem)} rent`];
-    if (cost.czynsz > 0) formula.push(`${pln(cost.czynsz)} czynsz`);
-    if (cost.mediaSum > 0) {
-      const detail = cost.mediaParts.map((p) => `${p.label} ~${p.value}`).join(', ');
-      formula.push(`~${pln(cost.mediaSum)} utilities (${detail})`);
-    }
-    lines.push(`  ${formula.join(' + ')} = ~${pln(cost.total)}`);
-  }
+  // Стоимость — одной строкой
+  const costParts = [`Аренда ${num(cost.najem)}`];
+  if (cost.czynsz > 0) costParts.push(`czynsz ${num(cost.czynsz)}`);
+  if (cost.mediaSum > 0) costParts.push(`~${num(cost.mediaSum)} коммун.`);
+  const costStr = costParts.length > 1 ? `${costParts.join(' + ')} = ${zl(cost.total)}` : zl(cost.najem);
+  lines.push(`${CE.costBreak} ${costStr}`);
 
-  // Kaucja
-  if (parsed?.depositNote) {
-    lines.push(`  Kaucja: ${esc(parsed.depositNote)}`);
-  } else if (parsed?.deposit != null) {
-    lines.push(`  Kaucja: ${pln(parsed.deposit)}`);
-  } else if (listing.deposit != null) {
-    lines.push(`  Kaucja: ${pln(listing.deposit)}`);
-  } else {
-    lines.push(`  Kaucja: ${CE.warning} not specified \u2014 ask landlord`);
-  }
-
-  // What's included / tenant pays
-  if (parsed?.adminFeeIncludes) {
-    lines.push(`  Included in czynsz: ${esc(parsed.adminFeeIncludes)}`);
-  }
-  if (parsed?.tenantPays) {
-    lines.push(`  Tenant pays extra: ${esc(parsed.tenantPays)}`);
-  }
+  // Kaucja + тип договора — одной строкой
+  const payLine: string[] = [];
+  if (parsed?.depositNote) payLine.push(`Kaucja: ${esc(parsed.depositNote)}`);
+  else if (parsed?.deposit != null) payLine.push(`Kaucja: ${zl(parsed.deposit)}`);
+  else if (listing.deposit != null) payLine.push(`Kaucja: ${zl(listing.deposit)}`);
+  else payLine.push(`Kaucja: ${CE.warning} не указана`);
+  if (parsed?.contractType) payLine.push(`Договор: ${esc(parsed.contractType.replace(/_/g, ' '))}`);
+  lines.push(payLine.join(' · '));
   lines.push('');
 
-  // ---- CONTRACT (CRITICAL) ----
-  lines.push(`<b>${CE.contract} CONTRACT</b>`);
-  if (parsed?.contractType) {
-    const contractDisplay = parsed.contractType.replace(/_/g, ' ');
-    lines.push(`Type: ${contractDisplay}`);
-  }
-  if (parsed?.contractNote) {
-    lines.push(esc(parsed.contractNote));
-  }
-  if (parsed?.availableFrom) lines.push(`Available: ${esc(parsed.availableFrom)}`);
-  if (parsed?.minimumLease) lines.push(`Min lease: ${esc(parsed.minimumLease)}`);
-
-  const restrictions: string[] = [];
-  restrictions.push(`${CE.pets} Pets: ${ceYn(parsed?.petFriendly)}`);
-  restrictions.push(`Smoking: ${ceYn(parsed?.smokingAllowed)}`);
-  if (parsed?.furnished) restrictions.push(`Furnished: ${parsed.furnished}`);
-  if (parsed?.parkingIncluded != null) restrictions.push(`Parking: ${ceYn(parsed.parkingIncluded)}`);
-  if (parsed?.balcony != null) restrictions.push(`Balcony: ${ceYn(parsed.balcony)}`);
-  lines.push(restrictions.join(' | '));
-
+  // Квартира — одной строкой
+  const apt: string[] = [];
+  if (listing.rooms != null) apt.push(`${listing.rooms} комн`);
+  if (listing.area != null) apt.push(`${listing.area} m²`);
+  if (listing.floor != null) apt.push(`${listing.floor} эт`);
+  if (parsed?.furnished) apt.push(`мебель: ${parsed.furnished}`);
+  apt.push(`питомцы ${ceYn(parsed?.petFriendly)}`);
+  apt.push(`курение ${ceYn(parsed?.smokingAllowed)}`);
+  if (parsed?.parkingIncluded != null) apt.push(`парковка ${ceYn(parsed.parkingIncluded)}`);
+  if (parsed?.balcony != null) apt.push(`балкон ${ceYn(parsed.balcony)}`);
+  if (apt.length > 0) lines.push(`${CE.house} ${apt.join(' · ')}`);
   const restrictionsList = parsed?.restrictions ?? [];
   if (restrictionsList.length > 0) {
-    lines.push(`${CE.warning} ${restrictionsList.map(r => esc(r)).join(', ')}`);
+    lines.push(`${CE.warning} ${restrictionsList.slice(0, 3).map(r => esc(r)).join(', ')}`);
   }
   lines.push('');
 
-  // ---- APARTMENT ----
-  lines.push(`<b>${CE.house} APARTMENT</b>`);
-  const details: string[] = [];
-  if (listing.rooms != null) details.push(`${listing.rooms} rooms`);
-  if (listing.area != null) details.push(`${listing.area} m\u00B2`);
-  if (listing.floor != null) details.push(`floor ${listing.floor}`);
-  if (listing.buildingType) details.push(esc(listing.buildingType));
-  if (listing.heating) details.push(esc(listing.heating));
-  if (details.length > 0) lines.push(details.join(' | '));
-
-  if (parsed?.kitchenDetails) lines.push(`${CE.kitchen} Kitchen: ${esc(parsed.kitchenDetails)}`);
-  if (parsed?.bathroomDetails) lines.push(`${CE.bathroom} Bathroom: ${esc(parsed.bathroomDetails)}`);
-  if (parsed?.internetReady) lines.push(`${CE.ac} Internet: ${esc(parsed.internetReady)}`);
-
-  // Equipment: truncate to 5 items max
-  const furnitureList = parsed?.furnitureAndEquipment ?? [];
-  if (furnitureList.length > 0) {
-    const shown = furnitureList.slice(0, 5).map(f => esc(f));
-    const suffix = furnitureList.length > 5 ? `, and ${furnitureList.length - 5} more` : '';
-    lines.push(`${CE.furniture} Equipment: ${shown.join(', ')}${suffix}`);
-  }
-  lines.push('');
-
-  // ---- LOCATION ----
+  // Локация — одна строка на удобство (ближайшее место)
   if (locationScore) {
-    lines.push(`<b>${CE.location} LOCATION (${locationScore.overallScore}/100)</b>`);
-    if (listing.district) {
-      lines.push(`${CE.location} ${esc(listing.district)}, ${esc(listing.city)}`);
-    } else {
-      lines.push(`${CE.location} ${esc(listing.city)}`);
-    }
-    // Amenity icons — use custom emoji where available, fallback to Unicode
+    const where = listing.district ? `${esc(listing.district)}, ${esc(listing.city)}` : esc(listing.city);
+    lines.push(`<b>${CE.location} ЛОКАЦИЯ ${locationScore.overallScore}/100</b> — ${where}`);
+    const ruLabel: Record<string, string> = {
+      metro: 'метро', tram: 'трамвай', bus: 'автобус', airport: 'аэропорт',
+      groceries: 'продукты', supermarket: 'супермаркет', gym: 'зал',
+      pool: 'бассейн', pharmacy: 'аптека', park: 'парк',
+    };
     const icons: Record<string, string> = {
-      metro: '\uD83D\uDE87', tram: '\uD83D\uDE8B', bus: '\uD83D\uDE8C',
-      airport: '\u2708\uFE0F', groceries: '\uD83D\uDED2',
+      metro: '🚇', tram: '🚋', bus: '🚌',
+      airport: '✈️', groceries: '🛒',
       gym: CE.gym, pool: CE.pool, pharmacy: CE.pharmacy,
-      supermarket: '\uD83D\uDED2', park: '\uD83C\uDF33',
+      supermarket: '🛒', park: '🌳',
     };
     for (const a of locationScore.amenities) {
       const icon = icons[a.type] ?? CE.location;
+      const label = ruLabel[a.type] ?? esc(a.type);
+      const mark = a.withinLimit ? CE.yes : CE.warning;
       if (a.places.length > 0) {
-        const mark = a.withinLimit ? ` ${CE.yes}` : ` ${CE.warning}`;
-        lines.push(`${icon} <b>${esc(a.type)}</b>${mark}`);
-        for (const p of a.places) {
-          const parts: string[] = [esc(p.name)];
-          // Walking time (most amenities)
-          if (p.walkingMinutes >= 0) parts.push(`${p.walkingMinutes} min walk`);
-          // Frequency info (metro/tram/bus)
-          if (p.frequencyMinutes) {
-            parts.push(`${p.lineName ? esc(p.lineName) + ' ' : ''}every ~${p.frequencyMinutes} min`);
-          }
-          // Transit time (airport, groceries fallback)
-          if (p.transitMinutes) parts.push(`${p.transitMinutes} min transit`);
-          // Driving time (airport taxi)
-          if (p.drivingMinutes) parts.push(`${p.drivingMinutes} min taxi`);
-          lines.push(`  \u2022 ${parts.join(' \u2014 ')}`);
+        const p = a.places[0];
+        const parts: string[] = [esc(p.name)];
+        if (p.walkingMinutes >= 0) parts.push(`${p.walkingMinutes} мин`);
+        if (p.frequencyMinutes) {
+          parts.push(`${p.lineName ? esc(p.lineName) + ' ' : ''}~${p.frequencyMinutes} мин`);
+        } else if (p.transitMinutes) {
+          parts.push(`${p.transitMinutes} мин транзит`);
         }
+        lines.push(`${icon} ${label} ${mark} ${parts.join(' — ')}`);
       } else {
-        lines.push(`${icon} ${esc(a.type)}: not found nearby`);
+        lines.push(`${icon} ${label} ${CE.warning} рядом нет`);
       }
     }
     if (locationScore.commute) {
-      lines.push(`\u2192 ${esc(locationScore.commute.duration)} by ${esc(locationScore.commute.mode)}`);
+      lines.push(`→ ${esc(locationScore.commute.duration)} до работы`);
     }
     lines.push(locationScore.mapsLink);
-  } else if (listing.lat && listing.lng) {
-    lines.push(`${CE.location} ${listing.district ? esc(listing.district) + ', ' : ''}${esc(listing.city)}`);
-    lines.push(`https://www.google.com/maps?q=${listing.lat},${listing.lng}`);
   } else {
     lines.push(`${CE.location} ${listing.district ? esc(listing.district) + ', ' : ''}${esc(listing.city)}`);
+    if (listing.lat && listing.lng) lines.push(`https://www.google.com/maps?q=${listing.lat},${listing.lng}`);
   }
   lines.push('');
 
-  // ---- AI ASSESSMENT ----
-  if (parsed?.bestSuitedFor) {
-    lines.push(`${CE.person} Best for: ${esc(parsed.bestSuitedFor)}`);
-  }
-  if (parsed?.landlordNotes) {
-    lines.push(`${CE.landlord} Landlord: ${esc(parsed.landlordNotes)}`);
-  }
-  const positives = parsed?.positives ?? [];
+  // Плюсы / минусы (кратко, до 3)
+  const positives = (parsed?.positives ?? []).slice(0, 3);
   if (positives.length > 0) {
     lines.push(`${CE.pros} ${positives.map(p => esc(p)).join(', ')}`);
   }
-  const redFlags = parsed?.redFlags ?? [];
+  const redFlags = (parsed?.redFlags ?? []).slice(0, 3);
   if (redFlags.length > 0) {
     lines.push(`${CE.cons} ${redFlags.map(f => esc(f)).join(', ')}`);
   }
-  // additionalNotes removed — rarely useful, adds verbosity
 
-  // Contact
-  lines.push('');
+  // Контакт
   const contactParts: string[] = [];
   if (listing.phone) contactParts.push(`${CE.phone} ${esc(listing.phone)}`);
-  if (listing.contactName) contactParts.push(`${CE.person} ${esc(listing.contactName)}`);
-  if (listing.advertiserType) contactParts.push(listing.advertiserType);
+  if (listing.advertiserType) contactParts.push(esc(listing.advertiserType));
   if (listing.agencyName) contactParts.push(esc(listing.agencyName));
-  if (contactParts.length > 0) lines.push(contactParts.join(' | '));
+  if (contactParts.length > 0) lines.push(contactParts.join(' · '));
 
   return lines.join('\n');
 }
