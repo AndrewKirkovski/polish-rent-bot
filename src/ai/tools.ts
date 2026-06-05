@@ -748,9 +748,13 @@ async function execFindRentals(
           const { enrichListingLocation } = await import('./location.js');
           const enriched = await enrichListingLocation(enrichedListing, parsedData);
           if (enriched.lat != null && enriched.lng != null) {
-            // Write the precise coords back so the cached listing + card map link benefit too.
+            // Write the precise coords back, and re-cache so disk recall (show_listing /
+            // get_listing) yields the same precise map link as the card we send now.
             enrichedListing.lat = enriched.lat;
             enrichedListing.lng = enriched.lng;
+            try {
+              cacheListing({ platform: enrichedListing.platform, platformId: enrichedListing.platformId, kind: 'rental', resultId, listing: enrichedListing });
+            } catch (e) { console.warn('[find_rentals] re-cache after enrich failed:', e instanceof Error ? e.message : e); }
             const amenityPrefs: AmenityPreference[] = amenities.map((a) => ({
               type: a.type,
               maxMinutes: a.maxMinutes,

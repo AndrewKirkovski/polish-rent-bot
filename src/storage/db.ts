@@ -1065,6 +1065,16 @@ export function cacheListing(input: {
   );
 }
 
+/** Prune recall-cache rows older than maxAgeDays — cached_listings otherwise grows unbounded. */
+export function cleanOldCachedListings(maxAgeDays = 90): number {
+  const db = getDb();
+  const result = db.prepare(`
+    DELETE FROM cached_listings
+    WHERE cached_at < datetime('now', ? || ' days')
+  `).run(`-${maxAgeDays}`);
+  return result.changes;
+}
+
 function decodeCached(row: { kind: string; listing_json: string; result_id: string | null; cached_at: string }): CachedListingRecord {
   return {
     kind: row.kind as 'rental' | 'item',

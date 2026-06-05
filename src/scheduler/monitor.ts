@@ -351,7 +351,7 @@ export function startScheduler(
             // Location: resolve precise coords (Otodom detail / address geocode), then score.
             // Previously skipped entirely when listing.lat/lng were null (OLX, Otodom search).
             let locationScore = null;
-            if (config.amenities) {
+            if (monitor.type === 'rental' && config.amenities) {
               try {
                 const { enrichListingLocation } = await import('../ai/location.js');
                 const enriched = await enrichListingLocation(listing as Listing, parsedData as { addressHint?: string | null } | null);

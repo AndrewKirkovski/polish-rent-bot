@@ -35,15 +35,11 @@ function pln(amount: number | null | undefined): string {
   return amount.toLocaleString('pl-PL') + ' PLN';
 }
 
-function yn(val: boolean | null | undefined): string {
-  if (val === true) return '\u2713';
-  if (val === false) return '\u2717';
-  return '?';
-}
-
-function listItems(items: string[] | undefined, prefix = '\u2022 '): string {
-  if (!items || items.length === 0) return '';
-  return items.map(i => `${prefix}${esc(i)}`).join('\n');
+/** Truncate AI free-text so an over-long LLM summary can't push the card past
+ *  Telegram's single-message limit (the "1-2 sentence" instruction is prompt-only). */
+function trunc(text: string, max: number): string {
+  if (text.length <= max) return text;
+  return text.slice(0, max - 1).trimEnd() + '\u2026';
 }
 
 /** Split text into chunks that fit Telegram's 4096 char limit.
@@ -131,7 +127,7 @@ export function formatRentalCard(
 
   // Краткое AI-резюме
   if (parsed?.descriptionSummary) {
-    lines.push(`${CE.thinking} ${esc(parsed.descriptionSummary)}`);
+    lines.push(`${CE.thinking} ${esc(trunc(parsed.descriptionSummary, 400))}`);
     lines.push('');
   }
 

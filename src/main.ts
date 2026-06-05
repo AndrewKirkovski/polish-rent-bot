@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { getDb } from './storage/db.js';
+import { getDb, cleanOldCachedListings, cleanExpiredMapsCache } from './storage/db.js';
 import { startBot, sendEnrichedNotification } from './bot/telegram.js';
 import { startScheduler } from './scheduler/monitor.js';
 import { closeBrowser } from './crawlers/otodom.js';
@@ -20,6 +20,18 @@ process.on('uncaughtException', (err) => {
 // --- Bootstrap ---
 
 getDb(); // initialize DB singleton (creates tables if needed)
+
+// One-time cache maintenance on boot — these tables otherwise grow without bound.
+try {
+  const prunedListings = cleanOldCachedListings();
+  const prunedMaps = cleanExpiredMapsCache();
+  if (prunedListings || prunedMaps) {
+    console.log(`[startup] pruned ${prunedListings} old cached listings, ${prunedMaps} expired maps entries`);
+  }
+} catch (err) {
+  console.error('[startup] cache prune failed:', err instanceof Error ? err.message : err);
+}
+
 startBot();
 
 const MONITOR_INTERVAL_MINUTES = 10;
