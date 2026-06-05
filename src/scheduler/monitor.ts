@@ -4,11 +4,12 @@
 import { searchOlx, OLX_CATEGORIES, OLX_DISTRICTS } from '../crawlers/olx.js';
 import { searchItems } from '../crawlers/olx-items.js';
 import { searchOtodom } from '../crawlers/otodom.js';
-import { getMonitors, isListingSeen, markListingSeen, cleanOldSeen, startMonitorRun, finishMonitorRun, cacheListing, type MonitorRow } from '../storage/db.js';
-import type { Listing } from '../types.js';
+import { getMonitors, isListingSeen, markListingSeen, cleanOldSeen, cleanOldCachedListings, startMonitorRun, finishMonitorRun, cacheListing, type MonitorRow } from '../storage/db.js';
+import type { Listing, ParsedRentalData } from '../types.js';
 import type { ItemListing } from '../crawlers/olx-items.js';
 import { parseRentalListing, parseItemListing, evaluateRejection } from '../ai/parse-listing.js';
 import { scoreLocation } from '../ai/maps.js';
+import { computeRentalCost } from '../cost.js';
 
 // ---------------------------------------------------------------------------
 // City name → OLX city ID mapping (case-insensitive)
@@ -310,8 +311,7 @@ export function startScheduler(
             const config = monitorConfig;
             if (monitor.type === 'rental' && config.priceTo != null) {
               const l = listing as Listing;
-              const estimatedTotal = (parsedData as any)?.totalMonthlyCost
-                ?? (l.price + (l.rent ?? 0));
+              const estimatedTotal = computeRentalCost(l, parsedData as ParsedRentalData | null).total;
               if (estimatedTotal > config.priceTo) {
                 console.log(`[scheduler] Budget reject "${listing.title}": ${estimatedTotal} > ${config.priceTo}`);
                 markListingSeen(monitor.id, listing.platform, listing.platformId, listing.url, listing.title, listing.price);
@@ -351,7 +351,7 @@ export function startScheduler(
             // Location: resolve precise coords (Otodom detail / address geocode), then score.
             // Previously skipped entirely when listing.lat/lng were null (OLX, Otodom search).
             let locationScore = null;
-            if (monitor.type === 'rental' && config.amenities) {
+            if (monitor.type === 'rental' && ((config.amenities?.length ?? 0) > 0 || config.workAddress)) {
               try {
                 const { enrichListingLocation } = await import('../ai/location.js');
                 const enriched = await enrichListingLocation(listing as Listing, parsedData as { addressHint?: string | null } | null);
@@ -359,7 +359,7 @@ export function startScheduler(
                   locationScore = await scoreLocation(
                     enriched.lat,
                     enriched.lng,
-                    config.amenities,
+                    config.amenities ?? [],
                     config.workAddress,
                     config.commuteMode,
                   );
@@ -390,8 +390,10 @@ export function startScheduler(
         });
       }
 
-      // Purge listings older than 30 days from the seen table
+      // Purge listings older than 30 days from the seen table; prune the recall cache too,
+      // so cached_listings stays bounded even on a host that never restarts.
       cleanOldSeen(30);
+      cleanOldCachedListings(90);
 
       const totalNew = results.reduce((sum, r) => sum + r.newListings.length, 0);
       console.log(`[scheduler] Cycle complete — ${results.length} monitors, ${totalNew} unseen listings`);

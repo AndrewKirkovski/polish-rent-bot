@@ -23,6 +23,7 @@ import {
   getParsedListing,
 } from '../storage/db.js';
 import type { Listing, ParsedRentalData, ParsedItemData, LocationScore } from '../types.js';
+import { computeRentalCost } from '../cost.js';
 
 // ---------------------------------------------------------------------------
 // Short human-readable ID generator (nanoid, unambiguous alphabet)
@@ -701,9 +702,9 @@ async function execFindRentals(
         }
       }
 
-      // Budget filter — use AI total if available, fallback to rent + czynsz
-      const estimatedTotal = parsedData?.totalMonthlyCost
-        ?? (enrichedListing.price + (enrichedListing.rent ?? 0));
+      // Budget filter — use the SAME code-computed total the card displays (cost.ts),
+      // not the LLM's totalMonthlyCost, so the gate and the shown ИТОГО can never disagree.
+      const estimatedTotal = computeRentalCost(enrichedListing, parsedData).total;
 
       if (priceTo != null && estimatedTotal > priceTo) {
         const reason = `estimated total ${estimatedTotal} PLN exceeds budget ${priceTo} PLN`;
