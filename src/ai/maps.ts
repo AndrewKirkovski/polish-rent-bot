@@ -697,6 +697,6 @@ export async function scoreLocation(
     amenities,
     commute,
     overallScore,
-    mapsLink: `https://www.google.com/maps/@${lat},${lng},15z`,
+    mapsLink: `https://www.google.com/maps?q=${lat},${lng}`,
   };
 }

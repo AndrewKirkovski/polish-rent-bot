@@ -702,12 +702,21 @@ async function execFindRentals(
         }
       }
 
+      // Always discard listings that aren't a single concrete apartment (aggregator/agency
+      // posts, investment offers, price ranges) — "это не конкретная квартира".
+      if (parsedData?.isConcreteApartment === false) {
+        const reason = 'это не конкретная квартира';
+        rejected.push({ id: resultId, url: enrichedListing.url, title: enrichedListing.title, reason });
+        await sendRejection(ctx.chatId, sendFn, resultId, enrichedListing.url, enrichedListing.title, reason);
+        continue;
+      }
+
       // Budget filter — use the SAME code-computed total the card displays (cost.ts),
       // not the LLM's totalMonthlyCost, so the gate and the shown ИТОГО can never disagree.
       const estimatedTotal = computeRentalCost(enrichedListing, parsedData).total;
 
       if (priceTo != null && estimatedTotal > priceTo) {
-        const reason = `estimated total ${estimatedTotal} PLN exceeds budget ${priceTo} PLN`;
+        const reason = `итог ~${estimatedTotal} zł превышает бюджет ${priceTo} zł`;
         rejected.push({ id: resultId, url: enrichedListing.url, title: enrichedListing.title, reason });
         await sendRejection(ctx.chatId, sendFn, resultId, enrichedListing.url, enrichedListing.title, reason);
         continue;
@@ -719,7 +728,7 @@ async function execFindRentals(
         parsedData?.contractType != null &&
         parsedData.contractType !== 'najem_okazjonalny'
       ) {
-        const reason = `contract type "${parsedData.contractType}" does not match preference "najem_okazjonalny"`;
+        const reason = `тип договора не «najem okazjonalny» (${parsedData.contractType.replace(/_/g, ' ')})`;
         rejected.push({ id: resultId, url: enrichedListing.url, title: enrichedListing.title, reason });
         await sendRejection(ctx.chatId, sendFn, resultId, enrichedListing.url, enrichedListing.title, reason);
         continue;
@@ -730,7 +739,7 @@ async function execFindRentals(
         try {
           const rejectionResult = await evaluateRejection(enrichedListing, parsedData, rejectionCriteria, { userId: ctx.userId });
           if (rejectionResult.rejected) {
-            const reason = rejectionResult.rejectionReason ?? 'Rejected by AI criteria';
+            const reason = rejectionResult.rejectionReason ?? 'отклонено по вашим критериям';
             rejected.push({ id: resultId, url: enrichedListing.url, title: enrichedListing.title, reason });
             await sendRejection(ctx.chatId, sendFn, resultId, enrichedListing.url, enrichedListing.title, reason);
             continue;
@@ -774,7 +783,7 @@ async function execFindRentals(
       acceptedIds.push(resultId);
     } catch (err) {
       console.error(`[find_rentals] Error processing ${listing.url}:`, err);
-      const reason = `processing error: ${err instanceof Error ? err.message : String(err)}`;
+      const reason = `ошибка обработки: ${err instanceof Error ? err.message : String(err)}`;
       rejected.push({ id: resultId, url: listing.url, title: listing.title, reason });
       await sendRejection(ctx.chatId, sendFn, resultId, listing.url, listing.title, reason);
     }
@@ -911,7 +920,7 @@ async function execFindItems(
         try {
           const rejectionResult = await evaluateRejection(enrichedItem, parsedData, rejectionCriteria, { userId: ctx.userId });
           if (rejectionResult.rejected) {
-            const reason = rejectionResult.rejectionReason ?? 'Rejected by AI criteria';
+            const reason = rejectionResult.rejectionReason ?? 'отклонено по вашим критериям';
             itemRejected.push({ id: resultId, url: enrichedItem.url, title: enrichedItem.title, reason });
             await sendRejection(ctx.chatId, sendFn, resultId, enrichedItem.url, enrichedItem.title, reason);
             continue;
@@ -927,7 +936,7 @@ async function execFindItems(
       shownIds.push(resultId);
     } catch (err) {
       console.error(`[find_items] Error processing ${item.url}:`, err);
-      const reason = `processing error: ${err instanceof Error ? err.message : String(err)}`;
+      const reason = `ошибка обработки: ${err instanceof Error ? err.message : String(err)}`;
       itemRejected.push({ id: resultId, url: item.url, title: item.title, reason });
       await sendRejection(ctx.chatId, sendFn, resultId, item.url, item.title, reason);
     }

@@ -292,6 +292,13 @@ export function startScheduler(
               console.error(`[scheduler] AI parse failed:`, parseErr);
             }
 
+            // Always drop listings that aren't a single concrete apartment.
+            if (monitor.type === 'rental' && (parsedData as ParsedRentalData | null)?.isConcreteApartment === false) {
+              console.log(`[scheduler] Drop "${listing.title}": не конкретная квартира`);
+              markListingSeen(monitor.id, listing.platform, listing.platformId, listing.url, listing.title, listing.price);
+              continue;
+            }
+
             // Cache the full listing so chat-side show_listing / get_listing can recall it.
             // No resultId here — monitor deliveries don't go through the chat result-ID flow.
             try {

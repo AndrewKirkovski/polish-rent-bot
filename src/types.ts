@@ -76,6 +76,7 @@ export interface ParsedRentalData {
   adminFeeIncludes: string | null;
   tenantPays: string | null;
   addressHint: string | null;
+  isConcreteApartment: boolean | null;
   estimatedMedia: {
     water: number | null;
     electricity: number | null;

@@ -37,6 +37,7 @@ CRITICAL fields to extract from the description:
 - What's included in czynsz: often includes heating, garbage, water — extract this into adminFeeIncludes
 - What tenant pays separately: gas, electricity, internet — extract this into tenantPays
 - addressHint: the exact street/ulica (with building number if present) or a precise landmark from the description, for map geolocation. OLX hides the street in its API, but the description often names it. Null if nothing specific.
+- isConcreteApartment: TRUE if this is ONE specific, real apartment offered for rent. Set FALSE when it is NOT a single concrete unit — e.g. an agency/portfolio post advertising many or "various" apartments, an investment / new-development sale, a price RANGE ("od X zł", "od ... do ..."), a generic "we have flats, call us" ad, or an obvious placeholder/scam. The app immediately discards anything where this is false.
 
 DEEP analysis to produce:
 - Translate and summarize the entire description into Russian — preserve ALL useful details
@@ -62,6 +63,7 @@ Return ONLY valid JSON (no markdown fences):
     "heating": number or null
   },
   "addressHint": "exact street/ulica + number or a clear landmark from the description, or null",
+  "isConcreteApartment": true | false,
   "totalMonthlyCost": number or null,
   "totalBreakdown": "e.g. 2000 rent + 544 czynsz + ~200 utilities = ~2744 PLN",
   "contractType": "najem_okazjonalny" | "najem_zwykly" | "najem_instytucjonalny" | null,
@@ -288,6 +290,7 @@ CRITICAL RULES:
 
 Return ONLY valid JSON (no markdown fences):
 {"rejected": true/false, "rejectionReason": "reason string or null"}
+The rejectionReason MUST be written in Russian, short (e.g. "первый этаж", "только агентство").
 Set rejected=true ONLY if the listing clearly violates a criterion.
 If the listing passes or info is unclear, set rejected=false and rejectionReason=null.`;
 

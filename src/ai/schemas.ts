@@ -14,6 +14,7 @@ export const ParsedRentalDataSchema = z.looseObject({
   adminFeeIncludes: z.string().nullable().default(null),
   tenantPays: z.string().nullable().default(null),
   addressHint: z.string().nullable().default(null),
+  isConcreteApartment: z.boolean().nullable().default(true),
   estimatedMedia: z.object({
     water: z.number().nullable().default(null),
     electricity: z.number().nullable().default(null),
