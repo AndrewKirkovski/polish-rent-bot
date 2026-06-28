@@ -3,14 +3,15 @@
 import type { Tool } from '@anthropic-ai/sdk/resources/messages.js';
 import { customAlphabet } from 'nanoid';
 
-import { searchOlx, fetchOlxPhone, OLX_CATEGORIES, OLX_CITIES, OLX_DISTRICTS } from '../crawlers/olx.js';
 import { searchItems, fetchItemPhone } from '../crawlers/olx-items.js';
 import type { ItemListing } from '../crawlers/olx-items.js';
-import { searchOtodom, fetchOtodomDetail } from '../crawlers/otodom.js';
 import { parseRentalListing, parseItemListing, evaluateRejection } from './parse-listing.js';
 import { scoreLocation } from './maps.js';
 import type { AmenityPreference } from './maps.js';
-import { formatRichRentalNotification, formatRichItemNotification, splitMessage } from '../bot/format.js';
+import { formatRichRentalNotification, formatRichItemNotification, splitMessage, captionLength } from '../bot/format.js';
+import { searchRentalListings, CITY_PROVINCE_MAP, resolveCityId } from '../search/rental-search.js';
+import { enrichRentalListing } from '../search/enrich-listing.js';
+import { checkAmenityGate, resolveStrictAmenities } from '../search/amenity-gate.js';
 import {
   addMonitor,
   getMonitors,
@@ -21,6 +22,7 @@ import {
   cacheListing,
   getCachedListingByResultId,
   getParsedListing,
+  getAuthorizedTelegramIds,
 } from '../storage/db.js';
 import type { Listing, ParsedRentalData, ParsedItemData, LocationScore } from '../types.js';
 import { computeRentalCost } from '../cost.js';
@@ -59,33 +61,20 @@ export function getOrCreateContext(userId: number, chatId: number): UserContext 
   return ctx;
 }
 
-// ---------------------------------------------------------------------------
-// City name -> OLX city ID mapping
-// ---------------------------------------------------------------------------
+function seedResultForFamily(ctx: UserContext, resultId: string, listing: Listing | ItemListing): void {
+  ctx.resultMap.set(resultId, listing);
+  for (const uid of getAuthorizedTelegramIds()) {
+    if (uid === ctx.userId) continue;
+    getOrCreateContext(uid, uid).resultMap.set(resultId, listing);
+  }
+}
 
-const CITY_ID_MAP: Record<string, number> = {
-  warszawa: OLX_CITIES.WARSZAWA,
-  krakow: OLX_CITIES.KRAKOW,
-  wroclaw: OLX_CITIES.WROCLAW,
-  gdansk: OLX_CITIES.GDANSK,
-  poznan: OLX_CITIES.POZNAN,
-  lodz: OLX_CITIES.LODZ,
-  katowice: OLX_CITIES.KATOWICE,
-};
-
-// City -> default province for Otodom
-const CITY_PROVINCE_MAP: Record<string, string> = {
-  warszawa: 'mazowieckie',
-  krakow: 'malopolskie',
-  wroclaw: 'dolnoslaskie',
-  gdansk: 'pomorskie',
-  poznan: 'wielkopolskie',
-  lodz: 'lodzkie',
-  katowice: 'slaskie',
-};
-
-function resolveCityId(name: string): number | undefined {
-  return CITY_ID_MAP[name.toLowerCase().trim()];
+function seedSearchResultsForFamily(ctx: UserContext, listings: (Listing | ItemListing)[]): void {
+  ctx.lastSearchResults = listings;
+  for (const uid of getAuthorizedTelegramIds()) {
+    if (uid === ctx.userId) continue;
+    getOrCreateContext(uid, uid).lastSearchResults = listings;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -173,6 +162,10 @@ export const TOOL_DEFINITIONS: Tool[] = [
           type: 'string',
           description: 'Free-text criteria for rejecting listings. The AI will evaluate each listing against this. E.g. "no ground floor", "must have balcony", "exclude agencies"',
         },
+        strictAmenities: {
+          type: 'boolean',
+          description: 'If true, hard-reject listings where metro/tram/bus are beyond maxMinutes walking distance. Default: score only on card. Set true when user asks for strict walking distance (e.g. "really 5 min walk to metro").',
+        },
       },
       required: ['city'],
     },
@@ -253,6 +246,10 @@ export const TOOL_DEFINITIONS: Tool[] = [
           type: 'string',
           description: 'Free-text criteria for rejecting listings. The AI will evaluate each listing against this.',
         },
+        strictAmenities: {
+          type: 'boolean',
+          description: 'Hard-reject when metro/tram/bus exceed maxMinutes walking. Persisted in monitor config.',
+        },
         // Item search params
         query: { type: 'string', description: 'Search keywords (for item monitors)' },
         mandatoryKeywords: {
@@ -298,7 +295,7 @@ export const TOOL_DEFINITIONS: Tool[] = [
   // ---- 6. list_monitors ----
   {
     name: 'list_monitors',
-    description: 'List all active monitors for the current user, showing their config and how many listings have been seen.',
+    description: 'List all active family monitors with config and seen counts.',
     input_schema: {
       type: 'object' as const,
       properties: {},
@@ -349,14 +346,14 @@ async function sendRejection(
   chatId: number,
   sendFn: SendFn,
   resultId: string,
-  url: string,
+  _url: string,
   title: string,
   reason: string,
 ): Promise<void> {
   try {
     await sendFn(
       chatId,
-      `❌ [<b>${resultId}</b>] <a href="${url}">${escHtml(title.slice(0, 60))}</a> — ${escHtml(reason)}`,
+      `❌ [<b>${resultId}</b>] ${escHtml(title.slice(0, 50))} — ${escHtml(reason)}`,
       { parse_mode: 'HTML' },
     );
   } catch (e) { console.error('[tools] rejection send failed:', e instanceof Error ? e.message : e); }
@@ -378,9 +375,9 @@ async function sendRentalCard(
   );
   const card = `<b>[${resultId}]</b>\n${rawCard}`;
 
-  if (rawCard.length <= CAPTION_LIMIT && listing.photos.length > 0) {
+  if (listing.photos.length > 0) {
     const caption = `[${resultId}] ${rawCard}`;
-    if (caption.length <= CAPTION_LIMIT) {
+    if (captionLength(caption) <= CAPTION_LIMIT) {
       try {
         await sendPhotosFn(chatId, listing.photos.slice(0, 10), caption);
         return;
@@ -486,144 +483,29 @@ async function execFindRentals(
   const maxResults = Math.min(Math.max((input.maxResults as number) || 5, 1), 10);
   const contractPreference = input.contractPreference as string | undefined;
   const rejectionCriteria = input.rejectionCriteria as string | undefined;
+  const strictAmenities = resolveStrictAmenities(input.strictAmenities as boolean | undefined);
 
-  console.log(`[find_rentals] Params: city=${city}, districts=${districts.join(',')}, rooms=${roomsFrom}-${roomsTo}, priceTo=${priceTo}, rejection=${rejectionCriteria ?? 'none'}`);
+  console.log(`[find_rentals] Params: city=${city}, districts=${districts.join(',')}, rooms=${roomsFrom}-${roomsTo}, priceTo=${priceTo}, rejection=${rejectionCriteria ?? 'none'}, strictAmenities=${strictAmenities}`);
 
   const doOlx = platformsInput === 'olx' || platformsInput === 'all';
   const doOtodom = platformsInput === 'otodom' || platformsInput === 'all';
 
-  // ---- Step A: Search OLX + Otodom in parallel ----
-  const searchPromises: Promise<Listing[]>[] = [];
-
-  // Strip diacritics helper for URL-safe district names
-  const stripDiacritics = (s: string) => s.toLowerCase().trim()
-    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
-    .replace(/ł/g, 'l');
-
-  if (doOlx) {
-    const cityId = resolveCityId(city);
-
-    // Resolve OLX district ID from first district name
-    let olxDistrictId: number | undefined;
-    if (districts.length > 0 && city) {
-      const cityDistricts = OLX_DISTRICTS[stripDiacritics(city)];
-      if (cityDistricts) olxDistrictId = cityDistricts[stripDiacritics(districts[0])];
-    }
-
-    // Don't pass priceTo to OLX — user budget is TOTAL but API filters RENT only.
-    // Don't pre-filter price at all — let AI parse determine total and filter after.
-    // Fetch multiple pages to get enough results.
-    searchPromises.push(
-      (async () => {
-        const page1 = await searchOlx({
-          categoryId: OLX_CATEGORIES.MIESZKANIA_WYNAJEM,
-          cityId,
-          rooms: roomsFrom,
-          districtId: olxDistrictId,
-          limit: 40,
-        });
-        const results = [...page1.listings];
-        // Fetch page 2 if available — wrapped so page 1 results survive if page 2 fails
-        if (page1.hasNextPage) {
-          try {
-            const page2 = await searchOlx({
-              categoryId: OLX_CATEGORIES.MIESZKANIA_WYNAJEM,
-              cityId,
-              rooms: roomsFrom,
-              districtId: olxDistrictId,
-              limit: 40,
-              offset: 40,
-            });
-            results.push(...page2.listings);
-          } catch (e) { console.error('[find_rentals] OLX page 2 failed:', e instanceof Error ? e.message : e); }
-        }
-        return results;
-      })(),
-    );
-  }
-
-  if (doOtodom) {
-    // If districts are specified, search each district. Otherwise search the city.
-    const districtList = districts.length > 0 ? districts : [undefined];
-    for (const district of districtList) {
-      searchPromises.push(
-        searchOtodom({
-          type: 'wynajem',
-          estate: 'mieszkanie',
-          province,
-          city: city || undefined,
-          district: district ? stripDiacritics(district) : undefined, // URL-safe, no diacritics
-          priceFrom,
-          priceTo, // Otodom filters on advertised price, close enough
-          areaFrom,
-          areaTo,
-          roomsFrom,
-          roomsTo,
-          ownerType: (ownerType as 'ALL' | 'PRIVATE' | 'AGENCY') ?? undefined,
-          limit: 36,
-        }).then((r) => r.listings),
-      );
-    }
-  }
-
-  const searchResults = await Promise.allSettled(searchPromises);
-  const allListings = searchResults
-    .filter((r): r is PromiseFulfilledResult<Listing[]> => r.status === 'fulfilled')
-    .flatMap(r => r.value);
-
-  const failedSearches = searchResults.filter(r => r.status === 'rejected');
-  if (failedSearches.length > 0) {
-    console.error('[find_rentals] Some searches failed:', failedSearches.map(r => (r as PromiseRejectedResult).reason));
-  }
-
-  console.log(`[find_rentals] Search results: ${allListings.length} total (OLX: ${doOlx}, Otodom: ${doOtodom})`);
-
-  // ---- Filter by rooms/area (for OLX which doesn't filter well) ----
-  let filtered = allListings;
-  if (roomsFrom != null) {
-    filtered = filtered.filter((l) => l.rooms == null || l.rooms >= roomsFrom);
-  }
-  if (roomsTo != null) {
-    filtered = filtered.filter((l) => l.rooms == null || l.rooms <= roomsTo);
-  }
-  if (areaFrom != null) {
-    filtered = filtered.filter((l) => l.area == null || l.area >= areaFrom);
-  }
-  if (areaTo != null) {
-    filtered = filtered.filter((l) => l.area == null || l.area <= areaTo);
-  }
-
-  // Filter by district — use substring matching, normalize diacritics
-  if (districts.length > 0) {
-    const normalize = (s: string) => s.toLowerCase().trim()
-      .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
-      .replace(/ł/g, 'l');
-    const normalizedDistricts = districts.map(normalize);
-    filtered = filtered.filter((l) => {
-      if (!l.district) return true; // keep listings without district info
-      const nd = normalize(l.district);
-      // Substring match: "stary mokotow" contains "mokotow"
-      return normalizedDistricts.some(d => nd.includes(d) || d.includes(nd));
-    });
-  }
-
-  // Deduplicate by platformId + platform
-  const seen = new Set<string>();
-  const deduped: Listing[] = [];
-  for (const l of filtered) {
-    const key = `${l.platform}:${l.platformId}`;
-    if (!seen.has(key)) {
-      seen.add(key);
-      deduped.push(l);
-    }
-  }
-
-  // Sort by newest first (most relevant for monitoring new listings)
-  deduped.sort((a, b) => {
-    const ta = new Date(a.createdAt || 0).getTime();
-    const tb = new Date(b.createdAt || 0).getTime();
-    return tb - ta; // newest first
+  const deduped = await searchRentalListings({
+    city,
+    districts,
+    province,
+    roomsFrom,
+    roomsTo,
+    areaFrom,
+    areaTo,
+    priceFrom,
+    priceTo,
+    ownerType: ownerType as 'ALL' | 'PRIVATE' | 'AGENCY' | undefined,
+    platforms: platformsInput as 'olx' | 'otodom' | 'all',
+    olxMaxPages: 2,
   });
+
+  console.log(`[find_rentals] Search results: ${deduped.length} total (OLX: ${doOlx}, Otodom: ${doOtodom})`);
 
   if (deduped.length === 0) {
     return `No rental listings found matching your criteria. I searched ${doOlx ? 'OLX' : ''}${doOlx && doOtodom ? ' + ' : ''}${doOtodom ? 'Otodom' : ''} for ${roomsFrom ?? 'any'}-room apartments in ${city}${districts.length ? ' (' + districts.join(', ') + ')' : ''}. Try broadening the search (more districts, relax room count, or add more platforms).`;
@@ -634,8 +516,7 @@ async function execFindRentals(
   const candidateCount = debugLimit > 0 ? Math.min(deduped.length, debugLimit) : Math.min(deduped.length, 25);
   const searchId = genId();
   ctx.lastSearchId = searchId;
-  // Don't clear resultMap — old IDs stay resolvable across searches
-  try { await sendFn(ctx.chatId, `Found ${deduped.length} listings. Analyzing top ${candidateCount}\u2026 Results will appear as they\u2019re ready. [search <b>${searchId}</b>]`, { parse_mode: 'HTML' }); } catch (e) { console.error('[tools] send failed:', e instanceof Error ? e.message : e); }
+  try { await sendFn(ctx.chatId, `${deduped.length} найдено, анализ ${candidateCount}… [${searchId}]`, { parse_mode: undefined }); } catch (e) { console.error('[tools] send failed:', e instanceof Error ? e.message : e); }
 
   // ---- Step C: Analyze candidates and STREAM results to user ----
   const candidates = deduped.slice(0, candidateCount);
@@ -644,6 +525,7 @@ async function execFindRentals(
   const rejected: RejectionReason[] = [];
 
   ctx.lastSearchResults = candidates;
+  seedSearchResultsForFamily(ctx, candidates);
 
   let actualAnalyzed = 0;
   for (let i = 0; i < candidates.length; i++) {
@@ -658,22 +540,9 @@ async function execFindRentals(
     const resultId = genId();
 
     try {
-      // Fetch detail page for richer data
+      // Fetch detail page / phone for richer data
       console.log(`[find_rentals] ${i + 1}/${candidateCount}: ${listing.platform} "${listing.title.slice(0, 50)}"`);
-      let enrichedListing = listing;
-      if (listing.platform === 'otodom') {
-        try {
-          const detail = await fetchOtodomDetail(listing.url);
-          if (detail) enrichedListing = detail;
-        } catch (detailErr) {
-          console.error(`[find_rentals] Detail fetch failed, using search data:`, detailErr);
-        }
-      } else if (listing.platform === 'olx' && !listing.phone) {
-        try {
-          const phone = await fetchOlxPhone(listing.platformId);
-          if (phone) enrichedListing = { ...listing, phone };
-        } catch (e) { console.warn(`[find_rentals] Phone fetch failed for ${listing.platformId}:`, e instanceof Error ? e.message : e); }
-      }
+      const enrichedListing = await enrichRentalListing(listing);
 
       // Cache the enriched Listing immediately so show_listing / get_listing
       // can recall it later — including rejected ones.
@@ -688,7 +557,7 @@ async function execFindRentals(
       } catch (cacheErr) {
         console.error('[find_rentals] cacheListing failed:', cacheErr instanceof Error ? cacheErr.message : cacheErr);
       }
-      ctx.resultMap.set(resultId, enrichedListing);
+      seedResultForFamily(ctx, resultId, enrichedListing);
 
       // AI extraction — best effort, don't block on failure
       let parsedData: ParsedRentalData | null = null;
@@ -777,6 +646,23 @@ async function execFindRentals(
         }
       }
 
+      const amenityPrefs: AmenityPreference[] = amenities.map((a) => ({
+        type: a.type,
+        maxMinutes: a.maxMinutes,
+      }));
+      const gate = checkAmenityGate(
+        locationScore,
+        amenityPrefs,
+        locationScore?.precision,
+        strictAmenities,
+      );
+      if (!gate.pass) {
+        const reason = gate.reason ?? 'не прошло фильтр метро/трамвая';
+        rejected.push({ id: resultId, url: enrichedListing.url, title: enrichedListing.title, reason });
+        await sendRejection(ctx.chatId, sendFn, resultId, enrichedListing.url, enrichedListing.title, reason);
+        continue;
+      }
+
       // ---- STREAM: send card to user immediately ----
       await sendRentalCard(ctx.chatId, sendFn, sendPhotosFn, resultId, enrichedListing, parsedData, locationScore);
       accepted.push(enrichedListing);
@@ -794,14 +680,15 @@ async function execFindRentals(
     const rejectionSummary = rejected.length > 0
       ? `\nRejection reasons:\n${rejected.map((r) => `- ${r.title}: ${r.reason}`).join('\n')}`
       : '';
-    return `Analyzed ${candidateCount} listings but none passed the filters.${rejectionSummary}\nTry increasing the budget, relaxing amenity requirements, or broadening the search area.`;
+    return `Analyzed ${candidateCount} listings but none passed the filters.${rejectionSummary}\nTry increasing the budget, ${strictAmenities ? 'расширьте радиус метро' : 'broaden the search area'}.`;
   }
 
   // Send a brief "done" summary
-  try { await sendFn(ctx.chatId, `Done [${searchId}]: showed ${accepted.length}, rejected ${rejected.length}.`, { parse_mode: undefined }); } catch (e) { console.error('[tools] send failed:', e instanceof Error ? e.message : e); }
+  try { await sendFn(ctx.chatId, `Готово [${searchId}]: ${accepted.length} показано, ${rejected.length} отклонено.`, { parse_mode: undefined }); } catch (e) { console.error('[tools] send failed:', e instanceof Error ? e.message : e); }
 
   // Update context
   ctx.lastSearchResults = accepted;
+  seedSearchResultsForFamily(ctx, accepted);
   if (accepted.length > 0) {
     ctx.lastDetailListing = accepted[0];
   }
@@ -863,12 +750,13 @@ async function execFindItems(
   const candidateLimit = debugLimit > 0 ? Math.min(filteredItems.length, debugLimit) : maxResults * 2;
   const candidates = filteredItems.slice(0, candidateLimit); // get extra for potential filtering
   ctx.lastSearchResults = candidates;
+  seedSearchResultsForFamily(ctx, candidates);
 
   const displayTotal = mandatoryKeywords.length > 0 ? filteredItems.length : result.totalAvailable;
   const searchId = genId();
   ctx.lastSearchId = searchId;
   // Don't clear resultMap — old IDs stay resolvable across searches
-  try { await sendFn(ctx.chatId, `Found ${displayTotal} items${mandatoryKeywords.length > 0 ? ` (filtered from ${result.totalAvailable})` : ''}. Results will appear as they\u2019re ready. [search <b>${searchId}</b>]`, { parse_mode: 'HTML' }); } catch (e) { console.error('[tools] send failed:', e instanceof Error ? e.message : e); }
+  try { await sendFn(ctx.chatId, `${displayTotal} найдено… [${searchId}]`, { parse_mode: undefined }); } catch (e) { console.error('[tools] send failed:', e instanceof Error ? e.message : e); }
 
   const shown: ItemListing[] = [];
   const shownIds: string[] = [];
@@ -903,7 +791,7 @@ async function execFindItems(
       } catch (cacheErr) {
         console.error('[find_items] cacheListing failed:', cacheErr instanceof Error ? cacheErr.message : cacheErr);
       }
-      ctx.resultMap.set(resultId, enrichedItem);
+      seedResultForFamily(ctx, resultId, enrichedItem);
 
       // AI condition analysis
       let parsedData: ParsedItemData | null = null;
@@ -943,9 +831,10 @@ async function execFindItems(
   }
 
   // Done summary
-  try { await sendFn(ctx.chatId, `Done [${searchId}]: showed ${shown.length}, rejected ${itemRejected.length}.`, { parse_mode: undefined }); } catch (e) { console.error('[tools] send failed:', e instanceof Error ? e.message : e); }
+  try { await sendFn(ctx.chatId, `Готово [${searchId}]: ${shown.length} показано.`, { parse_mode: undefined }); } catch (e) { console.error('[tools] send failed:', e instanceof Error ? e.message : e); }
 
   ctx.lastSearchResults = shown;
+  seedSearchResultsForFamily(ctx, shown);
 
   const itemRejectionBreakdown = itemRejected.length > 0
     ? `\nRejected ${itemRejected.length}: ${itemRejected.map((r) => r.reason).join('; ')}`
@@ -973,7 +862,7 @@ async function execCreateMonitor(
     'city', 'districts', 'province', 'priceFrom', 'priceTo',
     'roomsFrom', 'roomsTo', 'areaFrom', 'areaTo', 'ownerType',
     'query', 'mandatoryKeywords', 'workAddress', 'commuteMode', 'amenities',
-    'contractPreference', 'platforms', 'rejectionCriteria',
+    'contractPreference', 'platforms', 'rejectionCriteria', 'strictAmenities', 'limit',
   ];
   for (const key of configKeys) {
     if (input[key] !== undefined && input[key] !== null) {
@@ -1006,7 +895,7 @@ async function execCreateMonitor(
       }
     }
   }
-  details.push('\nI will notify you when new matching listings appear.');
+  details.push('\nСемья будет получать уведомления о новых объявлениях.');
 
   return details.join('\n');
 }
@@ -1017,7 +906,7 @@ async function execCreateMonitor(
 
 async function execUpdateMonitor(
   input: Record<string, unknown>,
-  context: UserContext,
+  _context: UserContext,
 ): Promise<string> {
   const monitorId = input.monitorId as number;
   const updates = input.updates as Record<string, unknown> | undefined;
@@ -1027,7 +916,7 @@ async function execUpdateMonitor(
 
   const monitor = getMonitor(monitorId);
   if (!monitor) return `Monitor #${monitorId} not found.`;
-  if (monitor.user_id !== context.userId) return `Monitor #${monitorId} doesn't belong to you.`;
+  // No ownership check — all members share one household; anyone can manage any monitor.
   if (!monitor.active) return `Monitor #${monitorId} is inactive. Create a new one instead.`;
 
   // Merge updates into existing config
@@ -1045,14 +934,14 @@ async function execUpdateMonitor(
 
 async function execDeleteMonitor(
   input: Record<string, unknown>,
-  context: UserContext,
+  _context: UserContext,
 ): Promise<string> {
   const monitorId = input.monitorId as number;
   if (!monitorId) return 'monitorId is required.';
 
   const monitor = getMonitor(monitorId);
   if (!monitor) return `Monitor #${monitorId} not found.`;
-  if (monitor.user_id !== context.userId) return `Monitor #${monitorId} doesn't belong to you.`;
+  // No ownership check — household model: any member can delete any monitor.
 
   deactivateMonitor(monitorId);
   return `Monitor #${monitorId} has been deactivated. You will no longer receive notifications for it.`;
@@ -1063,22 +952,22 @@ async function execDeleteMonitor(
 // ---------------------------------------------------------------------------
 
 async function execListMonitors(
-  ctx: UserContext,
+  _ctx: UserContext,
 ): Promise<string> {
-  const monitors = getMonitors(ctx.userId);
+  const monitors = getMonitors();
 
   if (monitors.length === 0) {
-    return 'You have no active monitors. I can create one for you if you\'d like to be notified about new listings.';
+    return 'No active monitors. I can create one if you want ongoing alerts.';
   }
 
-  const lines: string[] = [`You have ${monitors.length} active monitor(s):\n`];
+  const lines: string[] = [`Active monitors (${monitors.length}):\n`];
 
   for (const m of monitors) {
     const seenCount = getSeenCount(m.id);
     const config = JSON.parse(m.config) as Record<string, unknown>;
     const parts: string[] = [];
 
-    parts.push(`Monitor #${m.id} (${m.type}, ${m.platform})`);
+    parts.push(`Monitor #${m.id} (${m.type}, ${m.platform}, user ${m.user_id})`);
     if (config.city) parts.push(`  City: ${config.city}`);
     if (config.districts) parts.push(`  Districts: ${(config.districts as string[]).join(', ')}`);
     if (config.query) parts.push(`  Query: "${config.query}"`);
@@ -1091,6 +980,7 @@ async function execListMonitors(
     if (config.workAddress) parts.push(`  Commute to: ${config.workAddress}`);
     if (config.contractPreference) parts.push(`  Contract: ${config.contractPreference}`);
     if (config.rejectionCriteria) parts.push(`  Rejection criteria: "${config.rejectionCriteria}"`);
+    if (config.strictAmenities) parts.push(`  Strict walking amenities: yes`);
     if (config.mandatoryKeywords) parts.push(`  Mandatory keywords: ${(config.mandatoryKeywords as string[]).join(', ')}`);
     parts.push(`  Listings seen: ${seenCount}`);
     parts.push(`  Created: ${m.created_at}`);

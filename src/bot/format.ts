@@ -42,6 +42,28 @@ function trunc(text: string, max: number): string {
   return text.slice(0, max - 1).trimEnd() + '\u2026';
 }
 
+/** Visible length as Telegram counts it for caption limits: HTML tags don't count,
+ *  but a custom emoji counts as its fallback character(s). Used to decide whether a
+ *  card fits the 1024-char photo-caption budget and to drive the safety-trim. */
+function visibleText(html: string): string {
+  return html
+    .replace(/<tg-emoji[^>]*>([^<]*)<\/tg-emoji>/g, '$1') // keep the fallback emoji
+    .replace(/<a\b[^>]*>([\s\S]*?)<\/a>/g, '$1')          // keep anchor text, drop href
+    .replace(/<[^>]+>/g, '');                              // strip remaining tags
+}
+
+export function captionLength(html: string): number {
+  return visibleText(html).length;
+}
+
+/** Telegram photo-caption limit. */
+export const CAPTION_LIMIT = 1024;
+
+/** Escape `&` so a raw URL is a valid HTML attribute value (Telegram HTML parse_mode). */
+function escAttr(url: string): string {
+  return url.replace(/&/g, '&amp;');
+}
+
 /** Split text into chunks that fit Telegram's 4096 char limit.
  *  Each chunk is passed through sanitize-html to repair any broken HTML from the split. */
 export function splitMessage(text: string, limit = 3500): string[] {
@@ -112,122 +134,100 @@ export function formatRentalCard(
   parsed: ParsedRentalData | null | undefined,
   locationScore: LocationScore | null | undefined,
 ): string {
-  const lines: string[] = [];
-
-  // ---- ИТОГО — всегда первой строкой (считаем в коде, не доверяем арифметике LLM) ----
   const cost = computeRentalCost(listing, parsed);
   const num = (n: number) => n.toLocaleString('pl-PL');
   const zl = (n: number) => `${num(n)} zł`;
-  lines.push(`<b>${CE.price} ИТОГО: ~${zl(cost.total)}/мес</b>`);
 
-  // Заголовок
-  lines.push(`${CE.house} ${esc(listing.title)}`);
-  lines.push(listing.url);
-  lines.push('');
+  // --- Essential lines (never dropped) ---
+  const breakdown = cost.czynsz > 0 || cost.mediaSum > 0
+    ? ` (${num(cost.najem)}+${num(cost.czynsz)}${cost.mediaSum > 0 ? `+~${num(cost.mediaSum)}` : ''})`
+    : '';
+  const priceLine = `<b>${CE.price} ~${zl(cost.total)}/мес</b>${breakdown}`;
+  const titleLine = `${CE.house} ${esc(listing.title.slice(0, 80))}`;
+  const urlLine = listing.url;
 
-  // Краткое AI-резюме
-  if (parsed?.descriptionSummary) {
-    lines.push(`${CE.thinking} ${esc(trunc(parsed.descriptionSummary, 400))}`);
-    lines.push('');
-  }
-
-  // Стоимость — одной строкой
-  const costParts = [`Аренда ${num(cost.najem)}`];
-  if (cost.czynsz > 0) costParts.push(`czynsz ${num(cost.czynsz)}`);
-  if (cost.mediaSum > 0) costParts.push(`~${num(cost.mediaSum)} коммун.`);
-  const costStr = costParts.length > 1 ? `${costParts.join(' + ')} = ${zl(cost.total)}` : zl(cost.najem);
-  lines.push(`${CE.costBreak} ${costStr}`);
-
-  // Kaucja + тип договора — одной строкой
   const payLine: string[] = [];
   if (parsed?.depositNote) payLine.push(`Kaucja: ${esc(parsed.depositNote)}`);
   else if (parsed?.deposit != null) payLine.push(`Kaucja: ${zl(parsed.deposit)}`);
-  else if (listing.deposit != null) payLine.push(`Kaucja: ${zl(listing.deposit)}`);
-  else payLine.push(`Kaucja: ${CE.warning} не указана`);
-  if (parsed?.contractType) payLine.push(`Договор: ${esc(parsed.contractType.replace(/_/g, ' '))}`);
-  lines.push(payLine.join(' · '));
-  lines.push('');
+  else payLine.push(`Kaucja: ${CE.warning} ?`);
+  if (parsed?.contractType) payLine.push(esc(parsed.contractType.replace(/_/g, ' ')));
+  const payLineStr = payLine.join(' · ');
 
-  // Квартира — одной строкой
-  const apt: string[] = [];
-  if (listing.rooms != null) apt.push(`${listing.rooms} комн`);
-  if (listing.area != null) apt.push(`${listing.area} m²`);
-  if (listing.floor != null) apt.push(`${listing.floor} эт`);
-  if (parsed?.furnished) apt.push(`мебель: ${parsed.furnished}`);
-  apt.push(`питомцы ${ceYn(parsed?.petFriendly)}`);
-  apt.push(`курение ${ceYn(parsed?.smokingAllowed)}`);
-  if (parsed?.parkingIncluded != null) apt.push(`парковка ${ceYn(parsed.parkingIncluded)}`);
-  if (parsed?.balcony != null) apt.push(`балкон ${ceYn(parsed.balcony)}`);
-  if (apt.length > 0) lines.push(`${CE.house} ${apt.join(' · ')}`);
-  const restrictionsList = parsed?.restrictions ?? [];
-  if (restrictionsList.length > 0) {
-    lines.push(`${CE.warning} ${restrictionsList.slice(0, 3).map(r => esc(r)).join(', ')}`);
-  }
-  lines.push('');
+  // --- Apartment line; the trailing restriction note is droppable ---
+  const aptBase: string[] = [];
+  if (listing.rooms != null) aptBase.push(`${listing.rooms}к`);
+  if (listing.area != null) aptBase.push(`${listing.area}m²`);
+  if (listing.floor != null) aptBase.push(`${listing.floor}эт`);
+  if (parsed?.furnished) aptBase.push(parsed.furnished);
+  aptBase.push(`🐾${ceYn(parsed?.petFriendly)} 🚬${ceYn(parsed?.smokingAllowed)}`);
+  const restriction = (parsed?.restrictions ?? [])[0];
+  const aptLine = (withRestriction: boolean) =>
+    `${CE.house} ${[...aptBase, ...(withRestriction && restriction ? [esc(restriction)] : [])].join(' · ')}`;
 
-  // Локация — одна строка на удобство (ближайшее место)
+  // --- Location line; the map link is folded into the 🗺 icon (no standalone line) ---
+  let locationLine: string;
   if (locationScore) {
-    const where = listing.district ? `${esc(listing.district)}, ${esc(listing.city)}` : esc(listing.city);
-    const prec = locationScore.precision;
-    const precBadge = prec === 'exact' ? ' · 📍 точно' : prec === 'street' ? ' · 📍 по улице' : prec === 'district' ? ' · 📍 примерно' : '';
-    lines.push(`<b>${CE.location} ЛОКАЦИЯ ${locationScore.overallScore}/100</b> — ${where}${precBadge}`);
-    const ruLabel: Record<string, string> = {
-      metro: 'метро', tram: 'трамвай', bus: 'автобус', airport: 'аэропорт',
-      groceries: 'продукты', supermarket: 'супермаркет', gym: 'зал',
-      pool: 'бассейн', pharmacy: 'аптека', park: 'парк',
-    };
-    const icons: Record<string, string> = {
-      metro: '🚇', tram: '🚋', bus: '🚌',
-      airport: '✈️', groceries: '🛒',
-      gym: CE.gym, pool: CE.pool, pharmacy: CE.pharmacy,
-      supermarket: '🛒', park: '🌳',
-    };
-    for (const a of locationScore.amenities) {
-      const icon = icons[a.type] ?? CE.location;
-      const label = ruLabel[a.type] ?? esc(a.type);
-      const mark = a.withinLimit ? CE.yes : CE.warning;
-      if (a.places.length > 0) {
-        const p = a.places[0];
-        const parts: string[] = [esc(p.name)];
-        if (p.walkingMinutes >= 0) parts.push(`${p.walkingMinutes} мин`);
-        if (p.frequencyMinutes) {
-          parts.push(`${p.lineName ? esc(p.lineName) + ' ' : ''}~${p.frequencyMinutes} мин`);
-        } else if (p.transitMinutes) {
-          parts.push(`${p.transitMinutes} мин транзит`);
-        }
-        lines.push(`${icon} ${label} ${mark} ${parts.join(' — ')}`);
-      } else {
-        lines.push(`${icon} ${label} ${CE.warning} рядом нет`);
-      }
-    }
-    if (locationScore.commute) {
-      lines.push(`→ ${esc(locationScore.commute.duration)} до работы`);
-    }
-    lines.push(locationScore.mapsLink);
+    const icons: Record<string, string> = { metro: '🚇', tram: '🚋', bus: '🚌', groceries: '🛒', gym: CE.gym };
+    const amenParts = locationScore.amenities.map((a) => {
+      const icon = icons[a.type] ?? '·';
+      const mark = a.withinLimit ? '✓' : '✗';
+      const p = a.places[0];
+      const mins = p && p.walkingMinutes >= 0 ? `${p.walkingMinutes}m` : '?';
+      return `${icon}${mins}${mark}`;
+    });
+    // Fold the map link into the place name (no standalone URL line). Plain text inside
+    // <a> is safe; avoid nesting a <tg-emoji> in the anchor.
+    const where = listing.district ? esc(listing.district) : esc(listing.city);
+    const whereLinked = `<a href="${escAttr(locationScore.mapsLink)}">${where}</a>`;
+    const commute = locationScore.commute ? ` →${esc(locationScore.commute.duration)}` : '';
+    locationLine = `${CE.location} ${locationScore.overallScore} · ${amenParts.join(' ')}${commute} · ${whereLinked}`;
   } else {
-    lines.push(`${CE.location} ${listing.district ? esc(listing.district) + ', ' : ''}${esc(listing.city)}`);
-    if (listing.lat && listing.lng) lines.push(`https://www.google.com/maps?q=${listing.lat},${listing.lng}`);
-  }
-  lines.push('');
-
-  // Плюсы / минусы (кратко, до 3)
-  const positives = (parsed?.positives ?? []).slice(0, 3);
-  if (positives.length > 0) {
-    lines.push(`${CE.pros} ${positives.map(p => esc(p)).join(', ')}`);
-  }
-  const redFlags = (parsed?.redFlags ?? []).slice(0, 3);
-  if (redFlags.length > 0) {
-    lines.push(`${CE.cons} ${redFlags.map(f => esc(f)).join(', ')}`);
+    locationLine = `${CE.location} ${listing.district ? esc(listing.district) + ', ' : ''}${esc(listing.city)}`;
   }
 
-  // Контакт
-  const contactParts: string[] = [];
-  if (listing.phone) contactParts.push(`${CE.phone} ${esc(listing.phone)}`);
-  if (listing.advertiserType) contactParts.push(esc(listing.advertiserType));
-  if (listing.agencyName) contactParts.push(esc(listing.agencyName));
-  if (contactParts.length > 0) lines.push(contactParts.join(' · '));
+  const contact: string[] = [];
+  if (listing.phone) contact.push(`${CE.phone} ${esc(listing.phone)}`);
+  if (listing.agencyName) contact.push(esc(listing.agencyName));
+  const contactLine = contact.length > 0 ? contact.join(' · ') : null;
 
-  return lines.join('\n');
+  // --- Droppable lines ---
+  const summaryLine = parsed?.descriptionSummary
+    ? `${CE.thinking} ${esc(trunc(parsed.descriptionSummary, 200))}`
+    : null;
+  const positives = (parsed?.positives ?? []).slice(0, 2);
+  const positivesLine = positives.length > 0 ? `${CE.pros} ${positives.map((p) => esc(p)).join(', ')}` : null;
+  const redFlags = (parsed?.redFlags ?? []).slice(0, 2);
+  const redFlagsLine = redFlags.length > 0 ? `${CE.cons} ${redFlags.map((f) => esc(f)).join(', ')}` : null;
+
+  // Assemble with progressively dropped non-essential content so a rich card still
+  // fits the photo-caption budget. Essentials (price/title/url/kaucja/apt/location/contact)
+  // are never dropped. Drop order: summary → positives → restriction note → red flags.
+  const assemble = (drop: { summary?: boolean; positives?: boolean; restriction?: boolean; redFlags?: boolean }): string => {
+    const parts: string[] = [priceLine, titleLine, urlLine];
+    if (!drop.summary && summaryLine) parts.push(summaryLine);
+    parts.push(payLineStr);
+    parts.push(aptLine(!drop.restriction));
+    parts.push(locationLine);
+    if (!drop.positives && positivesLine) parts.push(positivesLine);
+    if (!drop.redFlags && redFlagsLine) parts.push(redFlagsLine);
+    if (contactLine) parts.push(contactLine);
+    return parts.join('\n');
+  };
+
+  // Budget kept below CAPTION_LIMIT to leave room for the interactive path's "[ID] " prefix.
+  const BUDGET = CAPTION_LIMIT - 24;
+  const stages: Array<{ summary?: boolean; positives?: boolean; restriction?: boolean; redFlags?: boolean }> = [
+    {},
+    { summary: true },
+    { summary: true, positives: true },
+    { summary: true, positives: true, restriction: true },
+    { summary: true, positives: true, restriction: true, redFlags: true },
+  ];
+  let card = assemble(stages[0]!);
+  for (let i = 1; i < stages.length && captionLength(card) > BUDGET; i++) {
+    card = assemble(stages[i]!);
+  }
+  return card;
 }
 
 // Backward-compatible alias
@@ -243,57 +243,17 @@ export function formatItemCard(
 ): string {
   const lines: string[] = [];
 
-  // PRICE + CONDITION first (most important info)
-  lines.push(`<b>${CE.price} ${pln(item.price)}${item.negotiable ? ' (negotiable)' : ''}</b>`);
-  if (item.condition) lines.push(`<b>${esc(item.condition)}</b>`);
-  lines.push('');
-
-  // Title + link
-  lines.push(`${esc(item.title)}`);
+  lines.push(`<b>${CE.price} ${pln(item.price)}${item.negotiable ? ' ↕' : ''}</b>${item.condition ? ` · ${esc(item.condition)}` : ''}`);
+  lines.push(`${esc(item.title.slice(0, 80))}`);
   lines.push(item.url);
-  lines.push('');
 
-  // AI assessment
-  if (parsed?.actualCondition) lines.push(`${CE.thinking} ${esc(parsed.actualCondition)}`);
-  if (parsed?.priceAssessment) lines.push(`${CE.fire} ${esc(parsed.priceAssessment)}`);
-  if (parsed?.descriptionSummary) lines.push(`${esc(parsed.descriptionSummary)}`);
-  lines.push('');
+  if (parsed?.actualCondition) lines.push(`${CE.thinking} ${esc(trunc(parsed.actualCondition, 120))}`);
+  const defects = (parsed?.defects ?? []).slice(0, 2);
+  if (defects.length > 0) lines.push(`${CE.warning} ${defects.map((d) => esc(d)).join(', ')}`);
 
-  // Details
-  const defects = parsed?.defects ?? [];
-  if (defects.length > 0) {
-    lines.push(`${CE.warning} Defects: ${defects.map(d => esc(d)).join(', ')}`);
-  }
-  const accessories = parsed?.includedAccessories ?? [];
-  if (accessories.length > 0) {
-    lines.push(`${CE.yes} Includes: ${accessories.map(a => esc(a)).join(', ')}`);
-  }
-  if (parsed?.whySelling) {
-    lines.push(`${CE.doubt} Why selling: ${esc(parsed.whySelling)}`);
-  }
-  if (parsed?.bestFor) {
-    lines.push(`${CE.person} Best for: ${esc(parsed.bestFor)}`);
-  }
-  const itemRedFlags = parsed?.redFlags ?? [];
-  if (itemRedFlags.length > 0) {
-    lines.push(`${CE.cons} ${itemRedFlags.map(f => esc(f)).join(', ')}`);
-  }
-
-  // Params
-  const skipKeys = new Set(['price', 'state']);
-  const paramEntries = Object.entries(item.params).filter(([k]) => !skipKeys.has(k));
-  if (paramEntries.length > 0) {
-    lines.push(`\u2699\uFE0F ${paramEntries.slice(0, 5).map(([k, v]) => `${k}: ${esc(v)}`).join(', ')}`);
-  }
-
-  // Location + shipping + contact
-  lines.push('');
-  const locationParts: string[] = [];
-  if (item.city) locationParts.push(`${CE.location} ${item.district ? esc(item.district) + ', ' : ''}${esc(item.city)}`);
-  locationParts.push(item.shipping ? `\uD83D\uDCE6 Shipping available` : `\uD83D\uDCCD Local pickup only`);
-  lines.push(locationParts.join(' | '));
+  const loc = item.city ? `${item.district ? esc(item.district) + ', ' : ''}${esc(item.city)}` : '';
+  lines.push(`${loc}${loc ? ' · ' : ''}${item.shipping ? '📦' : '📍'}`);
   if (item.phone) lines.push(`${CE.phone} ${esc(item.phone)}`);
-  if (item.contactName) lines.push(`${CE.person} ${esc(item.contactName)}${item.isBusiness ? ' (business)' : ''}`);
 
   return lines.join('\n');
 }

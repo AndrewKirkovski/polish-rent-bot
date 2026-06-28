@@ -33,6 +33,12 @@ BOT_PASSWORD=
 
 # SQLite database path (mapped via Docker volume)
 DB_PATH=/app/data/db.sqlite
+
+# Optional: hard-reject metro/tram/bus beyond walking limit (default off)
+# STRICT_WALKING_AMENITIES=false
+
+# Cross-platform dedup OLX+Otodom (default on)
+# LISTING_DEDUP_ENABLED=true
 ENVEOF
   echo "    Created .env template. Fill in your values before starting."
 else

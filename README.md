@@ -65,7 +65,33 @@ npx tsx src/experiments/test-allegro.ts
 
 Open the displayed URL in your browser, enter the code. Token is saved and auto-refreshes.
 
-## Deployment
+## Deployment (Revo server)
+
+Runs on Docker at `/opt/polish-rent-bot` on the Revo home server.
+
+**Automatic:** push to `main` → GitHub Actions builds `ghcr.io/andrewkirkovski/polish-rent-bot:latest` → Watchtower on Revo recreates the container.
+
+**Manual pull on Revo:**
+
+```bash
+cd /opt/polish-rent-bot
+docker compose pull bot
+docker compose up -d bot
+docker compose logs -f bot --tail 100
+```
+
+Dashboard: `http://<revo-lan-ip>:8090` (host 8090 → container 8080).
+
+Optional `.env` flags:
+
+All authorized bot users share one conversation and receive every message and monitor alert.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `STRICT_WALKING_AMENITIES` | `false` | Global default for hard metro/tram/bus walking filter |
+| `LISTING_DEDUP_ENABLED` | `true` | Cross-platform duplicate merge (OLX + Otodom) |
+
+## Deployment (local)
 
 Runs on Docker with Watchtower auto-updates:
 

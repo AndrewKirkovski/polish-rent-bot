@@ -1,6 +1,6 @@
 import 'dotenv/config';
 import { getDb, cleanOldCachedListings, cleanExpiredMapsCache } from './storage/db.js';
-import { startBot, sendEnrichedNotification } from './bot/telegram.js';
+import { startBot, broadcastEnrichedNotification } from './bot/telegram.js';
 import { startScheduler } from './scheduler/monitor.js';
 import { closeBrowser } from './crawlers/otodom.js';
 import { startHttpServer } from './server/http.js';
@@ -35,7 +35,9 @@ try {
 startBot();
 
 const MONITOR_INTERVAL_MINUTES = 10;
-const stopScheduler = startScheduler(MONITOR_INTERVAL_MINUTES, sendEnrichedNotification);
+const stopScheduler = startScheduler(MONITOR_INTERVAL_MINUTES, (_userId, listing, parsedData, locationScore) =>
+  broadcastEnrichedNotification(listing, parsedData, locationScore),
+);
 
 const httpServer = startHttpServer();
 

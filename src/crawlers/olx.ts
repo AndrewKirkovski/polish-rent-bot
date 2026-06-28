@@ -85,6 +85,66 @@ function buildSearchUrl(params: OlxSearchParams): string {
   return `${OLX_API}/offers/?${qs.toString()}`;
 }
 
+/** Sequential OLX queries across district × room combinations, deduped by offer id.
+ *  One failed combo does not abort the rest (rate-limited to avoid API bans). */
+export async function searchOlxRentals(params: {
+  cityId?: number;
+  districtIds?: number[];
+  roomCounts?: number[];
+  limit?: number;
+  maxPages?: number;
+}): Promise<Listing[]> {
+  const districtList = params.districtIds?.length ? params.districtIds : [undefined];
+  const roomList = params.roomCounts?.length ? params.roomCounts : [undefined];
+  const limit = params.limit ?? 40;
+  const maxPages = params.maxPages ?? 1;
+  const seen = new Set<string>();
+  const all: Listing[] = [];
+
+  for (const districtId of districtList) {
+    for (const rooms of roomList) {
+      try {
+        let offset = 0;
+        for (let page = 0; page < maxPages; page++) {
+          try {
+            const result = await searchOlx({
+              categoryId: OLX_CATEGORIES.MIESZKANIA_WYNAJEM,
+              cityId: params.cityId,
+              districtId,
+              rooms,
+              limit,
+              offset,
+            });
+            for (const l of result.listings) {
+              const key = `${l.platform}:${l.platformId}`;
+              if (!seen.has(key)) {
+                seen.add(key);
+                all.push(l);
+              }
+            }
+            if (!result.hasNextPage || result.listings.length === 0) break;
+            offset += limit;
+          } catch (pageErr) {
+            console.error(
+              `[olx] Page failed (district=${districtId ?? 'city'}, rooms=${rooms ?? 'any'}, page=${page + 1}):`,
+              pageErr instanceof Error ? pageErr.message : pageErr,
+            );
+            break;
+          }
+        }
+      } catch (comboErr) {
+        console.error(
+          `[olx] Combo failed (district=${districtId ?? 'city'}, rooms=${rooms ?? 'any'}):`,
+          comboErr instanceof Error ? comboErr.message : comboErr,
+        );
+      }
+      await new Promise((r) => setTimeout(r, 250 + Math.random() * 250));
+    }
+  }
+
+  return all;
+}
+
 function getParamValue(params: any[], key: string): any {
   const param = params?.find((p: any) => p.key === key);
   if (!param) return null;

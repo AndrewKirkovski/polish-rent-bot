@@ -193,6 +193,17 @@ export function initDb(dbPath?: string): Database.Database {
 
   runMigrations(db);
 
+  // Sentinel row for shared family conversation (user_id=0 FK target).
+  // MUST stay authorized=0 so it is never a broadcast recipient (chat id 0 is not
+  // a real Telegram chat — including it makes every broadcast report a failure).
+  db.prepare(`
+    INSERT INTO users (telegram_id, username, authorized)
+    VALUES (?, ?, 0)
+    ON CONFLICT(telegram_id) DO NOTHING
+  `).run(FAMILY_CONVERSATION_USER_ID, '__family__');
+  // Demote a pre-existing sentinel that an older build inserted as authorized=1.
+  db.prepare('UPDATE users SET authorized = 0 WHERE telegram_id = ?').run(FAMILY_CONVERSATION_USER_ID);
+
   return db;
 }
 
@@ -253,6 +264,22 @@ export function authorizeUser(telegramId: number): void {
   db.prepare(
     'UPDATE users SET authorized = 1 WHERE telegram_id = ?',
   ).run(telegramId);
+}
+
+/** Shared family conversation thread (all authorized users read/write this). */
+export const FAMILY_CONVERSATION_USER_ID = 0;
+
+export function getAuthorizedTelegramIds(): number[] {
+  const db = getDb();
+  const rows = db.prepare(
+    'SELECT telegram_id FROM users WHERE authorized = 1 AND telegram_id <> ? ORDER BY telegram_id',
+  ).all(FAMILY_CONVERSATION_USER_ID) as { telegram_id: number }[];
+  return rows.map((r) => r.telegram_id);
+}
+
+/** Resolve DB user_id for conversation storage (always shared family thread). */
+export function resolveConversationUserId(_requestingUserId: number): number {
+  return FAMILY_CONVERSATION_USER_ID;
 }
 
 // ---------------------------------------------------------------------------

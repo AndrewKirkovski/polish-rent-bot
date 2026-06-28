@@ -9,7 +9,7 @@
     "dashboard:install": "pnpm --dir dashboard install",
     "dashboard:dev": "pnpm --dir dashboard dev",
     "dashboard:build": "pnpm --dir dashboard build",
-    "recon:olx": "tsx src/experiments/recon-olx.ts",
+    "recon:olx-rooms": "tsx src/experiments/test-olx-rooms-districts.ts",
     "recon:otodom": "tsx src/experiments/recon-otodom.ts",
     "test:stealth": "tsx src/experiments/test-stealth.ts",
     "test:login": "tsx src/experiments/test-login.ts"

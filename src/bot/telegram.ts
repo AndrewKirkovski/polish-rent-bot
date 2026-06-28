@@ -7,13 +7,15 @@ type Msg = TelegramBot.Message;
 import type { Listing } from '../types.js';
 import type { ItemListing } from '../crawlers/olx-items.js';
 import { handleUserMessage } from '../ai/agent.js';
-import { sendPhotoAlbum, formatRichRentalNotification, formatRichItemNotification, splitMessage } from './format.js';
+import { sendPhotoAlbum, formatRichRentalNotification, formatRichItemNotification, splitMessage, captionLength, CAPTION_LIMIT } from './format.js';
 import {
   isUserAuthorized,
   authorizeUser,
   addUser,
 } from '../storage/db.js';
 import type { ParsedRentalData, ParsedItemData, LocationScore } from '../types.js';
+import { wrapBroadcastPhotos, broadcastToFamily, assertBroadcastOk } from './broadcast.js';
+import { getAuthorizedTelegramIds } from '../storage/db.js';
 
 // ---------------------------------------------------------------------------
 // Bot instance (module-level for notification use)
@@ -122,6 +124,17 @@ async function mustSend(bot: TelegramBot, chatId: number | string, text: string,
   }
 }
 
+export async function broadcastEnrichedNotification(
+  listing: Listing | ItemListing,
+  parsedData?: ParsedRentalData | ParsedItemData | null,
+  locationScore?: LocationScore | null,
+): Promise<void> {
+  const result = await broadcastToFamily(async (chatId) => {
+    await sendEnrichedNotification(chatId, listing, parsedData, locationScore);
+  });
+  assertBroadcastOk(result, 'Monitor alert');
+}
+
 export async function sendEnrichedNotification(
   chatId: number | string,
   listing: Listing | ItemListing,
@@ -141,10 +154,9 @@ export async function sendEnrichedNotification(
   // Split long cards to stay under Telegram's 4096 char limit
   const chunks = splitMessage(text);
   const photos = listing.photos;
-  const CAPTION_LIMIT = 1024;
 
-  // Try photo+caption for short single-chunk cards
-  if (chunks.length === 1 && text.length <= CAPTION_LIMIT && photos.length > 0) {
+  // Try photo+caption for short single-chunk cards (visible length, not raw HTML length)
+  if (chunks.length === 1 && captionLength(text) <= CAPTION_LIMIT && photos.length > 0) {
     try {
       await sendPhotoAlbum(bot, chatId, photos, text);
       return;
@@ -197,11 +209,25 @@ async function safeSend(bot: TelegramBot, chatId: number | string, text: string,
   }
 }
 
-function makeSendFn(bot: TelegramBot): SendFn {
-  return async (chatId, text, opts?) => {
-    // If no explicit parse_mode override, transform Claude's Markdown to HTML
+/** Family-broadcast send: renders Markdown→HTML ONCE, then fans out to every member. */
+function makeBroadcastSendFn(bot: TelegramBot): SendFn {
+  return async (_chatId, text, opts?) => {
+    // If no explicit parse_mode override, transform Claude's Markdown to HTML (once, not per recipient)
     const finalText = (!opts || !('parse_mode' in opts)) ? mdToHtml(text) : text;
-    await safeSend(bot, chatId, finalText, { parse_mode: 'HTML', ...opts } as TelegramBot.SendMessageOptions);
+    const sendOpts = { parse_mode: 'HTML', ...opts } as TelegramBot.SendMessageOptions;
+    await broadcastToFamily((id) => safeSend(bot, id, finalText, sendOpts));
+  };
+}
+
+/** Best-effort echo of one member's question to the OTHER members (not the asker),
+ *  so the shared thread shows who asked what. Never blocks the reply. */
+function makeEchoFn(bot: TelegramBot): (askerChatId: number, senderName: string, text: string) => void {
+  return (askerChatId, senderName, text) => {
+    for (const id of getAuthorizedTelegramIds()) {
+      if (id === askerChatId) continue;
+      // Plain text (no parse_mode) — avoids having to HTML-escape arbitrary user input.
+      safeSend(bot, id, `👤 ${senderName}: ${text}`).catch(() => {});
+    }
   };
 }
 
@@ -224,8 +250,9 @@ export function startBot(): TelegramBot {
   bot.on('polling_error', (err) => console.error('[telegram] Polling error:', err.message));
   bot.on('error', (err) => console.error('[telegram] Bot error:', err.message));
 
-  const sendFn = makeSendFn(bot);
-  const sendPhotosFn = makeSendPhotosFn(bot);
+  const sendFn = makeBroadcastSendFn(bot);
+  const sendPhotosFn = wrapBroadcastPhotos(makeSendPhotosFn(bot));
+  const echoFn = makeEchoFn(bot);
 
   // --- /start ---
   bot.onText(/\/start/, async (msg: Msg) => {
@@ -298,11 +325,15 @@ export function startBot(): TelegramBot {
 
     const userId = msg.from!.id;
     const chatId = msg.chat.id;
+    const senderName = msg.from?.first_name ?? msg.from?.username ?? String(userId);
 
     const typingFn = async (cid: number) => { await bot.sendChatAction(cid, 'typing'); };
 
+    // Show the other members what was asked (best-effort, never blocks the reply).
+    echoFn(chatId, senderName, text);
+
     try {
-      await handleUserMessage(userId, chatId, text, sendFn, sendPhotosFn, typingFn);
+      await handleUserMessage(userId, chatId, text, senderName, sendFn, sendPhotosFn, typingFn);
     } catch (err) {
       console.error(`[telegram] Agent error for user ${userId}:`, err);
       await safeSend(bot, chatId, 'Something went wrong. Please try again later.');
