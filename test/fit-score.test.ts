@@ -39,6 +39,6 @@ test('within-limit amenities lift the score and the nearest is named in Russian'
   ]);
   const withAmen = computeFitScore(mkListing(), mkParsed({ twoOfficeCapable: true }), score);
   const noAmen = computeFitScore(mkListing(), mkParsed({ twoOfficeCapable: true }), null);
-  assert.ok(withAmen.score >= noAmen.score);   // both cafe+restaurant within → amenities term = 1
+  assert.ok(withAmen.score > noAmen.score);    // strict: proves the amenities weight actually contributes
   assert.match(withAmen.reason, /кафе 4м/);     // shared AMENITY_LABELS, not English 'cafe'
 });

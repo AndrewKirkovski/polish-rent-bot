@@ -21,10 +21,15 @@ const PARSE_MODEL = process.env.PARSE_MODEL || 'claude-haiku-4-5';
 
 // Folded into the parse cache key; bump on any RENTAL_PROMPT/schema change so stale
 // old-schema rows miss instead of returning objects without the new fields.
-const RENTAL_PARSE_VERSION = 'wfh-v1';
+export const RENTAL_PARSE_VERSION = 'wfh-v1';
 
 function hashText(text: string): string {
   return createHash('sha256').update(text, 'utf-8').digest('hex');
+}
+
+/** Cache key for a rental parse — version-prefixed so a schema/prompt bump misses old rows. */
+export function rentalParseCacheKey(descOrTitle: string, version = RENTAL_PARSE_VERSION): string {
+  return hashText(`${version}\n${descOrTitle}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -76,7 +81,7 @@ JSON schema:
 }`;
 
 export async function parseRentalListing(listing: Listing, ctx: AiCallCtx = {}): Promise<ParsedRentalData> {
-  const descHash = hashText(`${RENTAL_PARSE_VERSION}\n${listing.description || listing.title}`);
+  const descHash = rentalParseCacheKey(listing.description || listing.title);
 
   // Check cache
   const cached = getParsedListing(listing.platform, listing.platformId);

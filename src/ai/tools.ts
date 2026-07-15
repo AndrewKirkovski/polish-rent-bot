@@ -26,7 +26,7 @@ import {
   getAuthorizedTelegramIds,
 } from '../storage/db.js';
 import type { Listing, ParsedRentalData, ParsedItemData, LocationScore } from '../types.js';
-import { computeRentalCost } from '../cost.js';
+import { computeRentalCost, exceedsBudgetFloor } from '../cost.js';
 
 // ---------------------------------------------------------------------------
 // Short human-readable ID generator (nanoid, unambiguous alphabet)
@@ -545,11 +545,10 @@ async function execFindRentals(
     // (and the catch-all error handler below) can reference it.
     const resultId = genId();
 
-    // Pre-parse budget short-circuit: najem + czynsz ALONE already over the total
-    // budget → media can only push it higher, so skip the expensive enrich + AI parse.
-    if (priceTo != null && (listing.price + (listing.rent ?? 0)) > priceTo) {
-      const base = listing.price + (listing.rent ?? 0);
-      const reason = `дороже бюджета (${base} zł базовой ставки > ${priceTo})`;
+    // Pre-parse budget short-circuit: base rent alone already over budget → the true total
+    // can only be higher, so skip the expensive enrich + AI parse (see exceedsBudgetFloor).
+    if (priceTo != null && exceedsBudgetFloor(listing, priceTo)) {
+      const reason = `дороже бюджета (аренда ${listing.price} zł > ${priceTo})`;
       // Cache the (un-enriched) listing so the advertised [ID] is still resolvable via
       // show_listing, matching the other rejection paths.
       try { cacheListing({ platform: listing.platform, platformId: listing.platformId, kind: 'rental', resultId, listing }); } catch (e) { console.error('[find_rentals] cache pre-reject failed:', e instanceof Error ? e.message : e); }

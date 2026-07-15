@@ -28,11 +28,14 @@ test('over-budget card is trimmed under the caption budget, essentials kept', ()
     restrictions: ['только студенты'.repeat(30)],
     contractType: 'najem_okazjonalny',
   });
-  const card = formatRentalCard(mkListing({ phone: '123' }), big, null);
-  assert.ok(captionLength(card) <= CAPTION_LIMIT, `visible length ${captionLength(card)} > ${CAPTION_LIMIT}`);
+  // Assert the tighter budget the trim actually targets (CAPTION_LIMIT - 24, leaving room
+  // for the interactive "[ID] " prefix), and pass a long non-droppable fit line on top.
+  const card = formatRentalCard(mkListing({ phone: '123' }), big, null, 'z'.repeat(200));
+  assert.ok(captionLength(card) <= CAPTION_LIMIT - 24, `visible length ${captionLength(card)} > ${CAPTION_LIMIT - 24}`);
   assert.match(card, /\/мес/);                 // price kept
   assert.match(card, /example\.com/);          // url kept
   assert.match(card, /Kaucja/);                // contract/deposit kept
+  assert.match(card, /🔥/);                    // the fit line survives the trim
 });
 
 test('fit reason line renders when provided', () => {

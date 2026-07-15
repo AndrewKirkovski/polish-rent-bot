@@ -7,12 +7,12 @@ import type { Listing, ParsedRentalData, ParsedItemData, LocationScore } from '.
 import type { ItemListing } from '../crawlers/olx-items.js';
 import { parseRentalListing, parseItemListing, evaluateRejection } from '../ai/parse-listing.js';
 import { scoreLocation } from '../ai/maps.js';
-import { computeRentalCost } from '../cost.js';
+import { computeRentalCost, exceedsBudgetFloor } from '../cost.js';
 import { searchRentalListings, resolveCityId } from '../search/rental-search.js';
 import { enrichRentalListing } from '../search/enrich-listing.js';
 import { checkAmenityGate, resolveStrictAmenities } from '../search/amenity-gate.js';
 import { notificationDedupKey } from '../search/listing-fingerprint.js';
-import { computeFitScore } from '../search/fit-score.js';
+import { computeFitScore, preScore } from '../search/fit-score.js';
 
 // ---------------------------------------------------------------------------
 // Monitor config types (what lives inside monitor.config JSON column)
@@ -197,8 +197,13 @@ export function startScheduler(
 
           // Cap per cycle (like the interactive path) so a brand-new monitor doesn't fire
           // 100+ enrich+parse calls at once. Overflow stays unseen for the next cycle.
+          // Best-fit first (rentals) so the cap keeps the strongest candidates, matching
+          // the interactive path's preScore ordering.
           const PER_CYCLE_CAP = 25;
-          const toProcess = newListings.slice(0, PER_CYCLE_CAP);
+          const ordered = monitor.type === 'rental'
+            ? [...newListings].sort((a, b) => preScore(b as Listing) - preScore(a as Listing))
+            : newListings;
+          const toProcess = ordered.slice(0, PER_CYCLE_CAP);
           if (newListings.length > PER_CYCLE_CAP) {
             console.log(`[scheduler] Monitor #${monitor.id}: capping ${newListings.length} new → ${PER_CYCLE_CAP} this cycle (rest next cycle)`);
           }
@@ -219,13 +224,11 @@ export function startScheduler(
                 }
               }
 
-              // Pre-parse budget short-circuit: najem + czynsz ALONE over budget → media
-              // can only add more, so skip the expensive enrich + AI parse entirely.
+              // Pre-parse budget short-circuit: base rent alone over budget → skip enrich + AI.
               if (monitor.type === 'rental' && monitorConfig.priceTo != null) {
                 const l = listing as Listing;
-                const base = l.price + (l.rent ?? 0);
-                if (base > monitorConfig.priceTo) {
-                  console.log(`[scheduler] Budget pre-reject "${l.title}": base ${base} > ${monitorConfig.priceTo} (no AI call)`);
+                if (exceedsBudgetFloor(l, monitorConfig.priceTo)) {
+                  console.log(`[scheduler] Budget pre-reject "${l.title}": аренда ${l.price} > ${monitorConfig.priceTo} (no AI call)`);
                   markListingSeen(monitor.id, l.platform, l.platformId, l.url, l.title, l.price);
                   continue;
                 }

@@ -89,12 +89,12 @@ export function computeFitScore(
   const weighted = parts.reduce((s, p) => s + p.weight * p.value, 0);
   const score = totalWeight > 0 ? Math.round((weighted / totalWeight) * 100) : 50;
 
-  // Append the nearest within-limit amenity to the reason, if any.
+  // Append the genuinely nearest within-limit amenity (smallest walking time) to the reason.
   if (locationScore) {
-    const near = locationScore.amenities.find((a) => a.withinLimit && (a.places[0]?.walkingMinutes ?? -1) >= 0);
-    if (near && near.places[0]) {
-      reasons.push(`${amenityLabel(near.type)} ${near.places[0].walkingMinutes}м`);
-    }
+    const near = locationScore.amenities
+      .filter((a) => a.withinLimit && (a.places[0]?.walkingMinutes ?? -1) >= 0)
+      .sort((a, b) => a.places[0]!.walkingMinutes - b.places[0]!.walkingMinutes)[0];
+    if (near) reasons.push(`${amenityLabel(near.type)} ${near.places[0]!.walkingMinutes}м`);
   }
 
   return { score, reason: reasons.slice(0, 4).join(' · ') };

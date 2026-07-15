@@ -24,6 +24,13 @@ const MEDIA_ORDER: Array<{ key: keyof ParsedRentalData['estimatedMedia']; label:
   { key: 'internet', label: 'internet' },
 ];
 
+/** Safe pre-parse budget skip: najem (base rent) alone is a guaranteed lower bound on the
+ *  true total — czynsz/media are >= 0 and the AI may even refine czynsz below the crawler's
+ *  value, so gating on price+rent could wrongly drop an in-budget flat. Gate on najem only. */
+export function exceedsBudgetFloor(listing: Pick<Listing, 'price'>, priceTo: number): boolean {
+  return listing.price > priceTo;
+}
+
 export function computeRentalCost(
   listing: Pick<Listing, 'price' | 'rent'>,
   parsed: ParsedRentalData | null | undefined,
