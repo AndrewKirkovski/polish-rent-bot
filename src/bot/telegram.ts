@@ -128,9 +128,10 @@ export async function broadcastEnrichedNotification(
   listing: Listing | ItemListing,
   parsedData?: ParsedRentalData | ParsedItemData | null,
   locationScore?: LocationScore | null,
+  fitReason?: string | null,
 ): Promise<void> {
   const result = await broadcastToFamily(async (chatId) => {
-    await sendEnrichedNotification(chatId, listing, parsedData, locationScore);
+    await sendEnrichedNotification(chatId, listing, parsedData, locationScore, fitReason);
   });
   assertBroadcastOk(result, 'Monitor alert');
 }
@@ -140,6 +141,7 @@ export async function sendEnrichedNotification(
   listing: Listing | ItemListing,
   parsedData?: ParsedRentalData | ParsedItemData | null,
   locationScore?: LocationScore | null,
+  fitReason?: string | null,
 ): Promise<void> {
   const bot = getBot();
   const isItem = !('slug' in listing); // ItemListing lacks `slug`
@@ -148,7 +150,7 @@ export async function sendEnrichedNotification(
   if (isItem) {
     text = formatRichItemNotification(listing as ItemListing, parsedData as ParsedItemData | undefined);
   } else {
-    text = formatRichRentalNotification(listing as Listing, parsedData as ParsedRentalData | undefined, locationScore ?? undefined);
+    text = formatRichRentalNotification(listing as Listing, parsedData as ParsedRentalData | undefined, locationScore ?? undefined, fitReason);
   }
 
   // Split long cards to stay under Telegram's 4096 char limit

@@ -90,40 +90,19 @@ export function splitMessage(text: string, limit = 3500): string[] {
 // Custom emoji — premium animated emoji via tg-emoji tags
 // ---------------------------------------------------------------------------
 
+// Custom emoji the cards render — keep in sync with actual usage.
 const CE = {
-  yes:        '<tg-emoji emoji-id="5424972835095329742">👍</tg-emoji>',
-  no:         '<tg-emoji emoji-id="5416036249397905594">👎</tg-emoji>',
   fire:       '<tg-emoji emoji-id="5425111515294354563">🔥</tg-emoji>',
   warning:    '<tg-emoji emoji-id="5357067430755585653">❗️</tg-emoji>',
-  doubt:      '<tg-emoji emoji-id="5357585725934029727">❓</tg-emoji>',
   price:      '<tg-emoji emoji-id="5435999124245729290">💰</tg-emoji>',
   house:      '<tg-emoji emoji-id="5363840027245696377">🏠</tg-emoji>',
   phone:      '<tg-emoji emoji-id="5433866857666855412">📞</tg-emoji>',
-  mail:       '<tg-emoji emoji-id="5224229095927205846">💌</tg-emoji>',
-  person:     '<tg-emoji emoji-id="5425112292683435471">🐰</tg-emoji>',
-  landlord:   '<tg-emoji emoji-id="5433767609562578028">🐸</tg-emoji>',
   thinking:   '<tg-emoji emoji-id="5424920651242687937">💭</tg-emoji>',
   pros:       '<tg-emoji emoji-id="5224694451338759997">↗️</tg-emoji>',
   cons:       '<tg-emoji emoji-id="5224340348465073584">↘️</tg-emoji>',
-  pets:       '<tg-emoji emoji-id="5224205894513873252">🐾</tg-emoji>',
-  kitchen:    '<tg-emoji emoji-id="5364142105180521805">🍴</tg-emoji>',
-  ac:         '<tg-emoji emoji-id="5424976150810086048">☀️</tg-emoji>',
-  bathroom:   '<tg-emoji emoji-id="5436199127987799646">💦</tg-emoji>',
-  contract:   '<tg-emoji emoji-id="5364265065799239497">✏️</tg-emoji>',
-  // Location & amenities
   location:   '<tg-emoji emoji-id="5192907870827467960">🗺</tg-emoji>',
   gym:        '<tg-emoji emoji-id="5443161635046833571">🍑</tg-emoji>',
-  pool:       '<tg-emoji emoji-id="5199865266875420387">🏊</tg-emoji>',
-  pharmacy:   '<tg-emoji emoji-id="5363970667265934950">🩹</tg-emoji>',
-  furniture:  '<tg-emoji emoji-id="5219787086130859981">🏖</tg-emoji>',
-  costBreak:  '<tg-emoji emoji-id="5422878175250106861">🛍</tg-emoji>',
 } as const;
-
-function ceYn(val: boolean | null | undefined): string {
-  if (val === true) return CE.yes;
-  if (val === false) return CE.no;
-  return CE.doubt;
-}
 
 // ---------------------------------------------------------------------------
 // Rental card — comprehensive
@@ -133,6 +112,7 @@ export function formatRentalCard(
   listing: Listing,
   parsed: ParsedRentalData | null | undefined,
   locationScore: LocationScore | null | undefined,
+  fitReason?: string | null,
 ): string {
   const cost = computeRentalCost(listing, parsed);
   const num = (n: number) => n.toLocaleString('pl-PL');
@@ -157,17 +137,37 @@ export function formatRentalCard(
   const aptBase: string[] = [];
   if (listing.rooms != null) aptBase.push(`${listing.rooms}к`);
   if (listing.area != null) aptBase.push(`${listing.area}m²`);
-  if (listing.floor != null) aptBase.push(`${listing.floor}эт`);
-  if (parsed?.furnished) aptBase.push(parsed.furnished);
-  aptBase.push(`🐾${ceYn(parsed?.petFriendly)} 🚬${ceYn(parsed?.smokingAllowed)}`);
+  // Floor + total, with elevator flag (a high walk-up matters when moving desks/gear).
+  if (listing.floor != null) {
+    const floorTxt = listing.buildingFloor != null ? `${listing.floor}/${listing.buildingFloor}эт` : `${listing.floor}эт`;
+    const lift = listing.hasElevator === true ? ' 🛗' : listing.hasElevator === false ? ' без лифта' : '';
+    aptBase.push(`${floorTxt}${lift}`);
+  }
+  if (parsed?.furnished) aptBase.push(parsed.furnished === 'none' ? 'без мебели' : parsed.furnished === 'full' ? 'меблир.' : 'част. мебл.');
+  if (listing.buildYear != null) aptBase.push(`${listing.buildYear}г`);
   const restriction = (parsed?.restrictions ?? [])[0];
   const aptLine = (withRestriction: boolean) =>
     `${CE.house} ${[...aptBase, ...(withRestriction && restriction ? [esc(restriction)] : [])].join(' · ')}`;
 
+  // --- WFH persona strip: the signals this household actually ranks on ---
+  const wfhParts: string[] = [];
+  const fiber = parsed?.internetType === 'fiber';   // fibre is an AI inference (parsed only)
+  const anyInternet = fiber || listing.hasInternet === true || parsed?.internetType === 'cable';
+  wfhParts.push(fiber ? '🌐 оптика ✓' : anyInternet ? '🌐 интернет ✓' : '🌐 интернет: уточнить');
+  if (parsed?.twoOfficeCapable === true) wfhParts.push('🪑 2 офиса ✓');
+  else if (parsed?.twoOfficeCapable === false) wfhParts.push('🪑 2 офиса ✗');
+  else if (parsed?.separateRooms != null) wfhParts.push(`🪑 ${parsed.separateRooms} разд. комн.`);
+  if (parsed?.quiet === 'quiet') wfhParts.push('🔇 тихо');
+  else if (parsed?.quiet === 'noisy') wfhParts.push('🔊 шумно');
+  if (parsed?.naturalLight === 'bright') wfhParts.push('☀️ светло');
+  else if (parsed?.naturalLight === 'dark') wfhParts.push('🌑 тёмно');
+  if (listing.hasAc === true) wfhParts.push('❄️ кондиц.');
+  const wfhLine = wfhParts.length > 0 ? wfhParts.join(' · ') : null;
+
   // --- Location line; the map link is folded into the 🗺 icon (no standalone line) ---
   let locationLine: string;
   if (locationScore) {
-    const icons: Record<string, string> = { metro: '🚇', tram: '🚋', bus: '🚌', groceries: '🛒', gym: CE.gym };
+    const icons: Record<string, string> = { metro: '🚇', tram: '🚋', bus: '🚌', groceries: '🛒', gym: CE.gym, cafe: '☕', restaurant: '🍽', supermarket: '🛒', pharmacy: '💊', park: '🌳' };
     const amenParts = locationScore.amenities.map((a) => {
       const icon = icons[a.type] ?? '·';
       const mark = a.withinLimit ? '✓' : '✗';
@@ -202,8 +202,13 @@ export function formatRentalCard(
   // Assemble with progressively dropped non-essential content so a rich card still
   // fits the photo-caption budget. Essentials (price/title/url/kaucja/apt/location/contact)
   // are never dropped. Drop order: summary → positives → restriction note → red flags.
+  // Capped like other free-text: fitLine is never dropped by the safety-trim.
+  const fitLine = fitReason ? `${CE.fire} ${esc(trunc(fitReason, 80))}` : null;
+
   const assemble = (drop: { summary?: boolean; positives?: boolean; restriction?: boolean; redFlags?: boolean }): string => {
     const parts: string[] = [priceLine, titleLine, urlLine];
+    if (fitLine) parts.push(fitLine);
+    if (wfhLine) parts.push(wfhLine);
     if (!drop.summary && summaryLine) parts.push(summaryLine);
     parts.push(payLineStr);
     parts.push(aptLine(!drop.restriction));

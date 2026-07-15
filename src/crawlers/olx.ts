@@ -170,6 +170,9 @@ function parseOlxOffer(raw: any): Listing {
   const buildingType = getParamValue(params, 'builttype');
   const furniture = getParamValue(params, 'furniture');
   const parking = getParamValue(params, 'parking');
+  const windaStr = getParamValue(params, 'winda'); // elevator — OLX exposes it in search params
+  const hasElevator = windaStr === 'Tak' || windaStr === true ? true
+    : windaStr === 'Nie' || windaStr === false ? false : null;
 
   // Parse numeric values
   const area = areaStr ? parseFloat(String(areaStr).replace(/[^\d.]/g, '')) : null;
@@ -200,6 +203,10 @@ function parseOlxOffer(raw: any): Listing {
     heating: null,
     furniture: furniture === true || furniture === 'Tak' ? true : furniture === false || furniture === 'Nie' ? false : null,
     parking,
+    hasInternet: null,      // OLX search params don't reliably expose it — AI infers from description
+    hasElevator,
+    hasAc: null,
+    buildYear: null,
     city: raw.location?.city?.name ?? '',
     district: raw.location?.district?.name ?? null,
     street: null,

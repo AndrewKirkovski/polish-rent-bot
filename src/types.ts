@@ -26,6 +26,12 @@ export interface Listing {
   heating: string | null;
   furniture: boolean | null;
   parking: string | null;
+  // Platform ground truth for the AI parse; null = not stated (AI infers).
+  // Fibre-vs-cable is inferred separately — see ParsedRentalData.internetType.
+  hasInternet: boolean | null;
+  hasElevator: boolean | null;
+  hasAc: boolean | null;
+  buildYear: number | null;
 
   // Location
   city: string;
@@ -70,11 +76,10 @@ export interface SessionState {
 // ---------------------------------------------------------------------------
 
 export interface ParsedRentalData {
+  // cost / pipeline-critical
   deposit: number | null;
   depositNote: string | null;
   adminFee: number | null;
-  adminFeeIncludes: string | null;
-  tenantPays: string | null;
   addressHint: string | null;
   isConcreteApartment: boolean | null;
   estimatedMedia: {
@@ -84,28 +89,24 @@ export interface ParsedRentalData {
     internet: number | null;
     heating: number | null;
   };
-  totalMonthlyCost: number | null;
-  totalBreakdown: string | null;
   contractType: 'najem_okazjonalny' | 'najem_zwykly' | 'najem_instytucjonalny' | null;
-  contractNote: string | null;
   availableFrom: string | null;
   minimumLease: string | null;
-  petFriendly: boolean | null;
-  smokingAllowed: boolean | null;
   furnished: 'full' | 'partial' | 'none' | null;
-  parkingIncluded: boolean | null;
   balcony: boolean | null;
+  parkingIncluded: boolean | null;
+  // work-from-home fit
+  separateRooms: number | null;
+  layoutType: 'rozkladowy' | 'przechodni' | 'open' | null;
+  twoOfficeCapable: boolean | null;
+  quiet: 'quiet' | 'mixed' | 'noisy' | null;
+  naturalLight: 'bright' | 'average' | 'dark' | null;
+  internetType: 'fiber' | 'cable' | 'unknown' | null;
+  // display
   descriptionSummary: string | null;
-  furnitureAndEquipment: string[];
-  kitchenDetails: string | null;
-  bathroomDetails: string | null;
-  internetReady: string | null;
-  landlordNotes: string | null;
-  bestSuitedFor: string | null;
   redFlags: string[];
   positives: string[];
   restrictions: string[];
-  additionalNotes: string[];
 }
 
 export interface ParsedItemData {

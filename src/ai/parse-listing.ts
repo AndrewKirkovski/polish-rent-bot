@@ -16,7 +16,12 @@ export interface AiCallCtx {
   monitorId?: number;
 }
 
-const MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-6';
+// Extraction runs on every listing — route it to Haiku (cheaper than Sonnet). Override via env.
+const PARSE_MODEL = process.env.PARSE_MODEL || 'claude-haiku-4-5';
+
+// Folded into the parse cache key; bump on any RENTAL_PROMPT/schema change so stale
+// old-schema rows miss instead of returning objects without the new fields.
+const RENTAL_PARSE_VERSION = 'wfh-v1';
 
 function hashText(text: string): string {
   return createHash('sha256').update(text, 'utf-8').digest('hex');
@@ -26,90 +31,73 @@ function hashText(text: string): string {
 // Rental listing — comprehensive AI analysis
 // ---------------------------------------------------------------------------
 
-const RENTAL_PROMPT = `You are an expert Polish real estate analyst helping a Russian-speaking renter evaluate apartments in Poland. Write all free-text fields in Russian.
+const RENTAL_PROMPT = `You analyse Polish rental listings for a household of TWO adults who both WORK FROM HOME and share the flat. They have NO children, NO pets, are NOT students. Their priorities: TWO separate quiet rooms usable as home offices (for simultaneous video calls), reliable internet (ideally fibre / światłowód), low noise, good natural light, and true total cost. Do NOT spend effort on pet/family/student concerns. Write free-text fields in Russian, ONE short sentence max.
 
-Given the listing data below, produce a COMPREHENSIVE analysis in JSON. Read the Polish description carefully — landlords hide crucial details there.
+Read the Polish description carefully — landlords hide crucial details there. Return ONLY the JSON object below (no markdown fences, no extra text).
 
-CRITICAL fields to extract from the description:
-- Kaucja (deposit): Look for "kaucja", "depozyt", "zabezpieczenie", "kaucja zwrotna", amounts like "2x czynsz"
-- Contract type: "najem okazjonalny", "umowa najmu okazjonalnego", "najem instytucjonalny" — if NOT mentioned in the description, return null (do NOT assume najem zwykły)
-- estimatedMedia: estimate the MONTHLY PLN cost of each utility the tenant pays SEPARATELY, on top of czynsz. If a utility is already included in czynsz (e.g. heating, water), leave it null here — do NOT also estimate it, or it gets double-counted. The app sums rent + czynsz + these to get the total, so keep the numbers realistic. (Do not compute the total yourself — the app does the arithmetic.)
-- What's included in czynsz: often includes heating, garbage, water — extract this into adminFeeIncludes
-- What tenant pays separately: gas, electricity, internet — extract this into tenantPays
-- addressHint: the exact street/ulica (with building number if present) or a precise landmark from the description, for map geolocation. OLX hides the street in its API, but the description often names it. Null if nothing specific.
-- isConcreteApartment: TRUE if this is ONE specific, real apartment offered for rent. Set FALSE when it is NOT a single concrete unit — e.g. an agency/portfolio post advertising many or "various" apartments, an investment / new-development sale, a price RANGE ("od X zł", "od ... do ..."), a generic "we have flats, call us" ad, or an obvious placeholder/scam. The app immediately discards anything where this is false.
+GROUND-TRUTH FACTS may be supplied in the input (internet / elevator / AC / build year). When a fact is given as true/false, DO NOT contradict it. Only infer that field from the description when it is marked "unknown".
 
-DEEP analysis to produce:
-- Translate and summarize the entire description into Russian — preserve ALL useful details
-- Assess the apartment's vibe/style (modern? renovated? old? communist-era?)
-- List ALL furniture and equipment mentioned
-- Note landlord's personality/flexibility from the text
-- Identify restrictions (pets, smoking, couples, ID requirements)
-- Red flags or positive signals
-- Who this apartment is best suited for
+Extraction notes:
+- deposit (kaucja): "kaucja", "depozyt", "zabezpieczenie", "kaucja zwrotna", "2x czynsz".
+- contractType: only if explicitly stated ("najem okazjonalny/instytucjonalny"); else null (never assume najem zwykły).
+- estimatedMedia: monthly PLN the tenant pays SEPARATELY on top of czynsz. If a utility is already in czynsz, leave it null (no double counting). Do not compute a total — the app does.
+- addressHint: exact ulica + number or a clear landmark, for geocoding; null if none.
+- isConcreteApartment: FALSE for agency/portfolio posts, investment/new-build sales, price ranges ("od X zł"), generic "we have flats" ads, or scams; TRUE for one real, specific flat.
+- separateRooms: number of CLOSABLE separate rooms (exclude a walk-through/przechodni room and the kitchen). layoutType: "rozkladowy" (rooms off a hall), "przechodni" (walk-through), or "open" (studio/open-plan).
+- twoOfficeCapable: true if the flat plausibly fits TWO private desks/offices with doors for calls (needs ≥2 separable rooms, not przechodni).
+- quiet: "quiet" if "od podwórza"/"cicha okolica"/top floor/courtyard; "noisy" if busy street/tram/nightlife; else "mixed" or null.
+- naturalLight: "bright"/"average"/"dark" from exposure/floor/description; null if unclear.
+- internetType: "fiber" if światłowód/fibre mentioned; "cable" if cable/UPC/Vectra; else "unknown".
 
-Return ONLY valid JSON (no markdown fences):
+JSON schema:
 {
-  "deposit": number or null,
-  "depositNote": "e.g. 2600 PLN (1.3x monthly rent), refundable",
-  "adminFee": number or null,
-  "adminFeeIncludes": "what's covered in czynsz admin — heating, water, garbage, etc.",
-  "tenantPays": "what tenant pays on top — gas, electricity, internet, etc.",
-  "estimatedMedia": {
-    "water": number or null,
-    "electricity": number or null,
-    "gas": number or null,
-    "internet": number or null,
-    "heating": number or null
-  },
-  "addressHint": "exact street/ulica + number or a clear landmark from the description, or null",
-  "isConcreteApartment": true | false,
-  "totalMonthlyCost": number or null,
-  "totalBreakdown": "e.g. 2000 rent + 544 czynsz + ~200 utilities = ~2744 PLN",
-  "contractType": "najem_okazjonalny" | "najem_zwykly" | "najem_instytucjonalny" | null,
-  "contractNote": "any details about the contract mentioned",
-  "availableFrom": "date string or 'immediately' or null",
-  "minimumLease": "e.g. '12 months' or null",
-  "petFriendly": true | false | null,
-  "smokingAllowed": true | false | null,
-  "furnished": "full" | "partial" | "none" | null,
-  "parkingIncluded": true | false | null,
-  "balcony": true | false | null,
-  "descriptionSummary": "1-2 sentence Russian summary of the apartment — vibe, style, key features",
-  "furnitureAndEquipment": ["list every item mentioned: bed type, desk, wardrobe, appliances, etc."],
-  "kitchenDetails": "what's in the kitchen",
-  "bathroomDetails": "what's in the bathroom",
-  "internetReady": "e.g. 'PLAY/ORANGE cable ready, bring own contract'",
-  "landlordNotes": "landlord personality, flexibility, restrictions, tone of the listing",
-  "bestSuitedFor": "e.g. 'single professional working remotely'",
-  "redFlags": ["any concerning things"],
-  "positives": ["strong points of this listing"],
-  "restrictions": ["no pets", "no smoking", "Polish ID required", etc.],
-  "additionalNotes": ["anything else noteworthy"]
+  "deposit": number|null,
+  "depositNote": "напр. 6000 zł (2x аренды), возвратный" | null,
+  "adminFee": number|null,
+  "addressHint": "улица+номер или ориентир" | null,
+  "isConcreteApartment": true|false,
+  "estimatedMedia": { "water": number|null, "electricity": number|null, "gas": number|null, "internet": number|null, "heating": number|null },
+  "contractType": "najem_okazjonalny"|"najem_zwykly"|"najem_instytucjonalny"|null,
+  "availableFrom": "дата / 'сразу'" | null,
+  "minimumLease": "напр. '12 месяцев'" | null,
+  "furnished": "full"|"partial"|"none"|null,
+  "balcony": true|false|null,
+  "parkingIncluded": true|false|null,
+  "separateRooms": number|null,
+  "layoutType": "rozkladowy"|"przechodni"|"open"|null,
+  "twoOfficeCapable": true|false|null,
+  "quiet": "quiet"|"mixed"|"noisy"|null,
+  "naturalLight": "bright"|"average"|"dark"|null,
+  "internetType": "fiber"|"cable"|"unknown"|null,
+  "descriptionSummary": "одно короткое предложение по-русски" | null,
+  "redFlags": ["..."],
+  "positives": ["сильные стороны для удалёнщиков"],
+  "restrictions": ["напр. только без животных, нужен польский ID"]
 }`;
 
 export async function parseRentalListing(listing: Listing, ctx: AiCallCtx = {}): Promise<ParsedRentalData> {
-  const descHash = hashText(listing.description || listing.title);
+  const descHash = hashText(`${RENTAL_PARSE_VERSION}\n${listing.description || listing.title}`);
 
   // Check cache
   const cached = getParsedListing(listing.platform, listing.platformId);
   if (cached && cached.description_hash === descHash) {
     try {
       const parsed = JSON.parse(cached.parsed_data);
-      recordLocalCacheHit({ feature: 'parse_rental', ...ctx }, MODEL);
+      recordLocalCacheHit({ feature: 'parse_rental', ...ctx }, PARSE_MODEL);
       return parsed;
     } catch {
       console.warn(`[parse-listing] Corrupt cache entry for ${listing.platform}:${listing.platformId}, re-parsing`);
     }
   }
 
+  const tri = (v: boolean | null) => (v === true ? 'yes' : v === false ? 'no' : 'unknown');
   const userMessage = `Title: ${listing.title}
 Rent price: ${listing.price} PLN/month
 Czynsz admin (from structured data): ${listing.rent ?? 'not specified'} PLN
 Deposit (from structured data): ${listing.deposit ?? 'not specified'} PLN
 Area: ${listing.area ?? 'unknown'} m²
 Rooms: ${listing.rooms ?? 'unknown'}
-Floor: ${listing.floor ?? 'unknown'}
+Floor: ${listing.floor ?? 'unknown'}${listing.buildingFloor != null ? ` of ${listing.buildingFloor}` : ''}
 Building type: ${listing.buildingType ?? 'unknown'}
 Heating: ${listing.heating ?? 'unknown'}
 City: ${listing.city}, District: ${listing.district ?? 'unknown'}
@@ -117,12 +105,18 @@ Street: ${listing.street ?? 'unknown'}
 Advertiser: ${listing.advertiserType ?? 'unknown'}
 Coordinates: ${listing.lat ?? 'unknown'}, ${listing.lng ?? 'unknown'}
 
+GROUND-TRUTH FACTS (do NOT contradict; infer only the 'unknown' ones from the description):
+- internet available: ${tri(listing.hasInternet)}
+- elevator (winda): ${tri(listing.hasElevator)}
+- air conditioning: ${tri(listing.hasAc)}
+- build year: ${listing.buildYear ?? 'unknown'}
+
 Full description (Polish):
 ${(listing.description || 'No description provided').slice(0, 8000)}`;
 
   const response = await createMessageTracked({
-    model: MODEL,
-    max_tokens: 2048,
+    model: PARSE_MODEL,
+    max_tokens: 4096,
     temperature: 0,
     system: [
       {
@@ -133,6 +127,10 @@ ${(listing.description || 'No description provided').slice(0, 8000)}`;
     ],
     messages: [{ role: 'user', content: userMessage }],
   }, { feature: 'parse_rental', ...ctx }); // uses client defaults: 120s timeout, 3 retries
+
+  if (response.stop_reason === 'max_tokens') {
+    console.error(`[parse-listing] TRUNCATED (max_tokens) for ${listing.platform}:${listing.platformId} "${listing.title.slice(0, 40)}" — raise max_tokens or trim schema`);
+  }
 
   const textBlock = response.content.find((b: { type: string }) => b.type === 'text');
   if (!textBlock || textBlock.type !== 'text') {
@@ -206,7 +204,7 @@ export async function parseItemListing(item: ItemListing, ctx: AiCallCtx = {}): 
   if (cached && cached.description_hash === descHash) {
     try {
       const parsed = JSON.parse(cached.parsed_data);
-      recordLocalCacheHit({ feature: 'parse_item', ...ctx }, MODEL);
+      recordLocalCacheHit({ feature: 'parse_item', ...ctx }, PARSE_MODEL);
       return parsed;
     } catch {
       console.warn(`[parse-listing] Corrupt cache entry for ${item.platform}:${item.platformId}, re-parsing`);
@@ -224,7 +222,7 @@ Full description (Polish):
 ${(item.description || 'No description provided').slice(0, 8000)}`;
 
   const response = await createMessageTracked({
-    model: MODEL,
+    model: PARSE_MODEL,
     max_tokens: 1024,
     temperature: 0,
     system: [
@@ -305,7 +303,7 @@ export async function evaluateRejection(
   // Check rejection cache
   const cached = getRejectionCache(listing.platform, listing.platformId, criteriaHash);
   if (cached) {
-    recordLocalCacheHit({ feature: 'rejection_eval', ...ctx }, MODEL);
+    recordLocalCacheHit({ feature: 'rejection_eval', ...ctx }, PARSE_MODEL);
     return cached;
   }
 
@@ -340,8 +338,11 @@ export async function evaluateRejection(
   if ('contractType' in universalParse && universalParse.contractType != null) {
     summaryParts.push(`Contract type: ${universalParse.contractType}`);
   }
-  if ('petFriendly' in universalParse && universalParse.petFriendly != null) {
-    summaryParts.push(`Pets allowed: ${universalParse.petFriendly}`);
+  if ('twoOfficeCapable' in universalParse && universalParse.twoOfficeCapable != null) {
+    summaryParts.push(`Fits two home offices: ${universalParse.twoOfficeCapable}`);
+  }
+  if ('quiet' in universalParse && universalParse.quiet != null) {
+    summaryParts.push(`Quiet: ${universalParse.quiet}`);
   }
   if ('furnished' in universalParse && universalParse.furnished != null) {
     summaryParts.push(`Furnished: ${universalParse.furnished}`);
@@ -382,7 +383,7 @@ USER REJECTION CRITERIA:
 ${rejectionCriteria}`;
 
   const response = await createMessageTracked({
-    model: MODEL,
+    model: PARSE_MODEL,
     max_tokens: 256,
     temperature: 0,
     system: [{ type: 'text' as const, text: REJECTION_PROMPT, cache_control: { type: 'ephemeral' as const } }],

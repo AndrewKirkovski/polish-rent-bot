@@ -41,6 +41,8 @@ const AMENITY_SEARCHES: Record<string, string[][]> = {
   supermarket: [['supermarket']],
   park:        [['park']],
   pharmacy:    [['pharmacy']],
+  cafe:        [['cafe']],
+  restaurant:  [['restaurant']],
 };
 
 // ---------------------------------------------------------------------------
@@ -66,6 +68,8 @@ const TRANSPORT_CONFIG: Record<string, TransportConfig> = {
   supermarket: { walking: true,  transit: false, driving: false, checkFrequency: false, transitFallback: false },
   park:        { walking: true,  transit: false, driving: false, checkFrequency: false, transitFallback: false },
   pharmacy:    { walking: true,  transit: false, driving: false, checkFrequency: false, transitFallback: false },
+  cafe:        { walking: true,  transit: false, driving: false, checkFrequency: false, transitFallback: false },
+  restaurant:  { walking: true,  transit: false, driving: false, checkFrequency: false, transitFallback: false },
 };
 
 function getTransportConfig(type: string): TransportConfig {

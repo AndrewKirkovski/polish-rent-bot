@@ -17,6 +17,21 @@ process.on('uncaughtException', (err) => {
   process.exit(1);
 });
 
+// --- Config sanity check (fail loud on missing required keys, warn on optional) ---
+
+if (!process.env.TELEGRAM_TOKEN) {
+  console.error('[FATAL] TELEGRAM_TOKEN is required');
+  process.exit(1);
+}
+if (!process.env.ANTHROPIC_API_KEY) {
+  console.error('[FATAL] ANTHROPIC_API_KEY is required (AI parsing/agent will fail without it)');
+  process.exit(1);
+}
+if (!process.env.GOOGLE_MAPS_API_KEY) {
+  // Not fatal, but without it location scoring returns nothing and strict amenities reject everything.
+  console.warn('[startup] GOOGLE_MAPS_API_KEY not set — location scoring and amenity filters are DISABLED');
+}
+
 // --- Bootstrap ---
 
 getDb(); // initialize DB singleton (creates tables if needed)
@@ -35,8 +50,8 @@ try {
 startBot();
 
 const MONITOR_INTERVAL_MINUTES = 10;
-const stopScheduler = startScheduler(MONITOR_INTERVAL_MINUTES, (_userId, listing, parsedData, locationScore) =>
-  broadcastEnrichedNotification(listing, parsedData, locationScore),
+const stopScheduler = startScheduler(MONITOR_INTERVAL_MINUTES, (_userId, listing, parsedData, locationScore, fitReason) =>
+  broadcastEnrichedNotification(listing, parsedData, locationScore, fitReason),
 );
 
 const httpServer = startHttpServer();

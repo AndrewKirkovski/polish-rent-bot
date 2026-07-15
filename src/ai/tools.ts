@@ -12,6 +12,7 @@ import { formatRichRentalNotification, formatRichItemNotification, splitMessage,
 import { searchRentalListings, CITY_PROVINCE_MAP, resolveCityId } from '../search/rental-search.js';
 import { enrichRentalListing } from '../search/enrich-listing.js';
 import { checkAmenityGate, resolveStrictAmenities } from '../search/amenity-gate.js';
+import { computeFitScore, preScore } from '../search/fit-score.js';
 import {
   addMonitor,
   getMonitors,
@@ -136,7 +137,7 @@ export const TOOL_DEFINITIONS: Tool[] = [
           items: {
             type: 'object',
             properties: {
-              type: { type: 'string', enum: ['metro', 'tram', 'bus', 'gym', 'pool', 'supermarket', 'groceries', 'park', 'pharmacy', 'airport'], description: 'Amenity type' },
+              type: { type: 'string', enum: ['metro', 'tram', 'bus', 'gym', 'pool', 'supermarket', 'groceries', 'park', 'pharmacy', 'airport', 'cafe', 'restaurant'], description: 'Amenity type' },
               maxMinutes: { type: 'number', description: 'Maximum walking minutes to this amenity' },
             },
             required: ['type', 'maxMinutes'],
@@ -232,7 +233,7 @@ export const TOOL_DEFINITIONS: Tool[] = [
           items: {
             type: 'object',
             properties: {
-              type: { type: 'string', enum: ['metro', 'tram', 'bus', 'gym', 'pool', 'supermarket', 'groceries', 'park', 'pharmacy', 'airport'] },
+              type: { type: 'string', enum: ['metro', 'tram', 'bus', 'gym', 'pool', 'supermarket', 'groceries', 'park', 'pharmacy', 'airport', 'cafe', 'restaurant'] },
               maxMinutes: { type: 'number' },
             },
             required: ['type', 'maxMinutes'],
@@ -367,11 +368,13 @@ async function sendRentalCard(
   listing: Listing,
   parsedData: ParsedRentalData | null,
   locationScore: LocationScore | null,
+  fitReason?: string | null,
 ): Promise<void> {
   const rawCard = formatRichRentalNotification(
     listing,
     parsedData ?? undefined,
     locationScore ?? undefined,
+    fitReason,
   );
   const card = `<b>[${resultId}]</b>\n${rawCard}`;
 
@@ -505,6 +508,10 @@ async function execFindRentals(
     olxMaxPages: 2,
   });
 
+  // Rank best-structural-fit first (cheap, crawler-only) so the most promising candidates
+  // are analyzed and streamed first; the full AI fit score is shown per card.
+  deduped.sort((a, b) => preScore(b) - preScore(a));
+
   console.log(`[find_rentals] Search results: ${deduped.length} total (OLX: ${doOlx}, Otodom: ${doOtodom})`);
 
   if (deduped.length === 0) {
@@ -530,7 +537,6 @@ async function execFindRentals(
   let actualAnalyzed = 0;
   for (let i = 0; i < candidates.length; i++) {
     const listing = candidates[i];
-    actualAnalyzed++;
 
     // Stop if we have enough accepted results
     if (accepted.length >= maxResults) break;
@@ -538,6 +544,22 @@ async function execFindRentals(
     // Reserve a result ID for this candidate up-front so even rejection paths
     // (and the catch-all error handler below) can reference it.
     const resultId = genId();
+
+    // Pre-parse budget short-circuit: najem + czynsz ALONE already over the total
+    // budget → media can only push it higher, so skip the expensive enrich + AI parse.
+    if (priceTo != null && (listing.price + (listing.rent ?? 0)) > priceTo) {
+      const base = listing.price + (listing.rent ?? 0);
+      const reason = `дороже бюджета (${base} zł базовой ставки > ${priceTo})`;
+      // Cache the (un-enriched) listing so the advertised [ID] is still resolvable via
+      // show_listing, matching the other rejection paths.
+      try { cacheListing({ platform: listing.platform, platformId: listing.platformId, kind: 'rental', resultId, listing }); } catch (e) { console.error('[find_rentals] cache pre-reject failed:', e instanceof Error ? e.message : e); }
+      seedResultForFamily(ctx, resultId, listing);
+      rejected.push({ id: resultId, url: listing.url, title: listing.title, reason });
+      await sendRejection(ctx.chatId, sendFn, resultId, listing.url, listing.title, reason);
+      continue;
+    }
+
+    actualAnalyzed++; // count only candidates that reach real analysis
 
     try {
       // Fetch detail page / phone for richer data
@@ -565,7 +587,7 @@ async function execFindRentals(
         try {
           console.log(`[find_rentals] AI parsing...`);
           parsedData = await parseRentalListing(enrichedListing, { userId: ctx.userId });
-          console.log(`[find_rentals] AI parsed: total=${parsedData?.totalMonthlyCost}, contract=${parsedData?.contractType}, kaucja=${parsedData?.deposit}`);
+          console.log(`[find_rentals] AI parsed: contract=${parsedData?.contractType}, kaucja=${parsedData?.deposit}, offices=${parsedData?.twoOfficeCapable}, quiet=${parsedData?.quiet}`);
         } catch (parseErr) {
           console.error(`[find_rentals] AI parse FAILED for "${enrichedListing.title}":`, parseErr instanceof Error ? parseErr.message : parseErr);
         }
@@ -663,8 +685,10 @@ async function execFindRentals(
         continue;
       }
 
-      // ---- STREAM: send card to user immediately ----
-      await sendRentalCard(ctx.chatId, sendFn, sendPhotosFn, resultId, enrichedListing, parsedData, locationScore);
+      // ---- STREAM: send card to user immediately (fit score + best-fit signals on the card) ----
+      const fit = computeFitScore(enrichedListing, parsedData, locationScore);
+      const fitReason = `${fit.score}${fit.reason ? ' · ' + fit.reason : ''}`;
+      await sendRentalCard(ctx.chatId, sendFn, sendPhotosFn, resultId, enrichedListing, parsedData, locationScore, fitReason);
       accepted.push(enrichedListing);
       acceptedIds.push(resultId);
     } catch (err) {

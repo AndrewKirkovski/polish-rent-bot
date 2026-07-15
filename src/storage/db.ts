@@ -1103,9 +1103,19 @@ export function cleanOldCachedListings(maxAgeDays = 90): number {
 }
 
 function decodeCached(row: { kind: string; listing_json: string; result_id: string | null; cached_at: string }): CachedListingRecord {
+  const parsed = JSON.parse(row.listing_json) as Listing | ItemListing;
+  // Rows cached before the WFH-fields change lack these keys; normalize undefined → null
+  // so consumers can rely on the boolean|null contract (not undefined).
+  if (row.kind === 'rental') {
+    const l = parsed as Listing;
+    l.hasInternet ??= null;
+    l.hasElevator ??= null;
+    l.hasAc ??= null;
+    l.buildYear ??= null;
+  }
   return {
     kind: row.kind as 'rental' | 'item',
-    listing: JSON.parse(row.listing_json) as Listing | ItemListing,
+    listing: parsed,
     resultId: row.result_id,
     cachedAt: row.cached_at,
   };

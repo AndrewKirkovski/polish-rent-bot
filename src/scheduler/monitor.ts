@@ -12,6 +12,7 @@ import { searchRentalListings, resolveCityId } from '../search/rental-search.js'
 import { enrichRentalListing } from '../search/enrich-listing.js';
 import { checkAmenityGate, resolveStrictAmenities } from '../search/amenity-gate.js';
 import { notificationDedupKey } from '../search/listing-fingerprint.js';
+import { computeFitScore } from '../search/fit-score.js';
 
 // ---------------------------------------------------------------------------
 // Monitor config types (what lives inside monitor.config JSON column)
@@ -167,6 +168,7 @@ export function startScheduler(
     listing: Listing | ItemListing,
     parsedData?: ParsedRentalData | ParsedItemData | null,
     locationScore?: LocationScore | null,
+    fitReason?: string | null,
   ) => void | Promise<void>,
 ): () => void {
   let stopped = false;
@@ -193,7 +195,15 @@ export function startScheduler(
           const monitorConfig = JSON.parse(monitor.config) as RentalConfig;
           const strictAmenities = resolveStrictAmenities(monitorConfig.strictAmenities);
 
-          for (const listing of newListings) {
+          // Cap per cycle (like the interactive path) so a brand-new monitor doesn't fire
+          // 100+ enrich+parse calls at once. Overflow stays unseen for the next cycle.
+          const PER_CYCLE_CAP = 25;
+          const toProcess = newListings.slice(0, PER_CYCLE_CAP);
+          if (newListings.length > PER_CYCLE_CAP) {
+            console.log(`[scheduler] Monitor #${monitor.id}: capping ${newListings.length} new → ${PER_CYCLE_CAP} this cycle (rest next cycle)`);
+          }
+
+          for (const listing of toProcess) {
             try {
               if (monitor.type === 'rental') {
                 const fpKey = notificationDedupKey(listing as Listing);
@@ -205,6 +215,18 @@ export function startScheduler(
                 const itemKey = `${listing.platform}:${listing.platformId}`;
                 if (notifiedItemKeys.has(itemKey)) {
                   markListingSeen(monitor.id, listing.platform, listing.platformId, listing.url, listing.title, listing.price);
+                  continue;
+                }
+              }
+
+              // Pre-parse budget short-circuit: najem + czynsz ALONE over budget → media
+              // can only add more, so skip the expensive enrich + AI parse entirely.
+              if (monitor.type === 'rental' && monitorConfig.priceTo != null) {
+                const l = listing as Listing;
+                const base = l.price + (l.rent ?? 0);
+                if (base > monitorConfig.priceTo) {
+                  console.log(`[scheduler] Budget pre-reject "${l.title}": base ${base} > ${monitorConfig.priceTo} (no AI call)`);
+                  markListingSeen(monitor.id, l.platform, l.platformId, l.url, l.title, l.price);
                   continue;
                 }
               }
@@ -313,11 +335,17 @@ export function startScheduler(
                 }
               }
 
+              let fitReason: string | null = null;
+              if (monitor.type === 'rental') {
+                const fit = computeFitScore(workingListing as Listing, parsedData as ParsedRentalData | null, locationScore);
+                fitReason = `${fit.score}${fit.reason ? ' · ' + fit.reason : ''}`;
+              }
               await notifyFn(
                 monitor.user_id,
                 workingListing,
                 parsedData,
                 locationScore,
+                fitReason,
               );
               if (monitor.type === 'rental') {
                 notifiedFingerprints.add(notificationDedupKey(workingListing as Listing));

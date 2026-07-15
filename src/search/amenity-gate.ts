@@ -9,7 +9,7 @@ import type { AmenityPreference } from '../ai/maps.js';
 /** Extra minutes of tolerance when coordinates are only a district centroid (approximate). */
 const DISTRICT_SLACK_MIN = 5;
 
-const AMENITY_LABELS: Record<string, string> = {
+export const AMENITY_LABELS: Record<string, string> = {
   metro: 'метро',
   tram: 'трамвай',
   bus: 'автобус',
@@ -20,9 +20,12 @@ const AMENITY_LABELS: Record<string, string> = {
   park: 'парк',
   pharmacy: 'аптека',
   airport: 'аэропорт',
+  cafe: 'кафе',
+  restaurant: 'рестораны',
 };
 
-function label(type: string): string {
+/** Russian label for an amenity type (shared by the gate, fit-score, and card). */
+export function amenityLabel(type: string): string {
   return AMENITY_LABELS[type] ?? type;
 }
 
@@ -71,14 +74,14 @@ export function checkAmenityGate(
   for (const pref of amenities) {
     const result = locationScore.amenities.find((a) => a.type === pref.type);
     if (!result || result.places.length === 0) {
-      return { pass: false, reason: `${label(pref.type)} рядом не найдено` };
+      return { pass: false, reason: `${amenityLabel(pref.type)} рядом не найдено` };
     }
 
     // Exact/street coords: trust the strict withinLimit directly (no slack).
     if (slack === 0) {
       if (!result.withinLimit) {
         const mins = nearestMinutes(result);
-        return { pass: false, reason: `${label(pref.type)} ${mins ?? '?'} ${unit(pref.type)} (лимит ${pref.maxMinutes} мин)` };
+        return { pass: false, reason: `${amenityLabel(pref.type)} ${mins ?? '?'} ${unit(pref.type)} (лимит ${pref.maxMinutes} мин)` };
       }
       continue;
     }
@@ -87,7 +90,7 @@ export function checkAmenityGate(
     if (result.withinLimit) continue;
     const mins = nearestMinutes(result);
     if (mins != null && mins > pref.maxMinutes + slack) {
-      return { pass: false, reason: `${label(pref.type)} ${mins} ${unit(pref.type)} (лимит ${pref.maxMinutes}+${slack} мин, район)` };
+      return { pass: false, reason: `${amenityLabel(pref.type)} ${mins} ${unit(pref.type)} (лимит ${pref.maxMinutes}+${slack} мин, район)` };
     }
   }
 

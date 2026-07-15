@@ -7,12 +7,13 @@ import { z } from 'zod';
 // Rental listing schema — matches ParsedRentalData interface
 // ---------------------------------------------------------------------------
 
+// Trimmed to the pipeline-critical fields + WFH-fit signals + minimal display text.
+// The smaller output also stops the old ~30-field schema truncating at max_tokens.
 export const ParsedRentalDataSchema = z.looseObject({
+  // --- cost / pipeline-critical ---
   deposit: z.number().nullable().default(null),
   depositNote: z.string().nullable().default(null),
   adminFee: z.number().nullable().default(null),
-  adminFeeIncludes: z.string().nullable().default(null),
-  tenantPays: z.string().nullable().default(null),
   addressHint: z.string().nullable().default(null),
   isConcreteApartment: z.boolean().nullable().default(true),
   estimatedMedia: z.object({
@@ -28,28 +29,24 @@ export const ParsedRentalDataSchema = z.looseObject({
     internet: null,
     heating: null,
   }),
-  totalMonthlyCost: z.number().nullable().default(null),
-  totalBreakdown: z.string().nullable().default(null),
   contractType: z.enum(['najem_okazjonalny', 'najem_zwykly', 'najem_instytucjonalny']).nullable().default(null),
-  contractNote: z.string().nullable().default(null),
   availableFrom: z.string().nullable().default(null),
   minimumLease: z.string().nullable().default(null),
-  petFriendly: z.boolean().nullable().default(null),
-  smokingAllowed: z.boolean().nullable().default(null),
   furnished: z.enum(['full', 'partial', 'none']).nullable().default(null),
-  parkingIncluded: z.boolean().nullable().default(null),
   balcony: z.boolean().nullable().default(null),
+  parkingIncluded: z.boolean().nullable().default(null),
+  // --- work-from-home fit (the signals this household ranks on) ---
+  separateRooms: z.number().nullable().default(null),
+  layoutType: z.enum(['rozkladowy', 'przechodni', 'open']).nullable().default(null),
+  twoOfficeCapable: z.boolean().nullable().default(null),
+  quiet: z.enum(['quiet', 'mixed', 'noisy']).nullable().default(null),
+  naturalLight: z.enum(['bright', 'average', 'dark']).nullable().default(null),
+  internetType: z.enum(['fiber', 'cable', 'unknown']).nullable().default(null),
+  // --- display ---
   descriptionSummary: z.string().nullable().default(null),
-  furnitureAndEquipment: z.array(z.string()).default([]),
-  kitchenDetails: z.string().nullable().default(null),
-  bathroomDetails: z.string().nullable().default(null),
-  internetReady: z.string().nullable().default(null),
-  landlordNotes: z.string().nullable().default(null),
-  bestSuitedFor: z.string().nullable().default(null),
   redFlags: z.array(z.string()).default([]),
   positives: z.array(z.string()).default([]),
   restrictions: z.array(z.string()).default([]),
-  additionalNotes: z.array(z.string()).default([]),
 });
 
 // ---------------------------------------------------------------------------

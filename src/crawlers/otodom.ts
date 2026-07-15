@@ -176,6 +176,10 @@ function parseOtodomSearchItem(item: any): Listing | null {
     heating: null,
     furniture: null,
     parking: null,
+    hasInternet: null,   // search items don't carry the detail block — filled by enrichment
+    hasElevator: null,
+    hasAc: null,
+    buildYear: null,
     city: item.location?.address?.city?.name ?? '',
     district: findDistrict(locations),
     street: item.location?.address?.street?.name ?? null,
@@ -200,6 +204,15 @@ function parseOtodomDetailAd(ad: any): Listing | null {
   const slug = ad.slug ?? '';
   const target = ad.target ?? {};
 
+  // Landlord-checked amenity lists: a present tag is a reliable true, but an absent tag
+  // means "not stated", not false — so emit true-or-null and let the AI infer the rest.
+  const mediaTypes: string[] = Array.isArray(target.Media_types) ? target.Media_types.map((m: unknown) => String(m).toLowerCase()) : [];
+  const extras: string[] = Array.isArray(target.Extras_types) ? target.Extras_types.map((e: unknown) => String(e).toLowerCase()) : [];
+  const hasInternet = mediaTypes.some((m) => m.includes('internet')) ? true : null;
+  const hasElevator = extras.includes('lift') ? true : null;
+  const hasAc = extras.includes('air_conditioning') ? true : null;
+  const buildYear = target.Build_year ? (parseInt(String(target.Build_year), 10) || null) : null;
+
   return {
     platformId: String(ad.id),
     platform: 'otodom',
@@ -221,6 +234,10 @@ function parseOtodomDetailAd(ad: any): Listing | null {
     heating: target.Heating?.[0] ?? null,
     furniture: target.Equipment_types ? true : null,
     parking: target.Parking_type?.[0] ?? null,
+    hasInternet,
+    hasElevator,
+    hasAc,
+    buildYear,
     city: ad.location?.address?.city?.name ?? '',
     district: ad.location?.address?.district?.name ?? null,
     street: ad.location?.address?.street?.name

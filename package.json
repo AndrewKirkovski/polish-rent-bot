@@ -6,6 +6,8 @@
   "scripts": {
     "start": "tsx src/main.ts",
     "typecheck": "tsc --noEmit",
+    "typecheck:test": "tsc -p tsconfig.test.json",
+    "test": "node --import tsx --test test/dedup.test.ts test/fit-score.test.ts test/amenity-gate.test.ts test/format.test.ts",
     "dashboard:install": "pnpm --dir dashboard install",
     "dashboard:dev": "pnpm --dir dashboard dev",
     "dashboard:build": "pnpm --dir dashboard build",
