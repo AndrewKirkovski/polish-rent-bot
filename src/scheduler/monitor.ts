@@ -2,7 +2,7 @@
 // and calls a notification callback for each unseen result.
 
 import { searchItems, fetchItemPhone } from '../crawlers/olx-items.js';
-import { getMonitors, isListingSeen, markListingSeen, cleanOldSeen, cleanOldCachedListings, startMonitorRun, finishMonitorRun, cacheListing, isFingerprintNotified, markFingerprintNotified, type MonitorRow } from '../storage/db.js';
+import { getMonitors, isListingSeen, markListingSeen, cleanOldSeen, cleanOldCachedListings, cleanOldNotifiedFingerprints, startMonitorRun, finishMonitorRun, cacheListing, isFingerprintNotified, markFingerprintNotified, type MonitorRow } from '../storage/db.js';
 import type { Listing, ParsedRentalData, ParsedItemData, LocationScore } from '../types.js';
 import type { ItemListing } from '../crawlers/olx-items.js';
 import { parseRentalListing, parseItemListing, evaluateRejection, triageRentalListing } from '../ai/parse-listing.js';
@@ -396,6 +396,7 @@ export function startScheduler(
 
       cleanOldSeen(30);
       cleanOldCachedListings(90);
+      cleanOldNotifiedFingerprints(30);
 
       const totalNew = results.reduce((sum, r) => sum + r.newListings.length, 0);
       console.log(`[scheduler] Cycle complete — ${results.length} monitors, ${totalNew} unseen listings`);
