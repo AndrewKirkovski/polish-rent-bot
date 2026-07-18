@@ -36,6 +36,16 @@ test('non-walking amenity (groceries) is also enforced', () => {
   assert.equal(checkAmenityGate(s, [{ type: 'groceries', maxMinutes: 10 }], 'exact', true).pass, false);
 });
 
+test('transient Maps error (error:true) keeps-with-flag, does not hard-reject', () => {
+  const s = mkScore([{ type: 'metro', places: [], nearest: null, withinLimit: false, error: true }]);
+  assert.equal(checkAmenityGate(s, [{ type: 'metro', maxMinutes: 5 }], 'exact', true).pass, true);
+});
+
+test('genuine empty (no error) still hard-rejects in strict mode', () => {
+  const s = mkScore([{ type: 'metro', places: [], nearest: null, withinLimit: false }]);
+  assert.equal(checkAmenityGate(s, [{ type: 'metro', maxMinutes: 5 }], 'exact', true).pass, false);
+});
+
 test('new cafe amenity is enforced with a Russian label', () => {
   const s = mkScore([{ type: 'cafe', places: [{ name: 'C', walkingMinutes: 18, distance: '' }], nearest: { name: 'C', walkingMinutes: 18, distance: '' }, withinLimit: false }]);
   const g = checkAmenityGate(s, [{ type: 'cafe', maxMinutes: 10 }], 'exact', true);

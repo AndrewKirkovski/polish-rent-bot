@@ -476,7 +476,8 @@ export async function findNearbyAmenities(
 
     if (allPlaces.size === 0 && hadApiError) {
       console.error(`[maps] All searches for ${pref.type} failed with API errors — not caching`);
-      results.push({ type: pref.type, places: [], nearest: null, withinLimit: false });
+      // error:true → the strict gate keeps-with-flag rather than falsely rejecting "not nearby".
+      results.push({ type: pref.type, places: [], nearest: null, withinLimit: false, error: true });
       continue;
     }
 
@@ -540,8 +541,11 @@ export async function findNearbyAmenities(
 
     // B2. Transit distances (airport always, groceries as fallback)
     const needTransit = tc.transit && !tc.transitFallback; // airport: always
-    const needTransitFallback = tc.transitFallback &&
-      (nearbyPlaces.length === 0 || nearbyPlaces[0].walkingMinutes > pref.maxMinutes);
+    // Fetch transit UNCONDITIONALLY for transitFallback types (groceries), not only when
+    // walking > maxMinutes: the cache key omits maxMinutes and withinLimit is recomputed
+    // per-threshold on cache hits (computeWithinLimit), which needs transitMinutes to always
+    // be present — otherwise a later smaller-threshold read can't apply the transit fallback.
+    const needTransitFallback = tc.transitFallback;
 
     if ((needTransit || needTransitFallback) && destinations) {
       const mondayTs = getNextMondayWarsaw10am();
@@ -651,7 +655,7 @@ export async function findNearbyAmenities(
     // full 7-day TTL. Return it for this listing but let the next lookup re-measure.
     if (hadDistanceError && nearbyPlaces.length === 0) {
       console.error(`[maps] Distance measurement failed for ${pref.type} — returning uncached (will retry next lookup)`);
-      results.push(amenityResult);
+      results.push({ ...amenityResult, error: true }); // unknown, not "not nearby" — gate keeps-with-flag
       continue;
     }
 

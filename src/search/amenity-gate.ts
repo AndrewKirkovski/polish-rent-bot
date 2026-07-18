@@ -73,6 +73,9 @@ export function checkAmenityGate(
 
   for (const pref of amenities) {
     const result = locationScore.amenities.find((a) => a.type === pref.type);
+    // Transient Maps API/measurement failure → verdict unknown; keep-with-flag rather than
+    // falsely rejecting "not nearby" (and, in the monitor, permanently dropping the listing).
+    if (result?.error) continue;
     if (!result || result.places.length === 0) {
       return { pass: false, reason: `${amenityLabel(pref.type)} рядом не найдено` };
     }

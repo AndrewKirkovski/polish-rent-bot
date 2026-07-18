@@ -149,6 +149,8 @@ export interface AmenityResult {
   places: NearbyPlace[];          // top 3 closest, sorted by distance
   nearest: NearbyPlace | null;    // shortcut to places[0]
   withinLimit: boolean;           // true if nearest <= maxMinutes
+  error?: boolean;                // transient Maps API/measurement failure — verdict UNKNOWN,
+                                  // not a genuine "nothing nearby" (empty places is ambiguous otherwise)
 }
 
 export interface CommuteResult {
