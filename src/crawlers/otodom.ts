@@ -146,6 +146,18 @@ const FLOOR_MAP: Record<string, number> = {
   SEVENTH: 7, EIGHTH: 8, NINTH: 9, TENTH: 10, ABOVE_TENTH: 11, GARRET: -1,
 };
 
+/** Otodom's DETAIL target block encodes floor as "floor_N" / "ground_floor" (not the
+ *  search-item FLOOR_MAP enums), so parse that form or fall back to the enum/number. */
+function parseOtodomDetailFloor(raw: unknown): number | null {
+  if (raw == null) return null;
+  const s = String(raw);
+  if (s === 'ground_floor' || s === 'floor_0') return 0;
+  if (s === 'garret' || s === 'attic') return -1;
+  const m = s.match(/floor_(\d+)/);
+  if (m) return parseInt(m[1]!, 10);
+  return FLOOR_MAP[s] ?? (parseInt(s, 10) || null);
+}
+
 function findDistrict(locations: any[]): string | null {
   const district = locations?.find((l: any) => l.locationLevel === 'district');
   return district?.name ?? null;
@@ -228,9 +240,7 @@ export function parseOtodomDetailAd(ad: any): Listing | null {
     deposit: target.Deposit ? parseFloat(String(target.Deposit)) : null,
     area: target.Area ? parseFloat(String(target.Area)) : null,
     rooms: target.Rooms_num?.[0] ? parseInt(target.Rooms_num[0], 10) : null,
-    floor: target.Floor_no?.[0] != null
-      ? (FLOOR_MAP[target.Floor_no[0]] ?? (parseInt(target.Floor_no[0], 10) || null))
-      : null,
+    floor: parseOtodomDetailFloor(target.Floor_no?.[0]),
     buildingFloor: target.Building_floors_num ? parseInt(String(target.Building_floors_num), 10) : null,
     buildingType: target.Building_type?.[0] ?? null,
     heating: target.Heating?.[0] ?? null,

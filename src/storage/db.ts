@@ -530,6 +530,14 @@ export function updateMonitorConfig(monitorId: number, config: Record<string, un
   ).run(JSON.stringify(config), monitorId);
 }
 
+/** Keep the denormalized monitors.platform column in sync when a monitor's platform changes. */
+export function updateMonitorPlatform(monitorId: number, platform: string): void {
+  const db = getDb();
+  db.prepare(
+    'UPDATE monitors SET platform = ? WHERE id = ?',
+  ).run(platform, monitorId);
+}
+
 // ---------------------------------------------------------------------------
 // AI usage tracking
 // ---------------------------------------------------------------------------

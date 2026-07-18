@@ -20,6 +20,7 @@ import {
   deactivateMonitor,
   getSeenCount,
   updateMonitorConfig,
+  updateMonitorPlatform,
   cacheListing,
   getCachedListingByResultId,
   getParsedListing,
@@ -421,7 +422,7 @@ async function sendItemCard(
 
   if (item.photos.length > 0) {
     const caption = `[${resultId}] ${rawCard}`;
-    if (caption.length <= CAPTION_LIMIT) {
+    if (captionLength(caption) <= CAPTION_LIMIT) {
       try {
         await sendPhotosFn(chatId, item.photos.slice(0, 10), caption);
         return;
@@ -979,7 +980,22 @@ async function execUpdateMonitor(
   const existingConfig = JSON.parse(monitor.config) as Record<string, unknown>;
   const newConfig = { ...existingConfig, ...updates };
 
+  // If the city changed without an explicit province, re-resolve it (mirror create). A stale
+  // province from the old city malforms the Otodom URL and silently breaks that platform.
+  if (updates.city && updates.province == null) {
+    const prov = CITY_PROVINCE_MAP[String(updates.city).toLowerCase().trim()];
+    if (prov) newConfig.province = prov;
+    else delete newConfig.province; // let searchRentalListings backfill from the new city
+  }
+
   updateMonitorConfig(monitorId, newConfig);
+
+  // Keep the monitors.platform column in sync with a platforms change — list_monitors and the
+  // dashboard render that column, so leaving it stale shows a label that contradicts the search.
+  const VALID_PLATFORMS = ['olx', 'otodom', 'all', 'allegro', 'multi'];
+  if (typeof updates.platforms === 'string' && VALID_PLATFORMS.includes(updates.platforms)) {
+    updateMonitorPlatform(monitorId, updates.platforms);
+  }
 
   return `Monitor #${monitorId} updated.\nNew config: ${JSON.stringify(newConfig, null, 2)}`;
 }

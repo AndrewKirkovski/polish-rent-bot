@@ -476,6 +476,9 @@ export async function findNearbyAmenities(
       .join('|');
 
     let nearbyPlaces: NearbyPlace[] = [];
+    // Track Distance-Matrix failures so a transient DM error isn't cached for 7 days as a
+    // false "amenity not reachable" (which would poison the card, fit-score and strict gate).
+    let hadDistanceError = false;
 
     // B1. Walking distances (for most amenities)
     if (tc.walking && destinations) {
@@ -484,6 +487,7 @@ export async function findNearbyAmenities(
         const distRes = await fetchJson<DistanceMatrixResponse>(distUrl);
         if (distRes.status !== 'OK') {
           console.error(`[maps] Walking DM for ${pref.type}: ${distRes.status} — ${distRes.error_message ?? ''}`);
+          hadDistanceError = true;
           for (const p of placesArr.slice(0, MAX_PLACES_PER_TYPE)) {
             nearbyPlaces.push({ name: p.displayName?.text ?? 'Unknown', walkingMinutes: -1, distance: 'unknown' });
           }
@@ -502,6 +506,7 @@ export async function findNearbyAmenities(
         }
       } catch (err) {
         console.error(`[maps] Walking DM failed for ${pref.type}:`, err);
+        hadDistanceError = true;
         for (const p of placesArr.slice(0, MAX_PLACES_PER_TYPE)) {
           nearbyPlaces.push({ name: p.displayName?.text ?? 'Unknown', walkingMinutes: -1, distance: 'unknown' });
         }
@@ -555,6 +560,7 @@ export async function findNearbyAmenities(
         }
       } catch (err) {
         console.error(`[maps] Transit DM failed for ${pref.type}:`, err);
+        hadDistanceError = true;
       }
     }
 
@@ -578,6 +584,7 @@ export async function findNearbyAmenities(
         }
       } catch (err) {
         console.error(`[maps] Driving DM failed for ${pref.type}:`, err);
+        hadDistanceError = true;
       }
     }
 
@@ -631,6 +638,15 @@ export async function findNearbyAmenities(
       nearest,
       withinLimit,
     };
+
+    // Don't cache a result whose distances couldn't be measured (transient DM failure left no
+    // usable places) — otherwise a temporary Google hiccup pins a false "not reachable" for the
+    // full 7-day TTL. Return it for this listing but let the next lookup re-measure.
+    if (hadDistanceError && nearbyPlaces.length === 0) {
+      console.error(`[maps] Distance measurement failed for ${pref.type} — returning uncached (will retry next lookup)`);
+      results.push(amenityResult);
+      continue;
+    }
 
     setMapsCacheEntry(cacheKey, wrapCache(amenityResult));
     results.push(amenityResult);
