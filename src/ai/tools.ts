@@ -632,6 +632,14 @@ async function execFindRentals(
         await sendRejection(ctx.chatId, sendFn, resultId, enrichedListing.url, enrichedListing.title, reason);
         continue;
       }
+      // Minimum-total gate (priceFrom is the min TOTAL, not base rent — enforced here on the
+      // full computed total rather than by the platform base-rent filter, to avoid false negatives).
+      if (priceFrom != null && estimatedTotal > 0 && estimatedTotal < priceFrom) {
+        const reason = `итог ~${estimatedTotal} zł ниже мин. бюджета ${priceFrom} zł`;
+        rejected.push({ id: resultId, url: enrichedListing.url, title: enrichedListing.title, reason });
+        await sendRejection(ctx.chatId, sendFn, resultId, enrichedListing.url, enrichedListing.title, reason);
+        continue;
+      }
 
       // Contract preference filter
       if (

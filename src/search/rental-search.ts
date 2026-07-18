@@ -100,7 +100,8 @@ export async function searchRentalListings(params: RentalSearchParams): Promise<
           cityId,
           districtIds: districtIds?.length ? districtIds : undefined,
           roomCounts,
-          priceFrom: params.priceFrom,
+          // Only priceTo (a najem<=maxTotal necessary bound). priceFrom filters base rent,
+          // which would wrongly drop low-najem/high-czynsz flats — enforced post-parse instead.
           priceTo: params.priceTo,
           limit: params.olxLimit ?? 40,
           maxPages: params.olxMaxPages ?? 2,
@@ -119,7 +120,7 @@ export async function searchRentalListings(params: RentalSearchParams): Promise<
           province,
           city: city || undefined,
           district: district ? stripDiacritics(district) : undefined,
-          priceFrom: params.priceFrom,
+          // priceFrom omitted on purpose (base-rent min → false negatives); enforced post-parse.
           priceTo: params.priceTo,
           areaFrom: params.areaFrom,
           areaTo: params.areaTo,

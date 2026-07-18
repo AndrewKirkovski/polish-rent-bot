@@ -290,11 +290,17 @@ export function startScheduler(
               }
 
               const config = monitorConfig;
-              if (monitor.type === 'rental' && config.priceTo != null) {
+              if (monitor.type === 'rental' && (config.priceTo != null || config.priceFrom != null)) {
                 const l = workingListing as Listing;
                 const estimatedTotal = computeRentalCost(l, parsedData as ParsedRentalData | null).total;
-                if (estimatedTotal > config.priceTo) {
+                if (config.priceTo != null && estimatedTotal > config.priceTo) {
                   console.log(`[scheduler] Budget reject "${l.title}": ${estimatedTotal} > ${config.priceTo}`);
+                  markListingSeen(monitor.id, l.platform, l.platformId, l.url, l.title, l.price);
+                  continue;
+                }
+                // priceFrom = min TOTAL, enforced here (not by the platform base-rent filter).
+                if (config.priceFrom != null && estimatedTotal > 0 && estimatedTotal < config.priceFrom) {
+                  console.log(`[scheduler] Below-min reject "${l.title}": ${estimatedTotal} < ${config.priceFrom}`);
                   markListingSeen(monitor.id, l.platform, l.platformId, l.url, l.title, l.price);
                   continue;
                 }

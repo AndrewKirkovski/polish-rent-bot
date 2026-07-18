@@ -131,6 +131,8 @@ export function formatRentalCard(
   else if (parsed?.deposit != null) payLine.push(`Kaucja: ${zl(parsed.deposit)}`);
   else payLine.push(`Kaucja: ${CE.warning} ?`);
   if (parsed?.contractType) payLine.push(esc(parsed.contractType.replace(/_/g, ' ')));
+  if (parsed?.availableFrom) payLine.push(`📅 ${esc(trunc(parsed.availableFrom, 24))}`);
+  if (parsed?.minimumLease) payLine.push(`мин. ${esc(trunc(parsed.minimumLease, 24))}`);
   const payLineStr = payLine.join(' · ');
 
   // --- Apartment line; the trailing restriction note is droppable ---
