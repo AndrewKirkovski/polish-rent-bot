@@ -76,6 +76,22 @@ function getTransportConfig(type: string): TransportConfig {
   return TRANSPORT_CONFIG[type] ?? { walking: true, transit: false, driving: false, checkFrequency: false, transitFallback: false };
 }
 
+/** Whether the nearest place is within `maxMinutes` by the type-appropriate metric.
+ *  The per-place minutes are threshold-independent, so this is recomputed on every read
+ *  (incl. cache hits) — the maps cache key omits maxMinutes, so the stored boolean can't
+ *  be trusted across requests with different limits. */
+export function computeWithinLimit(nearest: NearbyPlace | null, tc: TransportConfig, maxMinutes: number): boolean {
+  if (!nearest) return false;
+  let within = false;
+  if (tc.walking && nearest.walkingMinutes >= 0) within = nearest.walkingMinutes <= maxMinutes;
+  if (!tc.walking) {
+    within = (nearest.transitMinutes != null && nearest.transitMinutes <= maxMinutes) ||
+             (nearest.drivingMinutes != null && nearest.drivingMinutes <= maxMinutes);
+  }
+  if (tc.transitFallback && !within && nearest.transitMinutes != null) within = nearest.transitMinutes <= maxMinutes;
+  return within;
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -399,7 +415,12 @@ export async function findNearbyAmenities(
     const cacheKey = `nearby5:${roundCoord(lat)}:${roundCoord(lng)}:${pref.type}`;
     const cached = getMapsCacheEntry(cacheKey);
     if (isCacheValid(cached)) {
-      results.push(unwrapCache<AmenityResult>(cached!));
+      const r = unwrapCache<AmenityResult>(cached!);
+      // The cache key omits maxMinutes; recompute withinLimit for THIS request's threshold
+      // from the (threshold-independent) cached place minutes rather than trusting the
+      // boolean that was written under whatever limit first populated the entry.
+      r.withinLimit = computeWithinLimit(r.nearest, tc, pref.maxMinutes);
+      results.push(r);
       continue;
     }
 
@@ -616,21 +637,7 @@ export async function findNearbyAmenities(
 
     // ---- D. Compute withinLimit ----
     const nearest = nearbyPlaces[0] ?? null;
-    let withinLimit = false;
-    if (nearest) {
-      if (tc.walking && nearest.walkingMinutes >= 0) {
-        withinLimit = nearest.walkingMinutes <= pref.maxMinutes;
-      }
-      // Airport: check transit or driving
-      if (!tc.walking) {
-        withinLimit = (nearest.transitMinutes != null && nearest.transitMinutes <= pref.maxMinutes) ||
-                      (nearest.drivingMinutes != null && nearest.drivingMinutes <= pref.maxMinutes);
-      }
-      // Groceries fallback: transit counts too
-      if (tc.transitFallback && !withinLimit && nearest.transitMinutes != null) {
-        withinLimit = nearest.transitMinutes <= pref.maxMinutes;
-      }
-    }
+    const withinLimit = computeWithinLimit(nearest, tc, pref.maxMinutes);
 
     const amenityResult: AmenityResult = {
       type: pref.type,

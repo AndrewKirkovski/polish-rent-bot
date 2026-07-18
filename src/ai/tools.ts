@@ -166,7 +166,7 @@ export const TOOL_DEFINITIONS: Tool[] = [
         },
         strictAmenities: {
           type: 'boolean',
-          description: 'If true, hard-reject listings where metro/tram/bus are beyond maxMinutes walking distance. Default: score only on card. Set true when user asks for strict walking distance (e.g. "really 5 min walk to metro").',
+          description: 'If true, hard-reject a listing when ANY requested amenity exceeds its maxMinutes (by its own metric — walking for transit/shops/gym, transit/driving for airport), not only metro/tram/bus. Default: score on card only. Set true only when the user asks for strict proximity (e.g. "really 5 min walk to metro").',
         },
       },
       required: ['city'],
@@ -250,7 +250,7 @@ export const TOOL_DEFINITIONS: Tool[] = [
         },
         strictAmenities: {
           type: 'boolean',
-          description: 'Hard-reject when metro/tram/bus exceed maxMinutes walking. Persisted in monitor config.',
+          description: 'Hard-reject when ANY requested amenity exceeds its maxMinutes (not only metro/tram/bus). Persisted in monitor config.',
         },
         // Item search params
         query: { type: 'string', description: 'Search keywords (for item monitors)' },
