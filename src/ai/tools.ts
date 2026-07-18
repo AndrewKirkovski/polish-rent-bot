@@ -218,8 +218,8 @@ export const TOOL_DEFINITIONS: Tool[] = [
         province: { type: 'string', description: 'Province' },
         priceFrom: { type: 'number', description: 'Min price / budget' },
         priceTo: { type: 'number', description: 'Max total monthly budget in PLN' },
-        roomsFrom: { type: 'number', description: 'Min rooms' },
-        roomsTo: { type: 'number', description: 'Max rooms' },
+        roomsFrom: { type: 'number', description: 'Number of ROOMS. For an exact count set roomsFrom AND roomsTo equal; for a range set both ends. A lone roomsFrom is treated as an EXACT count, not a minimum.' },
+        roomsTo: { type: 'number', description: 'Upper bound of the room range (equal to roomsFrom for an exact count).' },
         areaFrom: { type: 'number', description: 'Min area m2' },
         areaTo: { type: 'number', description: 'Max area m2' },
         ownerType: { type: 'string', enum: ['ALL', 'PRIVATE', 'AGENCY'] },
@@ -1028,7 +1028,13 @@ async function execListMonitors(
     if (config.districts) parts.push(`  Districts: ${(config.districts as string[]).join(', ')}`);
     if (config.query) parts.push(`  Query: "${config.query}"`);
     if (config.priceTo) parts.push(`  Max budget: ${config.priceTo} PLN`);
-    if (config.roomsFrom) parts.push(`  Rooms: ${config.roomsFrom}${config.roomsTo ? `-${config.roomsTo}` : '+'}`);
+    if (config.roomsFrom) {
+      // roomsTo defaults to roomsFrom at runtime (exact match), so a lone roomsFrom is an
+      // exact count — render it as such, not as "N+" which wrongly reads as a minimum.
+      const rf = config.roomsFrom as number;
+      const rt = config.roomsTo as number | undefined;
+      parts.push(`  Rooms: ${rt != null && rt !== rf ? `${rf}-${rt}` : rf}`);
+    }
     if (config.amenities) {
       const amens = config.amenities as Array<{ type: string; maxMinutes: number }>;
       parts.push(`  Amenities: ${amens.map((a) => `${a.type} (${a.maxMinutes}min)`).join(', ')}`);
