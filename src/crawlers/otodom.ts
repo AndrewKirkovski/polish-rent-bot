@@ -198,7 +198,7 @@ function parseOtodomSearchItem(item: any): Listing | null {
   };
 }
 
-function parseOtodomDetailAd(ad: any): Listing | null {
+export function parseOtodomDetailAd(ad: any): Listing | null {
   if (!ad?.id) return null;
 
   const slug = ad.slug ?? '';
@@ -220,7 +220,9 @@ function parseOtodomDetailAd(ad: any): Listing | null {
     slug,
     title: ad.title ?? '',
     description: ad.description ?? '',
-    price: ad.price?.value ?? target.Price ?? 0,
+    // Coerce the target.* fallback like every sibling below — that block stores strings,
+    // and an unparsed string in Listing.price string-concatenates in computeRentalCost.
+    price: ad.price?.value ?? (target.Price != null ? parseFloat(String(target.Price)) || 0 : 0),
     currency: ad.price?.currency ?? 'PLN',
     rent: target.Rent ? parseFloat(String(target.Rent)) : null,
     deposit: target.Deposit ? parseFloat(String(target.Deposit)) : null,
