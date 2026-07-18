@@ -110,7 +110,6 @@ export interface ParsedRentalData {
 }
 
 export interface ParsedItemData {
-  // Note: 'relevant' field is used by items to distinguish "wrong product" from "close but rejected"
   actualCondition: string;
   whySelling: string | null;
   defects: string[];
