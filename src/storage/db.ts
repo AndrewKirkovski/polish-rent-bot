@@ -78,6 +78,13 @@ const SCHEMA = `
   CREATE INDEX IF NOT EXISTS idx_seen_monitor
     ON seen_listings(monitor_id, first_seen_at);
 
+  -- Cross-monitor notification dedup: a physical flat (by fingerprint) or item is alerted to
+  -- the household at most once, even across cycles/monitors (seen_listings is per-monitor).
+  CREATE TABLE IF NOT EXISTS notified_fingerprints (
+    fingerprint       TEXT PRIMARY KEY,
+    first_notified_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
   CREATE TABLE IF NOT EXISTS conversations (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id     INTEGER NOT NULL,
@@ -371,6 +378,31 @@ export function cleanOldSeen(olderThanDays: number): number {
   const result = db.prepare(`
     DELETE FROM seen_listings
     WHERE first_seen_at < datetime('now', ? || ' days')
+  `).run(`-${olderThanDays}`);
+  return result.changes;
+}
+
+// ---------------------------------------------------------------------------
+// Cross-monitor notification dedup (persistent, across cycles + monitors)
+// ---------------------------------------------------------------------------
+
+export function isFingerprintNotified(fingerprint: string): boolean {
+  const db = getDb();
+  return db.prepare('SELECT 1 FROM notified_fingerprints WHERE fingerprint = ?').get(fingerprint) !== undefined;
+}
+
+export function markFingerprintNotified(fingerprint: string): void {
+  const db = getDb();
+  db.prepare(
+    `INSERT INTO notified_fingerprints (fingerprint) VALUES (?) ON CONFLICT(fingerprint) DO NOTHING`,
+  ).run(fingerprint);
+}
+
+export function cleanOldNotifiedFingerprints(olderThanDays: number): number {
+  const db = getDb();
+  const result = db.prepare(`
+    DELETE FROM notified_fingerprints
+    WHERE first_notified_at < datetime('now', ? || ' days')
   `).run(`-${olderThanDays}`);
   return result.changes;
 }

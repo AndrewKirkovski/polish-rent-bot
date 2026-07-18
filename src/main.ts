@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { getDb, cleanOldCachedListings, cleanExpiredMapsCache } from './storage/db.js';
+import { getDb, cleanOldCachedListings, cleanExpiredMapsCache, cleanOldNotifiedFingerprints } from './storage/db.js';
 import { startBot, broadcastEnrichedNotification } from './bot/telegram.js';
 import { startScheduler } from './scheduler/monitor.js';
 import { closeBrowser } from './crawlers/otodom.js';
@@ -40,8 +40,9 @@ getDb(); // initialize DB singleton (creates tables if needed)
 try {
   const prunedListings = cleanOldCachedListings();
   const prunedMaps = cleanExpiredMapsCache();
-  if (prunedListings || prunedMaps) {
-    console.log(`[startup] pruned ${prunedListings} old cached listings, ${prunedMaps} expired maps entries`);
+  const prunedNotified = cleanOldNotifiedFingerprints(30); // a flat re-listed >30d later is genuinely new
+  if (prunedListings || prunedMaps || prunedNotified) {
+    console.log(`[startup] pruned ${prunedListings} cached listings, ${prunedMaps} maps entries, ${prunedNotified} notified fingerprints`);
   }
 } catch (err) {
   console.error('[startup] cache prune failed:', err instanceof Error ? err.message : err);

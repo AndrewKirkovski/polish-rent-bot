@@ -552,6 +552,10 @@ export async function findNearbyAmenities(
       const transitUrl = `${MAPS_BASE}/distancematrix/json?origins=${lat},${lng}&destinations=${destinations}&mode=transit&departure_time=${mondayTs}&language=pl&key=${API_KEY}`;
       try {
         const transitRes = await fetchJson<DistanceMatrixResponse>(transitUrl);
+        if (transitRes.status !== 'OK') {
+          console.error(`[maps] Transit DM for ${pref.type}: ${transitRes.status} — ${transitRes.error_message ?? ''}`);
+          hadDistanceError = true; // mirror B1 — a non-OK status is a measurement failure
+        }
         if (transitRes.status === 'OK') {
           const elements = transitRes.rows[0]?.elements ?? [];
           for (let i = 0; i < elements.length && i < placesArr.length; i++) {
@@ -650,10 +654,12 @@ export async function findNearbyAmenities(
       withinLimit,
     };
 
-    // Don't cache a result whose distances couldn't be measured (transient DM failure left no
-    // usable places) — otherwise a temporary Google hiccup pins a false "not reachable" for the
-    // full 7-day TTL. Return it for this listing but let the next lookup re-measure.
-    if (hadDistanceError && nearbyPlaces.length === 0) {
+    // Don't cache a result a transient DM failure could have turned into a false negative —
+    // otherwise a temporary Google hiccup pins a false "not reachable" for the full 7-day TTL.
+    // Two cases: no usable places at all, OR a transitFallback type (groceries) that's over the
+    // walking limit whose transit rescue couldn't be measured (transitMinutes missing).
+    const transitRescueMissing = tc.transitFallback && !withinLimit && (nearest == null || nearest.transitMinutes == null);
+    if (hadDistanceError && (nearbyPlaces.length === 0 || transitRescueMissing)) {
       console.error(`[maps] Distance measurement failed for ${pref.type} — returning uncached (will retry next lookup)`);
       results.push({ ...amenityResult, error: true }); // unknown, not "not nearby" — gate keeps-with-flag
       continue;

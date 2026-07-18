@@ -1,8 +1,8 @@
 // Monitor scheduler — runs active monitors on an interval, detects new listings,
 // and calls a notification callback for each unseen result.
 
-import { searchItems } from '../crawlers/olx-items.js';
-import { getMonitors, isListingSeen, markListingSeen, cleanOldSeen, cleanOldCachedListings, startMonitorRun, finishMonitorRun, cacheListing, type MonitorRow } from '../storage/db.js';
+import { searchItems, fetchItemPhone } from '../crawlers/olx-items.js';
+import { getMonitors, isListingSeen, markListingSeen, cleanOldSeen, cleanOldCachedListings, startMonitorRun, finishMonitorRun, cacheListing, isFingerprintNotified, markFingerprintNotified, type MonitorRow } from '../storage/db.js';
 import type { Listing, ParsedRentalData, ParsedItemData, LocationScore } from '../types.js';
 import type { ItemListing } from '../crawlers/olx-items.js';
 import { parseRentalListing, parseItemListing, evaluateRejection, triageRentalListing } from '../ai/parse-listing.js';
@@ -181,8 +181,6 @@ export function startScheduler(
 
     try {
       const results = await runAllMonitors();
-      const notifiedFingerprints = new Set<string>();
-      const notifiedItemKeys = new Set<string>();
 
       for (const { monitor, runId, totalFound, newListings, searchError } of results) {
         if (searchError !== null) continue;
@@ -210,22 +208,15 @@ export function startScheduler(
 
           for (const listing of toProcess) {
             try {
-              // Compute the cross-monitor dedup key from the PRE-enrich listing and reuse it
-              // for the post-delivery add, so enrichment can't shift the fingerprint between
-              // the has()-check and the add() (which would let the same flat notify twice).
-              let dedupKey: string | null = null;
-              if (monitor.type === 'rental') {
-                dedupKey = notificationDedupKey(listing as Listing);
-                if (notifiedFingerprints.has(dedupKey)) {
-                  markListingSeen(monitor.id, listing.platform, listing.platformId, listing.url, listing.title, listing.price);
-                  continue;
-                }
-              } else {
-                const itemKey = `${listing.platform}:${listing.platformId}`;
-                if (notifiedItemKeys.has(itemKey)) {
-                  markListingSeen(monitor.id, listing.platform, listing.platformId, listing.url, listing.title, listing.price);
-                  continue;
-                }
+              // Cross-monitor notification dedup — persistent (across cycles + monitors), so a
+              // shared flat isn't re-alerted when one monitor defers it past the per-cycle cap.
+              // Key from the PRE-enrich listing so enrichment can't shift it between check and mark.
+              const dedupKey = monitor.type === 'rental'
+                ? notificationDedupKey(listing as Listing)
+                : `item:${listing.platform}:${listing.platformId}`;
+              if (isFingerprintNotified(dedupKey)) {
+                markListingSeen(monitor.id, listing.platform, listing.platformId, listing.url, listing.title, listing.price);
+                continue;
               }
 
               // Pre-parse budget short-circuit: base rent alone over budget → skip enrich + AI.
@@ -258,6 +249,13 @@ export function startScheduler(
               let workingListing = listing;
               if (monitor.type === 'rental') {
                 workingListing = await enrichRentalListing(listing as Listing);
+              } else if (!(listing as ItemListing).phone) {
+                // Mirror find_items: fetch the contact phone best-effort so scheduled item
+                // alerts carry 📞 too. Doesn't change platform/platformId, so seen/dedup stay stable.
+                try {
+                  const phone = await fetchItemPhone(listing.platformId);
+                  if (phone) workingListing = { ...(listing as ItemListing), phone };
+                } catch (e) { console.warn('[scheduler] item phone fetch failed:', e instanceof Error ? e.message : e); }
               }
 
               let parsedData: ParsedRentalData | import('../types.js').ParsedItemData | null = null;
@@ -377,11 +375,7 @@ export function startScheduler(
                 locationScore,
                 fitReason,
               );
-              if (monitor.type === 'rental') {
-                if (dedupKey) notifiedFingerprints.add(dedupKey);
-              } else {
-                notifiedItemKeys.add(`${workingListing.platform}:${workingListing.platformId}`);
-              }
+              markFingerprintNotified(dedupKey); // household-wide, so no other monitor re-alerts it
               markListingSeen(monitor.id, workingListing.platform, workingListing.platformId, workingListing.url, workingListing.title, workingListing.price);
               delivered++;
             } catch (notifyErr) {
