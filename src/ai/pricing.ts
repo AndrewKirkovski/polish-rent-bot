@@ -69,7 +69,9 @@ export function extractUsage(usage: Anthropic.Usage | undefined | null): UsageBr
 const warnedModels = new Set<string>();
 
 export function calculateCost(model: string, usage: UsageBreakdown): number {
-  const pricing = MODEL_PRICING[model];
+  // The API returns dated model IDs (e.g. claude-haiku-4-5-20251001) while the table is
+  // keyed by the alias — fall back to the date-stripped base so pricing still resolves.
+  const pricing = MODEL_PRICING[model] ?? MODEL_PRICING[model.replace(/-\d{8}$/, '')];
   if (!pricing) {
     if (!warnedModels.has(model)) {
       console.warn(`[pricing] No pricing entry for model "${model}" — cost will be 0. Update src/ai/pricing.ts.`);

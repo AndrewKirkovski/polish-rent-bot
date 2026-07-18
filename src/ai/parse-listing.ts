@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto';
 import type { Listing, ParsedRentalData, ParsedItemData, RejectionResult } from '../types.js';
 import type { ItemListing } from '../crawlers/olx-items.js';
 import { getParsedListing, saveParsedListing, getRejectionCache, saveRejectionCache } from '../storage/db.js';
-import { ParsedRentalDataSchema, ParsedItemDataSchema, RejectionResultSchema } from './schemas.js';
+import { ParsedRentalDataSchema, ParsedItemDataSchema, RejectionResultSchema, RentalTriageSchema } from './schemas.js';
 import { createMessageTracked, recordLocalCacheHit } from './client.js';
 import { computeRentalCost } from '../cost.js';
 
@@ -79,6 +79,60 @@ JSON schema:
   "positives": ["сильные стороны для удалёнщиков"],
   "restrictions": ["напр. только без животных, нужен польский ID"]
 }`;
+
+// ---------------------------------------------------------------------------
+// Rental triage — cheap Haiku gate run BEFORE the expensive enrich + full parse.
+// Answers only "is this one whole apartment?" and its room count, so we never spend
+// enrichment/full-analysis effort on single-room, coliving, shared, or non-flat listings.
+// ---------------------------------------------------------------------------
+
+const TRIAGE_PROMPT = `Classify a Polish rental listing from its title + short description. Answer ONLY whether it is ONE whole self-contained apartment offered for rent, and its room count.
+
+apartment = false when it is NOT a single independent flat, e.g.: a single room ("pokój do wynajęcia", "wynajmę pokój"), a bed/place in a shared room ("miejsce w pokoju", "łóżko"), a student room (stancja), a roommate/coliving offer (współlokator, coliving, rooms rented separately "pokoje wynajmowane osobno", per-person pricing "za osobę" / "zł/os"), an agency portfolio advertising many flats, a new-development sale, or a price range. apartment = true for a normal mieszkanie / apartament / kawalerka (studio) rented as a whole — a plain capacity phrase like "idealne dla 2 osób" is NOT coliving.
+
+rooms = the apartment's room count (pokoje; kawalerka/studio = 1) if determinable, else null.
+
+Return ONLY JSON, no prose: {"apartment": true|false, "rooms": number|null}`;
+
+export interface RentalTriage {
+  apartment: boolean;
+  rooms: number | null;
+}
+
+/** Cheap pre-parse gate. Fails OPEN (returns apartment:true) on any error so a triage
+ *  hiccup never wrongly drops a real listing. */
+export async function triageRentalListing(
+  listing: Pick<Listing, 'title' | 'description' | 'rooms'>,
+  ctx: AiCallCtx = {},
+): Promise<RentalTriage> {
+  const fallback: RentalTriage = { apartment: true, rooms: listing.rooms ?? null };
+  try {
+    const userMessage = `Title: ${listing.title}
+Structured rooms (from platform, may be missing): ${listing.rooms ?? 'unknown'}
+Description (Polish, truncated):
+${(listing.description || 'No description').slice(0, 600)}`;
+
+    const response = await createMessageTracked({
+      model: PARSE_MODEL,
+      max_tokens: 64,
+      temperature: 0,
+      // No cache_control: the prompt is far below the min cacheable size, so it would be
+      // inert. Triage is intentionally uncached — it's the cheapest call and the monitor
+      // path is already gated by isListingSeen.
+      system: TRIAGE_PROMPT,
+      messages: [{ role: 'user', content: userMessage }],
+    }, { feature: 'triage_rental', ...ctx }, { timeout: 30_000 });
+
+    const textBlock = response.content.find((b: { type: string }) => b.type === 'text');
+    if (!textBlock || textBlock.type !== 'text') return fallback;
+    const match = textBlock.text.match(/\{[\s\S]*\}/);
+    if (!match) return fallback;
+    return RentalTriageSchema.parse(JSON.parse(match[0])) as RentalTriage;
+  } catch (err) {
+    console.error('[triage] failed, keeping listing:', err instanceof Error ? err.message : err);
+    return fallback;
+  }
+}
 
 export async function parseRentalListing(listing: Listing, ctx: AiCallCtx = {}): Promise<ParsedRentalData> {
   const descHash = rentalParseCacheKey(listing.description || listing.title);

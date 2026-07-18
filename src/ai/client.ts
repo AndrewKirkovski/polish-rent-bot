@@ -11,7 +11,8 @@ export type Feature =
   | 'agent_tool_loop'
   | 'parse_rental'
   | 'parse_item'
-  | 'rejection_eval';
+  | 'rejection_eval'
+  | 'triage_rental';
 
 export interface CallContext {
   feature: Feature;

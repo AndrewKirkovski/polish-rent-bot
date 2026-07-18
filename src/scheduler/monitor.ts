@@ -5,7 +5,7 @@ import { searchItems } from '../crawlers/olx-items.js';
 import { getMonitors, isListingSeen, markListingSeen, cleanOldSeen, cleanOldCachedListings, startMonitorRun, finishMonitorRun, cacheListing, type MonitorRow } from '../storage/db.js';
 import type { Listing, ParsedRentalData, ParsedItemData, LocationScore } from '../types.js';
 import type { ItemListing } from '../crawlers/olx-items.js';
-import { parseRentalListing, parseItemListing, evaluateRejection } from '../ai/parse-listing.js';
+import { parseRentalListing, parseItemListing, evaluateRejection, triageRentalListing } from '../ai/parse-listing.js';
 import { scoreLocation } from '../ai/maps.js';
 import { computeRentalCost, exceedsBudgetFloor } from '../cost.js';
 import { searchRentalListings, resolveCityId } from '../search/rental-search.js';
@@ -229,6 +229,23 @@ export function startScheduler(
                 const l = listing as Listing;
                 if (exceedsBudgetFloor(l, monitorConfig.priceTo)) {
                   console.log(`[scheduler] Budget pre-reject "${l.title}": аренда ${l.price} > ${monitorConfig.priceTo} (no AI call)`);
+                  markListingSeen(monitor.id, l.platform, l.platformId, l.url, l.title, l.price);
+                  continue;
+                }
+              }
+
+              // Cheap AI triage before the expensive enrich + full parse: drop room/coliving/
+              // non-apartment listings and enforce the room count when the platform didn't report it.
+              if (monitor.type === 'rental') {
+                const l = listing as Listing;
+                const triage = await triageRentalListing(l, { monitorId: monitor.id, userId: monitor.user_id });
+                const effRooms = l.rooms ?? triage.rooms;
+                const roomsTo = monitorConfig.roomsTo ?? monitorConfig.roomsFrom;
+                const roomMismatch = effRooms != null
+                  && ((monitorConfig.roomsFrom != null && effRooms < monitorConfig.roomsFrom)
+                    || (roomsTo != null && effRooms > roomsTo));
+                if (!triage.apartment || roomMismatch) {
+                  console.log(`[scheduler] Triage drop "${l.title}": ${!triage.apartment ? 'room/coliving' : `${effRooms} rooms`}`);
                   markListingSeen(monitor.id, l.platform, l.platformId, l.url, l.title, l.price);
                   continue;
                 }

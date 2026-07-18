@@ -5,7 +5,7 @@ import { customAlphabet } from 'nanoid';
 
 import { searchItems, fetchItemPhone } from '../crawlers/olx-items.js';
 import type { ItemListing } from '../crawlers/olx-items.js';
-import { parseRentalListing, parseItemListing, evaluateRejection } from './parse-listing.js';
+import { parseRentalListing, parseItemListing, evaluateRejection, triageRentalListing } from './parse-listing.js';
 import { scoreLocation } from './maps.js';
 import type { AmenityPreference } from './maps.js';
 import { formatRichRentalNotification, formatRichItemNotification, splitMessage, captionLength } from '../bot/format.js';
@@ -118,8 +118,8 @@ export const TOOL_DEFINITIONS: Tool[] = [
         },
         priceFrom: { type: 'number', description: 'Minimum TOTAL monthly budget in PLN (rent + czynsz + media)' },
         priceTo: { type: 'number', description: 'Maximum TOTAL monthly budget in PLN (rent + czynsz + media)' },
-        roomsFrom: { type: 'number', description: 'Minimum number of rooms' },
-        roomsTo: { type: 'number', description: 'Maximum number of rooms' },
+        roomsFrom: { type: 'number', description: 'Minimum number of ROOMS (Polish pokoje) in the apartment. Always set for rentals once confirmed. Exact count → set roomsFrom=roomsTo. Single-room/coliving rentals are auto-excluded.' },
+        roomsTo: { type: 'number', description: 'Maximum number of rooms. For an exact count set equal to roomsFrom.' },
         areaFrom: { type: 'number', description: 'Minimum area in m2' },
         areaTo: { type: 'number', description: 'Maximum area in m2' },
         ownerType: {
@@ -561,6 +561,27 @@ async function execFindRentals(
     actualAnalyzed++; // count only candidates that reach real analysis
 
     try {
+      // Cheap AI triage BEFORE the expensive enrich + full parse: drop single-room /
+      // coliving / non-apartment listings, and enforce the room count when the platform
+      // didn't report it (fixes null-rooms leaking past the search filter).
+      const triage = await triageRentalListing(listing, { userId: ctx.userId });
+      const effRooms = listing.rooms ?? triage.rooms;
+      let triageDrop: string | null = null;
+      if (!triage.apartment) {
+        triageDrop = 'комната/подселение, не отдельная квартира';
+      } else if (effRooms != null && ((roomsFrom != null && effRooms < roomsFrom) || (roomsTo != null && effRooms > roomsTo))) {
+        triageDrop = `${effRooms}-комн. — не подходит по числу комнат`;
+      }
+      if (triageDrop) {
+        // Cache/seed the (un-enriched) listing so the advertised [ID] resolves via
+        // show_listing, matching the budget short-circuit and every other reject path.
+        try { cacheListing({ platform: listing.platform, platformId: listing.platformId, kind: 'rental', resultId, listing }); } catch (e) { console.error('[find_rentals] triage-drop cache failed:', e instanceof Error ? e.message : e); }
+        seedResultForFamily(ctx, resultId, listing);
+        rejected.push({ id: resultId, url: listing.url, title: listing.title, reason: triageDrop });
+        await sendRejection(ctx.chatId, sendFn, resultId, listing.url, listing.title, triageDrop);
+        continue;
+      }
+
       // Fetch detail page / phone for richer data
       console.log(`[find_rentals] ${i + 1}/${candidateCount}: ${listing.platform} "${listing.title.slice(0, 50)}"`);
       const enrichedListing = await enrichRentalListing(listing);

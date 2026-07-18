@@ -73,3 +73,12 @@ export const RejectionResultSchema = z.object({
   rejected: z.boolean().default(false),
   rejectionReason: z.string().nullable().default(null),
 });
+
+// ---------------------------------------------------------------------------
+// Rental triage — cheap pre-parse gate: is it a whole apartment, and how many rooms?
+// ---------------------------------------------------------------------------
+
+export const RentalTriageSchema = z.object({
+  apartment: z.boolean().default(true),   // false = single room / coliving / not one flat
+  rooms: z.number().nullable().default(null),
+});
