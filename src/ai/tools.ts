@@ -567,19 +567,30 @@ async function execFindRentals(
       // didn't report it (fixes null-rooms leaking past the search filter).
       const triage = await triageRentalListing(listing, { userId: ctx.userId });
       const effRooms = listing.rooms ?? triage.rooms;
-      let triageDrop: string | null = null;
+
+      // Room / coliving / non-apartment → HARD, SILENT drop. These are common and the user
+      // never wants a whole room rental, so surfacing a ❌ card per one just spams the chat.
+      // Only surfaced during pre-deploy testing (DEBUG_LIMIT set) so the gate can be verified.
       if (!triage.apartment) {
-        triageDrop = 'комната/подселение, не отдельная квартира';
-      } else if (effRooms != null && ((roomsFrom != null && effRooms < roomsFrom) || (roomsTo != null && effRooms > roomsTo))) {
-        triageDrop = `${effRooms}-комн. — не подходит по числу комнат`;
+        console.log(`[find_rentals] silent drop (not an apartment): ${listing.platform} "${listing.title.slice(0, 50)}"`);
+        if (debugLimit > 0) {
+          const reason = 'комната/подселение, не отдельная квартира';
+          try { cacheListing({ platform: listing.platform, platformId: listing.platformId, kind: 'rental', resultId, listing }); } catch (e) { console.error('[find_rentals] triage-drop cache failed:', e instanceof Error ? e.message : e); }
+          seedResultForFamily(ctx, resultId, listing);
+          rejected.push({ id: resultId, url: listing.url, title: listing.title, reason });
+          await sendRejection(ctx.chatId, sendFn, resultId, listing.url, listing.title, reason);
+        }
+        continue;
       }
-      if (triageDrop) {
-        // Cache/seed the (un-enriched) listing so the advertised [ID] resolves via
-        // show_listing, matching the budget short-circuit and every other reject path.
+
+      // Room count didn't match (backstop for null-rooms that slipped the search filter).
+      // Kept visible — it's rare and tells the user why an otherwise-fine flat was filtered.
+      if (effRooms != null && ((roomsFrom != null && effRooms < roomsFrom) || (roomsTo != null && effRooms > roomsTo))) {
+        const reason = `${effRooms}-комн. — не подходит по числу комнат`;
         try { cacheListing({ platform: listing.platform, platformId: listing.platformId, kind: 'rental', resultId, listing }); } catch (e) { console.error('[find_rentals] triage-drop cache failed:', e instanceof Error ? e.message : e); }
         seedResultForFamily(ctx, resultId, listing);
-        rejected.push({ id: resultId, url: listing.url, title: listing.title, reason: triageDrop });
-        await sendRejection(ctx.chatId, sendFn, resultId, listing.url, listing.title, triageDrop);
+        rejected.push({ id: resultId, url: listing.url, title: listing.title, reason });
+        await sendRejection(ctx.chatId, sendFn, resultId, listing.url, listing.title, reason);
         continue;
       }
 
