@@ -127,7 +127,7 @@ export function formatRentalCard(
   const urlLine = listing.url;
 
   const payLine: string[] = [];
-  if (parsed?.depositNote) payLine.push(`Kaucja: ${esc(parsed.depositNote)}`);
+  if (parsed?.depositNote) payLine.push(`Kaucja: ${esc(trunc(parsed.depositNote, 48))}`);
   else if (parsed?.deposit != null) payLine.push(`Kaucja: ${zl(parsed.deposit)}`);
   else payLine.push(`Kaucja: ${CE.warning} ?`);
   if (parsed?.contractType) payLine.push(esc(parsed.contractType.replace(/_/g, ' ')));
