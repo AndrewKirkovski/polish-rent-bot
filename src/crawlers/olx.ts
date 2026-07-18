@@ -91,6 +91,8 @@ export async function searchOlxRentals(params: {
   cityId?: number;
   districtIds?: number[];
   roomCounts?: number[];
+  priceFrom?: number;
+  priceTo?: number;
   limit?: number;
   maxPages?: number;
 }): Promise<Listing[]> {
@@ -112,6 +114,8 @@ export async function searchOlxRentals(params: {
               cityId: params.cityId,
               districtId,
               rooms,
+              priceFrom: params.priceFrom,
+              priceTo: params.priceTo,
               limit,
               offset,
             });

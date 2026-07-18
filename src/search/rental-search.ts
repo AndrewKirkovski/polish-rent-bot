@@ -89,15 +89,24 @@ export async function searchRentalListings(params: RentalSearchParams): Promise<
     }
     const roomCounts = olxRoomCounts(params.roomsFrom, roomsTo);
 
-    searchPromises.push(
-      searchOlxRentals({
-        cityId,
-        districtIds: districtIds?.length ? districtIds : undefined,
-        roomCounts,
-        limit: params.olxLimit ?? 40,
-        maxPages: params.olxMaxPages ?? 2,
-      }),
-    );
+    // A room request that maps to NO OLX bucket (e.g. 5+, OLX caps at 4) yields []. Skipping
+    // OLX avoids fetching every room (empty === undefined downstream) and relying on the
+    // post-filter; Otodom supports exact 5/6 counts, so it still covers those searches.
+    if (params.roomsFrom != null && roomCounts != null && roomCounts.length === 0) {
+      console.warn(`[rental-search] rooms ${params.roomsFrom}-${roomsTo} out of OLX range (1-4) — skipping OLX, using Otodom only`);
+    } else {
+      searchPromises.push(
+        searchOlxRentals({
+          cityId,
+          districtIds: districtIds?.length ? districtIds : undefined,
+          roomCounts,
+          priceFrom: params.priceFrom,
+          priceTo: params.priceTo,
+          limit: params.olxLimit ?? 40,
+          maxPages: params.olxMaxPages ?? 2,
+        }),
+      );
+    }
   }
 
   if (doOtodom) {

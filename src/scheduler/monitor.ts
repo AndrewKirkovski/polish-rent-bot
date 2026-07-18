@@ -210,9 +210,13 @@ export function startScheduler(
 
           for (const listing of toProcess) {
             try {
+              // Compute the cross-monitor dedup key from the PRE-enrich listing and reuse it
+              // for the post-delivery add, so enrichment can't shift the fingerprint between
+              // the has()-check and the add() (which would let the same flat notify twice).
+              let dedupKey: string | null = null;
               if (monitor.type === 'rental') {
-                const fpKey = notificationDedupKey(listing as Listing);
-                if (notifiedFingerprints.has(fpKey)) {
+                dedupKey = notificationDedupKey(listing as Listing);
+                if (notifiedFingerprints.has(dedupKey)) {
                   markListingSeen(monitor.id, listing.platform, listing.platformId, listing.url, listing.title, listing.price);
                   continue;
                 }
@@ -368,7 +372,7 @@ export function startScheduler(
                 fitReason,
               );
               if (monitor.type === 'rental') {
-                notifiedFingerprints.add(notificationDedupKey(workingListing as Listing));
+                if (dedupKey) notifiedFingerprints.add(dedupKey);
               } else {
                 notifiedItemKeys.add(`${workingListing.platform}:${workingListing.platformId}`);
               }

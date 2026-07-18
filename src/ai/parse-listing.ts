@@ -22,6 +22,7 @@ const PARSE_MODEL = process.env.PARSE_MODEL || 'claude-haiku-4-5';
 // Folded into the parse cache key; bump on any RENTAL_PROMPT/schema change so stale
 // old-schema rows miss instead of returning objects without the new fields.
 export const RENTAL_PARSE_VERSION = 'wfh-v1';
+export const ITEM_PARSE_VERSION = 'v1';
 
 function hashText(text: string): string {
   return createHash('sha256').update(text, 'utf-8').digest('hex');
@@ -257,7 +258,7 @@ Return ONLY valid JSON (no markdown fences):
 }`;
 
 export async function parseItemListing(item: ItemListing, ctx: AiCallCtx = {}): Promise<ParsedItemData> {
-  const descHash = hashText(item.description || item.title);
+  const descHash = hashText(`${ITEM_PARSE_VERSION}\n${item.description || item.title}`);
 
   const cached = getParsedListing(item.platform, item.platformId);
   if (cached && cached.description_hash === descHash) {

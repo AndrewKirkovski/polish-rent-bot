@@ -307,38 +307,40 @@ export function startBot(): TelegramBot {
   });
 
   // --- Catch-all: forward everything else to AI agent ---
+  // Whole body wrapped: an uncaught throw here (e.g. a DB error in ensureAuth) would become
+  // an unhandledRejection and main.ts hard-exits the process, killing the bot for everyone.
   bot.on('message', async (msg: Msg) => {
-    const text = (msg.text ?? '').trim();
-    if (!text) return;
-
-    // Log custom emoji entities for collecting emoji IDs
-    const customEmojis = (msg.entities ?? []).filter((e: any) => e.type === 'custom_emoji');
-    if (customEmojis.length > 0) {
-      for (const e of customEmojis) {
-        const emojiChar = text.slice(e.offset, e.offset + e.length);
-        console.log(`[emoji] Custom emoji: "${emojiChar}" → id: ${(e as any).custom_emoji_id}`);
-      }
-    }
-
-    // /start and /help are handled above — skip them here
-    if (/^\/start\b/.test(text) || /^\/help\b/.test(text)) return;
-
-    if (!(await ensureAuth(msg))) return;
-
-    const userId = msg.from!.id;
-    const chatId = msg.chat.id;
-    const senderName = msg.from?.first_name ?? msg.from?.username ?? String(userId);
-
-    const typingFn = async (cid: number) => { await bot.sendChatAction(cid, 'typing'); };
-
-    // Show the other members what was asked (best-effort, never blocks the reply).
-    echoFn(chatId, senderName, text);
-
     try {
+      const text = (msg.text ?? '').trim();
+      if (!text) return;
+
+      // Log custom emoji entities for collecting emoji IDs
+      const customEmojis = (msg.entities ?? []).filter((e: any) => e.type === 'custom_emoji');
+      if (customEmojis.length > 0) {
+        for (const e of customEmojis) {
+          const emojiChar = text.slice(e.offset, e.offset + e.length);
+          console.log(`[emoji] Custom emoji: "${emojiChar}" → id: ${(e as any).custom_emoji_id}`);
+        }
+      }
+
+      // /start and /help are handled above — skip them here
+      if (/^\/start\b/.test(text) || /^\/help\b/.test(text)) return;
+
+      if (!(await ensureAuth(msg))) return;
+
+      const userId = msg.from!.id;
+      const chatId = msg.chat.id;
+      const senderName = msg.from?.first_name ?? msg.from?.username ?? String(userId);
+
+      const typingFn = async (cid: number) => { await bot.sendChatAction(cid, 'typing'); };
+
+      // Show the other members what was asked (best-effort, never blocks the reply).
+      echoFn(chatId, senderName, text);
+
       await handleUserMessage(userId, chatId, text, senderName, sendFn, sendPhotosFn, typingFn);
     } catch (err) {
-      console.error(`[telegram] Agent error for user ${userId}:`, err);
-      await safeSend(bot, chatId, 'Something went wrong. Please try again later.');
+      console.error(`[telegram] message handler error for user ${msg.from?.id}:`, err);
+      try { await safeSend(bot, msg.chat.id, 'Something went wrong. Please try again later.'); } catch { /* best-effort */ }
     }
   });
 

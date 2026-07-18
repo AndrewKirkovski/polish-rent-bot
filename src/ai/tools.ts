@@ -118,8 +118,8 @@ export const TOOL_DEFINITIONS: Tool[] = [
         },
         priceFrom: { type: 'number', description: 'Minimum TOTAL monthly budget in PLN (rent + czynsz + media)' },
         priceTo: { type: 'number', description: 'Maximum TOTAL monthly budget in PLN (rent + czynsz + media)' },
-        roomsFrom: { type: 'number', description: 'Minimum number of ROOMS (Polish pokoje) in the apartment. Always set for rentals once confirmed. Exact count → set roomsFrom=roomsTo. Single-room/coliving rentals are auto-excluded.' },
-        roomsTo: { type: 'number', description: 'Maximum number of rooms. For an exact count set equal to roomsFrom.' },
+        roomsFrom: { type: 'number', description: 'Number of ROOMS (Polish pokoje) in the apartment. For an EXACT count (e.g. "4 rooms") set roomsFrom AND roomsTo to the same value. For a range ("3-4") set both ends. If you set only roomsFrom it is treated as an exact count, not a minimum. Single-room/coliving rentals are auto-excluded.' },
+        roomsTo: { type: 'number', description: 'Upper bound of the room range. Must be set (equal to roomsFrom for an exact count).' },
         areaFrom: { type: 'number', description: 'Minimum area in m2' },
         areaTo: { type: 'number', description: 'Maximum area in m2' },
         ownerType: {
@@ -714,6 +714,10 @@ async function execFindRentals(
     } catch (err) {
       console.error(`[find_rentals] Error processing ${listing.url}:`, err);
       const reason = `ошибка обработки: ${err instanceof Error ? err.message : String(err)}`;
+      // Cache/seed so the advertised [ID] resolves via show_listing even on an enrich throw
+      // (matches every other reject path).
+      try { cacheListing({ platform: listing.platform, platformId: listing.platformId, kind: 'rental', resultId, listing }); } catch (e) { console.error('[find_rentals] catch-all cache failed:', e instanceof Error ? e.message : e); }
+      seedResultForFamily(ctx, resultId, listing);
       rejected.push({ id: resultId, url: listing.url, title: listing.title, reason });
       await sendRejection(ctx.chatId, sendFn, resultId, listing.url, listing.title, reason);
     }
