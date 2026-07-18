@@ -100,7 +100,7 @@ export const TOOL_DEFINITIONS: Tool[] = [
   {
     name: 'find_rentals',
     description:
-      'Full pipeline: search rental apartments on OLX and/or Otodom, analyze each with AI, check location amenities, filter by budget, and send rich cards with photos directly to the user. Call ONCE after confirming criteria.',
+      'Full pipeline: search rental apartments on OLX and/or Otodom, analyze each with AI, check location amenities, filter by budget, and send rich cards with photos directly to the user. Call once per distinct criteria set — for a multi-variant request (different rooms/area/price), call it once per variant.',
     input_schema: {
       type: 'object' as const,
       properties: {
