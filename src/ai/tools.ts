@@ -13,6 +13,7 @@ import { searchRentalListings, CITY_PROVINCE_MAP, resolveCityId } from '../searc
 import { enrichRentalListing } from '../search/enrich-listing.js';
 import { checkAmenityGate, resolveStrictAmenities } from '../search/amenity-gate.js';
 import { computeFitScore, preScore } from '../search/fit-score.js';
+import { isSoftRejection, type RejectionCategory } from '../search/rejection.js';
 import {
   addMonitor,
   getMonitors,
@@ -353,10 +354,12 @@ async function sendRejection(
   reason: string,
 ): Promise<void> {
   try {
+    // Silent delivery: rejection cards still appear in the chat but don't buzz — they're
+    // FYI, not something to interrupt for (unlike an accepted-listing card or the daily digest).
     await sendFn(
       chatId,
       `❌ [<b>${resultId}</b>] ${escHtml(title.slice(0, 50))} — ${escHtml(reason)}`,
-      { parse_mode: 'HTML' },
+      { parse_mode: 'HTML', disable_notification: true },
     );
   } catch (e) { console.error('[tools] rejection send failed:', e instanceof Error ? e.message : e); }
 }
@@ -531,9 +534,37 @@ async function execFindRentals(
   const accepted: Listing[] = [];
   const acceptedIds: string[] = [];
   const rejected: RejectionReason[] = [];
+  let hiddenCount = 0; // HARD ("definitely not") rejects — silently dropped, not shown
 
   ctx.lastSearchResults = candidates;
   seedSearchResultsForFamily(ctx, candidates);
+
+  // Emit a rejection according to its tier:
+  //   SOFT ("close enough") → visible ❌ card so the user can reconsider.
+  //   HARD ("definitely not", e.g. not an apartment) → SILENT (counted + logged), unless
+  //     DEBUG_LIMIT is set (pre-deploy verification), so the chat isn't spammed.
+  // Pass alreadyCached=true when the listing was cached/seeded earlier in the loop so the
+  // advertised [ID] resolves via show_listing; otherwise this caches+seeds it for shown rejects.
+  const emitReject = async (
+    rid: string,
+    l: Listing,
+    category: RejectionCategory,
+    reason: string,
+    alreadyCached = false,
+  ): Promise<void> => {
+    const show = isSoftRejection(category) || debugLimit > 0;
+    if (!show) {
+      hiddenCount++;
+      console.log(`[find_rentals] silent drop (${category}): "${l.title.slice(0, 50)}" — ${reason}`);
+      return;
+    }
+    if (!alreadyCached) {
+      try { cacheListing({ platform: l.platform, platformId: l.platformId, kind: 'rental', resultId: rid, listing: l }); } catch (e) { console.error('[find_rentals] reject cache failed:', e instanceof Error ? e.message : e); }
+      seedResultForFamily(ctx, rid, l);
+    }
+    rejected.push({ id: rid, url: l.url, title: l.title, reason });
+    await sendRejection(ctx.chatId, sendFn, rid, l.url, l.title, reason);
+  };
 
   let actualAnalyzed = 0;
   for (let i = 0; i < candidates.length; i++) {
@@ -549,13 +580,8 @@ async function execFindRentals(
     // Pre-parse budget short-circuit: base rent alone already over budget → the true total
     // can only be higher, so skip the expensive enrich + AI parse (see exceedsBudgetFloor).
     if (priceTo != null && exceedsBudgetFloor(listing, priceTo)) {
-      const reason = `дороже бюджета (аренда ${listing.price} zł > ${priceTo})`;
-      // Cache the (un-enriched) listing so the advertised [ID] is still resolvable via
-      // show_listing, matching the other rejection paths.
-      try { cacheListing({ platform: listing.platform, platformId: listing.platformId, kind: 'rental', resultId, listing }); } catch (e) { console.error('[find_rentals] cache pre-reject failed:', e instanceof Error ? e.message : e); }
-      seedResultForFamily(ctx, resultId, listing);
-      rejected.push({ id: resultId, url: listing.url, title: listing.title, reason });
-      await sendRejection(ctx.chatId, sendFn, resultId, listing.url, listing.title, reason);
+      // HARD: base rent alone already over budget — the true total can only be higher.
+      await emitReject(resultId, listing, 'budget_floor', `дороже бюджета (аренда ${listing.price} zł > ${priceTo})`);
       continue;
     }
 
@@ -568,29 +594,16 @@ async function execFindRentals(
       const triage = await triageRentalListing(listing, { userId: ctx.userId });
       const effRooms = listing.rooms ?? triage.rooms;
 
-      // Room / coliving / non-apartment → HARD, SILENT drop. These are common and the user
-      // never wants a whole room rental, so surfacing a ❌ card per one just spams the chat.
-      // Only surfaced during pre-deploy testing (DEBUG_LIMIT set) so the gate can be verified.
+      // Room / coliving / non-apartment → HARD ("definitely not"), silent. The user never
+      // wants a whole room rental, so a ❌ card per one just spams the chat.
       if (!triage.apartment) {
-        console.log(`[find_rentals] silent drop (not an apartment): ${listing.platform} "${listing.title.slice(0, 50)}"`);
-        if (debugLimit > 0) {
-          const reason = 'комната/подселение, не отдельная квартира';
-          try { cacheListing({ platform: listing.platform, platformId: listing.platformId, kind: 'rental', resultId, listing }); } catch (e) { console.error('[find_rentals] triage-drop cache failed:', e instanceof Error ? e.message : e); }
-          seedResultForFamily(ctx, resultId, listing);
-          rejected.push({ id: resultId, url: listing.url, title: listing.title, reason });
-          await sendRejection(ctx.chatId, sendFn, resultId, listing.url, listing.title, reason);
-        }
+        await emitReject(resultId, listing, 'room_coliving', 'комната/подселение, не отдельная квартира');
         continue;
       }
 
-      // Room count didn't match (backstop for null-rooms that slipped the search filter).
-      // Kept visible — it's rare and tells the user why an otherwise-fine flat was filtered.
+      // Wrong room count (backstop for null-rooms that slipped the search filter) → HARD, silent.
       if (effRooms != null && ((roomsFrom != null && effRooms < roomsFrom) || (roomsTo != null && effRooms > roomsTo))) {
-        const reason = `${effRooms}-комн. — не подходит по числу комнат`;
-        try { cacheListing({ platform: listing.platform, platformId: listing.platformId, kind: 'rental', resultId, listing }); } catch (e) { console.error('[find_rentals] triage-drop cache failed:', e instanceof Error ? e.message : e); }
-        seedResultForFamily(ctx, resultId, listing);
-        rejected.push({ id: resultId, url: listing.url, title: listing.title, reason });
-        await sendRejection(ctx.chatId, sendFn, resultId, listing.url, listing.title, reason);
+        await emitReject(resultId, listing, 'room_count', `${effRooms}-комн. — не подходит по числу комнат`);
         continue;
       }
 
@@ -628,9 +641,8 @@ async function execFindRentals(
       // Always discard listings that aren't a single concrete apartment (aggregator/agency
       // posts, investment offers, price ranges) — "это не конкретная квартира".
       if (parsedData?.isConcreteApartment === false) {
-        const reason = 'это не конкретная квартира';
-        rejected.push({ id: resultId, url: enrichedListing.url, title: enrichedListing.title, reason });
-        await sendRejection(ctx.chatId, sendFn, resultId, enrichedListing.url, enrichedListing.title, reason);
+        // HARD: aggregator / investment / price-range post, not one concrete flat.
+        await emitReject(resultId, enrichedListing, 'not_concrete', 'это не конкретная квартира', true);
         continue;
       }
 
@@ -639,17 +651,14 @@ async function execFindRentals(
       const estimatedTotal = computeRentalCost(enrichedListing, parsedData).total;
 
       if (priceTo != null && estimatedTotal > priceTo) {
-        const reason = `итог ~${estimatedTotal} zł превышает бюджет ${priceTo} zł`;
-        rejected.push({ id: resultId, url: enrichedListing.url, title: enrichedListing.title, reason });
-        await sendRejection(ctx.chatId, sendFn, resultId, enrichedListing.url, enrichedListing.title, reason);
+        // SOFT: a bit over — surfaced so the user can decide whether to stretch.
+        await emitReject(resultId, enrichedListing, 'budget_max', `итог ~${estimatedTotal} zł превышает бюджет ${priceTo} zł`, true);
         continue;
       }
       // Minimum-total gate (priceFrom is the min TOTAL, not base rent — enforced here on the
       // full computed total rather than by the platform base-rent filter, to avoid false negatives).
       if (priceFrom != null && estimatedTotal > 0 && estimatedTotal < priceFrom) {
-        const reason = `итог ~${estimatedTotal} zł ниже мин. бюджета ${priceFrom} zł`;
-        rejected.push({ id: resultId, url: enrichedListing.url, title: enrichedListing.title, reason });
-        await sendRejection(ctx.chatId, sendFn, resultId, enrichedListing.url, enrichedListing.title, reason);
+        await emitReject(resultId, enrichedListing, 'budget_min', `итог ~${estimatedTotal} zł ниже мин. бюджета ${priceFrom} zł`, true);
         continue;
       }
 
@@ -659,9 +668,8 @@ async function execFindRentals(
         parsedData?.contractType != null &&
         parsedData.contractType !== 'najem_okazjonalny'
       ) {
-        const reason = `тип договора не «najem okazjonalny» (${parsedData.contractType.replace(/_/g, ' ')})`;
-        rejected.push({ id: resultId, url: enrichedListing.url, title: enrichedListing.title, reason });
-        await sendRejection(ctx.chatId, sendFn, resultId, enrichedListing.url, enrichedListing.title, reason);
+        // SOFT: the flat may be fine, only the contract type differs.
+        await emitReject(resultId, enrichedListing, 'contract', `тип договора не «najem okazjonalny» (${parsedData.contractType.replace(/_/g, ' ')})`, true);
         continue;
       }
 
@@ -670,9 +678,8 @@ async function execFindRentals(
         try {
           const rejectionResult = await evaluateRejection(enrichedListing, parsedData, rejectionCriteria, { userId: ctx.userId });
           if (rejectionResult.rejected) {
-            const reason = rejectionResult.rejectionReason ?? 'отклонено по вашим критериям';
-            rejected.push({ id: resultId, url: enrichedListing.url, title: enrichedListing.title, reason });
-            await sendRejection(ctx.chatId, sendFn, resultId, enrichedListing.url, enrichedListing.title, reason);
+            // SOFT: surfaced so AI over-rejection of the user's own criteria is catchable.
+            await emitReject(resultId, enrichedListing, 'criteria', rejectionResult.rejectionReason ?? 'отклонено по вашим критериям', true);
             continue;
           }
         } catch (rejErr) {
@@ -719,9 +726,8 @@ async function execFindRentals(
         strictAmenities,
       );
       if (!gate.pass) {
-        const reason = gate.reason ?? 'не прошло фильтр метро/трамвая';
-        rejected.push({ id: resultId, url: enrichedListing.url, title: enrichedListing.title, reason });
-        await sendRejection(ctx.chatId, sendFn, resultId, enrichedListing.url, enrichedListing.title, reason);
+        // SOFT: the flat is fine, an amenity is just a bit too far.
+        await emitReject(resultId, enrichedListing, 'amenity', gate.reason ?? 'не прошло фильтр метро/трамвая', true);
         continue;
       }
 
@@ -733,13 +739,9 @@ async function execFindRentals(
       acceptedIds.push(resultId);
     } catch (err) {
       console.error(`[find_rentals] Error processing ${listing.url}:`, err);
-      const reason = `ошибка обработки: ${err instanceof Error ? err.message : String(err)}`;
-      // Cache/seed so the advertised [ID] resolves via show_listing even on an enrich throw
-      // (matches every other reject path).
-      try { cacheListing({ platform: listing.platform, platformId: listing.platformId, kind: 'rental', resultId, listing }); } catch (e) { console.error('[find_rentals] catch-all cache failed:', e instanceof Error ? e.message : e); }
-      seedResultForFamily(ctx, resultId, listing);
-      rejected.push({ id: resultId, url: listing.url, title: listing.title, reason });
-      await sendRejection(ctx.chatId, sendFn, resultId, listing.url, listing.title, reason);
+      // SOFT: an error is worth showing so the user knows the candidate wasn't silently lost.
+      // emitReject caches/seeds the (un-enriched) listing so the advertised [ID] still resolves.
+      await emitReject(resultId, listing, 'error', `ошибка обработки: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
@@ -748,11 +750,13 @@ async function execFindRentals(
     const rejectionSummary = rejected.length > 0
       ? `\nRejection reasons:\n${rejected.map((r) => `- ${r.title}: ${r.reason}`).join('\n')}`
       : '';
-    return `Analyzed ${candidateCount} listings but none passed the filters.${rejectionSummary}\nTry increasing the budget, ${strictAmenities ? 'расширьте радиус метро' : 'broaden the search area'}.`;
+    const hiddenNote = hiddenCount > 0 ? `\n(${hiddenCount} явно не подходящих скрыто)` : '';
+    return `Analyzed ${candidateCount} listings but none passed the filters.${rejectionSummary}${hiddenNote}\nTry increasing the budget, ${strictAmenities ? 'расширьте радиус метро' : 'broaden the search area'}.`;
   }
 
-  // Send a brief "done" summary
-  try { await sendFn(ctx.chatId, `Готово [${searchId}]: ${accepted.length} показано, ${rejected.length} отклонено.`, { parse_mode: undefined }); } catch (e) { console.error('[tools] send failed:', e instanceof Error ? e.message : e); }
+  // Send a brief "done" summary. `rejected` = shown (soft) rejects; hard ones are silent (+N скрыто).
+  const hiddenSuffix = hiddenCount > 0 ? ` (+${hiddenCount} скрыто)` : '';
+  try { await sendFn(ctx.chatId, `Готово [${searchId}]: ${accepted.length} показано, ${rejected.length} отклонено${hiddenSuffix}.`, { parse_mode: undefined }); } catch (e) { console.error('[tools] send failed:', e instanceof Error ? e.message : e); }
 
   // Update context
   ctx.lastSearchResults = accepted;
@@ -761,13 +765,15 @@ async function execFindRentals(
     ctx.lastDetailListing = accepted[0];
   }
 
-  // Return summary to Claude — include IDs so it can reference specific results
+  // Return summary to Claude — include IDs so it can reference specific results.
+  // `rejected` holds only the SHOWN (soft/"close enough") rejects; hard ones stayed silent.
   const rejectionBreakdown = rejected.length > 0
-    ? `\nRejected ${rejected.length}: ${rejected.map((r) => r.reason).join('; ')}`
+    ? `\nRejected ${rejected.length} (shown): ${rejected.map((r) => r.reason).join('; ')}`
     : '';
+  const hiddenBreakdown = hiddenCount > 0 ? `\n${hiddenCount} hidden as "definitely not" (room/non-apartment/over-budget) — not shown to the user.` : '';
   const idList = acceptedIds.map((id, i) => `${id}: "${accepted[i]?.title?.slice(0, 50) ?? '?'}"`).join(', ');
 
-  return `Search ${searchId}: showed ${accepted.length} listing(s). Result IDs: ${idList}. Analyzed ${actualAnalyzed} of ${deduped.length} candidates.${rejectionBreakdown}\n\nIMPORTANT: The user has ALREADY seen full details. When they reference a result by ID (e.g. "${acceptedIds[0] ?? 'ABC123'}"), use that ID. Do NOT repeat listing details. Just offer next steps.`;
+  return `Search ${searchId}: showed ${accepted.length} listing(s). Result IDs: ${idList}. Analyzed ${actualAnalyzed} of ${deduped.length} candidates.${rejectionBreakdown}${hiddenBreakdown}\n\nIMPORTANT: The user has ALREADY seen full details. When they reference a result by ID (e.g. "${acceptedIds[0] ?? 'ABC123'}"), use that ID. Do NOT repeat listing details. Just offer next steps.`;
 }
 
 // ---------------------------------------------------------------------------

@@ -175,6 +175,30 @@ const SCHEMA = `
 
   CREATE INDEX IF NOT EXISTS idx_cached_listings_cached_at
     ON cached_listings(cached_at DESC);
+
+  -- Per-listing monitor rejection log — fuels the once-per-day aggregated rejection
+  -- report (monitors are silent per-listing; this is where they record what was filtered).
+  CREATE TABLE IF NOT EXISTS monitor_rejections (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    monitor_id   INTEGER NOT NULL,
+    platform     TEXT NOT NULL,
+    platform_id  TEXT NOT NULL,
+    title        TEXT NOT NULL,
+    url          TEXT NOT NULL,
+    price        REAL,
+    category     TEXT NOT NULL,
+    reason       TEXT,
+    rejected_at  TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_monitor_rejections_at
+    ON monitor_rejections(rejected_at);
+
+  -- Tiny key/value store for small scalars (e.g. the daily-report bookkeeping).
+  CREATE TABLE IF NOT EXISTS app_state (
+    key    TEXT PRIMARY KEY,
+    value  TEXT NOT NULL
+  );
 `;
 
 // ---------------------------------------------------------------------------
@@ -405,6 +429,73 @@ export function cleanOldNotifiedFingerprints(olderThanDays: number): number {
     WHERE first_notified_at < datetime('now', ? || ' days')
   `).run(`-${olderThanDays}`);
   return result.changes;
+}
+
+// ---------------------------------------------------------------------------
+// Monitor rejections — per-listing log for the once-per-day rejection report
+// ---------------------------------------------------------------------------
+
+export interface MonitorRejectionRow {
+  id: number;
+  monitor_id: number;
+  platform: string;
+  platform_id: string;
+  title: string;
+  url: string;
+  price: number | null;
+  category: string;
+  reason: string | null;
+  rejected_at: string;
+}
+
+export function recordMonitorRejection(
+  monitorId: number,
+  listing: { platform: string; platformId: string; title: string; url: string; price: number | null },
+  category: string,
+  reason: string | null,
+): void {
+  const db = getDb();
+  db.prepare(`
+    INSERT INTO monitor_rejections (monitor_id, platform, platform_id, title, url, price, category, reason)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(monitorId, listing.platform, listing.platformId, listing.title, listing.url, listing.price ?? null, category, reason ?? null);
+}
+
+/** Rejections STRICTLY AFTER `sinceUtc` (SQLite 'YYYY-MM-DD HH:MM:SS' UTC), oldest first.
+ *  Exclusive lower bound so a row already reported at the marker's whole-second timestamp
+ *  isn't reported again in the next window (rejected_at is second-resolution). */
+export function getMonitorRejectionsSince(sinceUtc: string): MonitorRejectionRow[] {
+  const db = getDb();
+  return db.prepare(
+    `SELECT * FROM monitor_rejections WHERE rejected_at > ? ORDER BY rejected_at ASC`,
+  ).all(sinceUtc) as MonitorRejectionRow[];
+}
+
+export function cleanOldMonitorRejections(olderThanDays: number): number {
+  const db = getDb();
+  const result = db.prepare(`
+    DELETE FROM monitor_rejections
+    WHERE rejected_at < datetime('now', ? || ' days')
+  `).run(`-${olderThanDays}`);
+  return result.changes;
+}
+
+// ---------------------------------------------------------------------------
+// App key/value state (small scalars, e.g. the daily-report bookkeeping)
+// ---------------------------------------------------------------------------
+
+export function getAppState(key: string): string | null {
+  const db = getDb();
+  const row = db.prepare('SELECT value FROM app_state WHERE key = ?').get(key) as { value: string } | undefined;
+  return row?.value ?? null;
+}
+
+export function setAppState(key: string, value: string): void {
+  const db = getDb();
+  db.prepare(`
+    INSERT INTO app_state (key, value) VALUES (?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+  `).run(key, value);
 }
 
 // ---------------------------------------------------------------------------

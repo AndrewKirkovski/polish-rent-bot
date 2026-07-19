@@ -1,6 +1,6 @@
 import 'dotenv/config';
-import { getDb, cleanOldCachedListings, cleanExpiredMapsCache, cleanOldNotifiedFingerprints } from './storage/db.js';
-import { startBot, broadcastEnrichedNotification } from './bot/telegram.js';
+import { getDb, cleanOldCachedListings, cleanExpiredMapsCache, cleanOldNotifiedFingerprints, cleanOldMonitorRejections } from './storage/db.js';
+import { startBot, broadcastEnrichedNotification, broadcastText } from './bot/telegram.js';
 import { startScheduler } from './scheduler/monitor.js';
 import { closeBrowser } from './crawlers/otodom.js';
 import { startHttpServer } from './server/http.js';
@@ -41,8 +41,9 @@ try {
   const prunedListings = cleanOldCachedListings();
   const prunedMaps = cleanExpiredMapsCache();
   const prunedNotified = cleanOldNotifiedFingerprints(30); // a flat re-listed >30d later is genuinely new
-  if (prunedListings || prunedMaps || prunedNotified) {
-    console.log(`[startup] pruned ${prunedListings} cached listings, ${prunedMaps} maps entries, ${prunedNotified} notified fingerprints`);
+  const prunedRejections = cleanOldMonitorRejections(7);   // only consumed by the daily report
+  if (prunedListings || prunedMaps || prunedNotified || prunedRejections) {
+    console.log(`[startup] pruned ${prunedListings} cached listings, ${prunedMaps} maps entries, ${prunedNotified} notified fingerprints, ${prunedRejections} monitor rejections`);
   }
 } catch (err) {
   console.error('[startup] cache prune failed:', err instanceof Error ? err.message : err);
@@ -51,8 +52,11 @@ try {
 startBot();
 
 const MONITOR_INTERVAL_MINUTES = 10;
-const stopScheduler = startScheduler(MONITOR_INTERVAL_MINUTES, (_userId, listing, parsedData, locationScore, fitReason) =>
-  broadcastEnrichedNotification(listing, parsedData, locationScore, fitReason),
+const stopScheduler = startScheduler(
+  MONITOR_INTERVAL_MINUTES,
+  (_userId, listing, parsedData, locationScore, fitReason) =>
+    broadcastEnrichedNotification(listing, parsedData, locationScore, fitReason),
+  (text) => broadcastText(text),
 );
 
 const httpServer = startHttpServer();

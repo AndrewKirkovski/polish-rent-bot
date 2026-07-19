@@ -136,6 +136,19 @@ export async function broadcastEnrichedNotification(
   assertBroadcastOk(result, 'Monitor alert');
 }
 
+/** Fan out a plain HTML text message to the whole family (used by the daily rejection report).
+ *  Uses mustSend (which throws on a genuine per-recipient failure) + assertBroadcastOk, so a
+ *  TOTAL delivery failure (nobody received it) THROWS — letting the caller leave its markers
+ *  untouched and retry next cycle. Partial delivery (≥1 recipient) counts as sent. The scheduler
+ *  wraps this in try/catch, so a throw never disturbs the monitor cycle. */
+export async function broadcastText(text: string): Promise<void> {
+  const bot = getBot();
+  const result = await broadcastToFamily((id) =>
+    mustSend(bot, id, text, { parse_mode: 'HTML', disable_web_page_preview: true }),
+  );
+  assertBroadcastOk(result, 'Daily rejection report');
+}
+
 export async function sendEnrichedNotification(
   chatId: number | string,
   listing: Listing | ItemListing,
@@ -199,11 +212,12 @@ async function safeSend(bot: TelegramBot, chatId: number | string, text: string,
     await bot.sendMessage(chatId, text, opts);
   } catch (err) {
     console.error('[telegram] sendMessage failed:', err instanceof Error ? err.message : err);
-    // If HTML parsing failed, retry as plain text (strip all tags)
+    // If HTML parsing failed, retry as plain text (strip all tags). Carry the caller's
+    // notification preference so a silent message (e.g. rejection card) stays silent.
     if (opts?.parse_mode && err instanceof Error && err.message.includes("can't parse entities")) {
       try {
         const plain = stripHtml(text);
-        await bot.sendMessage(chatId, plain);
+        await bot.sendMessage(chatId, plain, opts?.disable_notification ? { disable_notification: true } : undefined);
       } catch (retryErr) {
         console.error('[telegram] Plain text fallback also failed:', retryErr instanceof Error ? retryErr.message : retryErr);
       }

@@ -2,7 +2,8 @@
 // and calls a notification callback for each unseen result.
 
 import { searchItems, fetchItemPhone } from '../crawlers/olx-items.js';
-import { getMonitors, isListingSeen, markListingSeen, cleanOldSeen, cleanOldCachedListings, cleanOldNotifiedFingerprints, startMonitorRun, finishMonitorRun, cacheListing, isFingerprintNotified, markFingerprintNotified, type MonitorRow } from '../storage/db.js';
+import { getMonitors, isListingSeen, markListingSeen, cleanOldSeen, cleanOldCachedListings, cleanOldNotifiedFingerprints, cleanOldMonitorRejections, startMonitorRun, finishMonitorRun, cacheListing, isFingerprintNotified, markFingerprintNotified, recordMonitorRejection, getMonitorRejectionsSince, getAppState, setAppState, type MonitorRow } from '../storage/db.js';
+import { buildRejectionReport } from './rejection-report.js';
 import type { Listing, ParsedRentalData, ParsedItemData, LocationScore } from '../types.js';
 import type { ItemListing } from '../crawlers/olx-items.js';
 import { parseRentalListing, parseItemListing, evaluateRejection, triageRentalListing } from '../ai/parse-listing.js';
@@ -161,6 +162,60 @@ export async function runAllMonitors(): Promise<MonitorResult[]> {
   return results;
 }
 
+// ---------------------------------------------------------------------------
+// Once-per-day monitor rejection report (~09:00 Europe/Warsaw)
+// ---------------------------------------------------------------------------
+
+const DAILY_REPORT_HOUR = 9; // fire when the Warsaw local hour reaches this
+
+/** Warsaw-local date ('YYYY-MM-DD') and hour (0-23), timezone-safe regardless of the host clock. */
+function warsawDateHour(now: Date): { date: string; hour: number } {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'Europe/Warsaw',
+    year: 'numeric', month: '2-digit', day: '2-digit', hour: 'numeric', hour12: false,
+  }).formatToParts(now);
+  const get = (t: string) => parts.find((p) => p.type === t)!.value;
+  const hour = parseInt(get('hour'), 10) % 24; // some engines render midnight as '24'
+  return { date: `${get('year')}-${get('month')}-${get('day')}`, hour };
+}
+
+/** UTC timestamp in SQLite's 'YYYY-MM-DD HH:MM:SS' format so it compares lexically with datetime('now'). */
+function sqliteUtc(d: Date): string {
+  return d.toISOString().replace('T', ' ').slice(0, 19);
+}
+
+/** Sends one aggregated rejection digest per Warsaw day (once the local hour reaches
+ *  DAILY_REPORT_HOUR). Retries on the next cycle if the broadcast fails; advances the
+ *  window with nothing sent when there was nothing to report. */
+async function maybeSendDailyRejectionReport(reportFn: (text: string) => void | Promise<void>): Promise<void> {
+  const now = new Date();
+  const { date: today, hour } = warsawDateHour(now);
+  if (hour < DAILY_REPORT_HOUR) return;
+  if (getAppState('rejectionReport.lastDate') === today) return; // already handled today
+
+  const lastAt = getAppState('rejectionReport.lastAt') ?? sqliteUtc(new Date(now.getTime() - 24 * 3600_000));
+  const rows = getMonitorRejectionsSince(lastAt);
+  const report = buildRejectionReport(rows);
+
+  if (!report) {
+    // Nothing to report — still advance the marker so we don't recompute every cycle today.
+    setAppState('rejectionReport.lastDate', today);
+    setAppState('rejectionReport.lastAt', sqliteUtc(now));
+    console.log('[scheduler] Daily rejection report: nothing to report');
+    return;
+  }
+
+  try {
+    await reportFn(report);
+    setAppState('rejectionReport.lastDate', today);
+    setAppState('rejectionReport.lastAt', sqliteUtc(now));
+    console.log(`[scheduler] Daily rejection report sent (${rows.length} rejections since ${lastAt})`);
+  } catch (err) {
+    // Leave the markers untouched so the next cycle retries within the same day.
+    console.error('[scheduler] Daily rejection report send failed (will retry next cycle):', err instanceof Error ? err.message : err);
+  }
+}
+
 export function startScheduler(
   intervalMinutes: number,
   notifyFn: (
@@ -170,6 +225,7 @@ export function startScheduler(
     locationScore?: LocationScore | null,
     fitReason?: string | null,
   ) => void | Promise<void>,
+  reportFn?: (text: string) => void | Promise<void>,
 ): () => void {
   let stopped = false;
   let timer: ReturnType<typeof setTimeout> | null = null;
@@ -224,6 +280,7 @@ export function startScheduler(
                 const l = listing as Listing;
                 if (exceedsBudgetFloor(l, monitorConfig.priceTo)) {
                   console.log(`[scheduler] Budget pre-reject "${l.title}": аренда ${l.price} > ${monitorConfig.priceTo} (no AI call)`);
+                  recordMonitorRejection(monitor.id, l, 'budget_floor', `аренда ${l.price} zł > ${monitorConfig.priceTo} zł`);
                   markListingSeen(monitor.id, l.platform, l.platformId, l.url, l.title, l.price);
                   continue;
                 }
@@ -241,6 +298,9 @@ export function startScheduler(
                     || (roomsTo != null && effRooms > roomsTo));
                 if (!triage.apartment || roomMismatch) {
                   console.log(`[scheduler] Triage drop "${l.title}": ${!triage.apartment ? 'room/coliving' : `${effRooms} rooms`}`);
+                  const category = !triage.apartment ? 'room_coliving' : 'room_count';
+                  const reason = !triage.apartment ? 'комната/подселение, не отдельная квартира' : `${effRooms}-комн. — не по числу комнат`;
+                  recordMonitorRejection(monitor.id, l, category, reason);
                   markListingSeen(monitor.id, l.platform, l.platformId, l.url, l.title, l.price);
                   continue;
                 }
@@ -271,6 +331,7 @@ export function startScheduler(
 
               if (monitor.type === 'rental' && (parsedData as ParsedRentalData | null)?.isConcreteApartment === false) {
                 console.log(`[scheduler] Drop "${workingListing.title}": не конкретная квартира`);
+                recordMonitorRejection(monitor.id, workingListing, 'not_concrete', 'не конкретная квартира');
                 markListingSeen(monitor.id, workingListing.platform, workingListing.platformId, workingListing.url, workingListing.title, workingListing.price);
                 continue;
               }
@@ -293,12 +354,14 @@ export function startScheduler(
                 const estimatedTotal = computeRentalCost(l, parsedData as ParsedRentalData | null).total;
                 if (config.priceTo != null && estimatedTotal > config.priceTo) {
                   console.log(`[scheduler] Budget reject "${l.title}": ${estimatedTotal} > ${config.priceTo}`);
+                  recordMonitorRejection(monitor.id, l, 'budget_max', `итог ~${estimatedTotal} zł > ${config.priceTo} zł`);
                   markListingSeen(monitor.id, l.platform, l.platformId, l.url, l.title, l.price);
                   continue;
                 }
                 // priceFrom = min TOTAL, enforced here (not by the platform base-rent filter).
                 if (config.priceFrom != null && estimatedTotal > 0 && estimatedTotal < config.priceFrom) {
                   console.log(`[scheduler] Below-min reject "${l.title}": ${estimatedTotal} < ${config.priceFrom}`);
+                  recordMonitorRejection(monitor.id, l, 'budget_min', `итог ~${estimatedTotal} zł < ${config.priceFrom} zł`);
                   markListingSeen(monitor.id, l.platform, l.platformId, l.url, l.title, l.price);
                   continue;
                 }
@@ -311,6 +374,7 @@ export function startScheduler(
                 (parsedData as ParsedRentalData).contractType != null &&
                 (parsedData as ParsedRentalData).contractType !== 'najem_okazjonalny'
               ) {
+                recordMonitorRejection(monitor.id, workingListing, 'contract', `тип договора ${(parsedData as ParsedRentalData).contractType?.replace(/_/g, ' ')}`);
                 markListingSeen(monitor.id, workingListing.platform, workingListing.platformId, workingListing.url, workingListing.title, workingListing.price);
                 continue;
               }
@@ -319,6 +383,7 @@ export function startScheduler(
                 try {
                   const rejectionResult = await evaluateRejection(workingListing, parsedData, config.rejectionCriteria, { monitorId: monitor.id, userId: monitor.user_id });
                   if (rejectionResult.rejected) {
+                    recordMonitorRejection(monitor.id, workingListing, 'criteria', rejectionResult.rejectionReason ?? 'по вашим критериям');
                     markListingSeen(monitor.id, workingListing.platform, workingListing.platformId, workingListing.url, workingListing.title, workingListing.price);
                     continue;
                   }
@@ -358,6 +423,7 @@ export function startScheduler(
                 );
                 if (!gate.pass) {
                   console.log(`[scheduler] Amenity reject "${workingListing.title}": ${gate.reason}`);
+                  recordMonitorRejection(monitor.id, workingListing, 'amenity', gate.reason ?? 'далеко до удобств');
                   markListingSeen(monitor.id, workingListing.platform, workingListing.platformId, workingListing.url, workingListing.title, workingListing.price);
                   continue;
                 }
@@ -397,6 +463,16 @@ export function startScheduler(
       cleanOldSeen(30);
       cleanOldCachedListings(90);
       cleanOldNotifiedFingerprints(30);
+      cleanOldMonitorRejections(7); // consumed by the daily report; keep a small buffer
+
+      // Once-per-day aggregated rejection digest (monitors are silent per-listing).
+      if (reportFn) {
+        try {
+          await maybeSendDailyRejectionReport(reportFn);
+        } catch (err) {
+          console.error('[scheduler] Daily rejection report check failed:', err instanceof Error ? err.message : err);
+        }
+      }
 
       const totalNew = results.reduce((sum, r) => sum + r.newListings.length, 0);
       console.log(`[scheduler] Cycle complete — ${results.length} monitors, ${totalNew} unseen listings`);
