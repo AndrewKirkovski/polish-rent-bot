@@ -277,13 +277,13 @@ export async function sendPhotoAlbum(
   chatId: number | string,
   photoUrls: string[],
   caption?: string,
-): Promise<void> {
+): Promise<TelegramBot.Message[]> {
   const urls = photoUrls.slice(0, 10);
-  if (urls.length === 0) return;
+  if (urls.length === 0) return [];
 
   if (urls.length === 1) {
-    await bot.sendPhoto(chatId, urls[0], { caption, parse_mode: caption ? 'HTML' : undefined });
-    return;
+    const msg = await bot.sendPhoto(chatId, urls[0], { caption, parse_mode: caption ? 'HTML' : undefined });
+    return [msg];
   }
 
   const media = urls.map((url, i) => ({
@@ -292,5 +292,5 @@ export async function sendPhotoAlbum(
     ...(i === 0 && caption ? { caption, parse_mode: 'HTML' as const } : {}),
   }));
 
-  await bot.sendMediaGroup(chatId, media);
+  return bot.sendMediaGroup(chatId, media);
 }

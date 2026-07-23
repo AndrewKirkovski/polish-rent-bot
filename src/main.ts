@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { getDb, cleanOldCachedListings, cleanExpiredMapsCache, cleanOldNotifiedFingerprints, cleanOldMonitorRejections } from './storage/db.js';
+import { getDb, cleanOldCachedListings, cleanExpiredMapsCache, cleanOldNotifiedFingerprints, cleanOldMonitorRejections, cleanOldTelegramMessageRefs } from './storage/db.js';
 import { startBot, broadcastEnrichedNotification, broadcastText } from './bot/telegram.js';
 import { startScheduler } from './scheduler/monitor.js';
 import { closeBrowser } from './crawlers/otodom.js';
@@ -42,8 +42,9 @@ try {
   const prunedMaps = cleanExpiredMapsCache();
   const prunedNotified = cleanOldNotifiedFingerprints(30); // a flat re-listed >30d later is genuinely new
   const prunedRejections = cleanOldMonitorRejections(7);   // only consumed by the daily report
-  if (prunedListings || prunedMaps || prunedNotified || prunedRejections) {
-    console.log(`[startup] pruned ${prunedListings} cached listings, ${prunedMaps} maps entries, ${prunedNotified} notified fingerprints, ${prunedRejections} monitor rejections`);
+  const prunedMsgRefs = cleanOldTelegramMessageRefs(30);
+  if (prunedListings || prunedMaps || prunedNotified || prunedRejections || prunedMsgRefs) {
+    console.log(`[startup] pruned ${prunedListings} cached listings, ${prunedMaps} maps entries, ${prunedNotified} notified fingerprints, ${prunedRejections} monitor rejections, ${prunedMsgRefs} telegram message refs`);
   }
 } catch (err) {
   console.error('[startup] cache prune failed:', err instanceof Error ? err.message : err);
@@ -54,8 +55,8 @@ startBot();
 const MONITOR_INTERVAL_MINUTES = 10;
 const stopScheduler = startScheduler(
   MONITOR_INTERVAL_MINUTES,
-  (_userId, listing, parsedData, locationScore, fitReason) =>
-    broadcastEnrichedNotification(listing, parsedData, locationScore, fitReason),
+  (_userId, listing, parsedData, locationScore, fitReason, resultId) =>
+    broadcastEnrichedNotification(listing, parsedData, locationScore, fitReason, resultId),
   (text) => broadcastText(text),
 );
 

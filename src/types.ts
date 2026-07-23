@@ -88,6 +88,8 @@ export interface ParsedRentalData {
     gas: number | null;
     internet: number | null;
     heating: number | null;
+    /** Undifferentiated zaliczka / "media ~X zł" with no per-utility breakdown. */
+    other: number | null;
   };
   contractType: 'najem_okazjonalny' | 'najem_zwykly' | 'najem_instytucjonalny' | null;
   availableFrom: string | null;

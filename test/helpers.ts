@@ -19,7 +19,7 @@ export function mkListing(over: Partial<Listing> = {}): Listing {
 export function mkParsed(over: Partial<ParsedRentalData> = {}): ParsedRentalData {
   return {
     deposit: null, depositNote: null, adminFee: null, addressHint: null, isConcreteApartment: true,
-    estimatedMedia: { water: null, electricity: null, gas: null, internet: null, heating: null },
+    estimatedMedia: { water: null, electricity: null, gas: null, internet: null, heating: null, other: null },
     contractType: null, availableFrom: null, minimumLease: null, furnished: null,
     balcony: null, parkingIncluded: null,
     separateRooms: null, layoutType: null, twoOfficeCapable: null, quiet: null, naturalLight: null, internetType: null,

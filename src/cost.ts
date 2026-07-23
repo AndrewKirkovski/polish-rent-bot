@@ -22,6 +22,7 @@ const MEDIA_ORDER: Array<{ key: keyof ParsedRentalData['estimatedMedia']; label:
   { key: 'gas', label: 'gas' },
   { key: 'heating', label: 'heating' },
   { key: 'internet', label: 'internet' },
+  { key: 'other', label: 'media' }, // lump zaliczka / undifferentiated "media ~X"
 ];
 
 /** Safe pre-parse budget skip: najem (base rent) alone is a guaranteed lower bound on the

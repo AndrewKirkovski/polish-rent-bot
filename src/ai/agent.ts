@@ -59,7 +59,7 @@ export async function handleUserMessage(
   text: string,
   senderName: string,
   sendFn: (chatId: number, text: string, opts?: Record<string, unknown>) => Promise<void>,
-  sendPhotosFn: (chatId: number, urls: string[], caption?: string) => Promise<void>,
+  sendPhotosFn: (chatId: number, urls: string[], caption?: string, meta?: { resultId?: string }) => Promise<void>,
   typingFn?: (chatId: number) => Promise<void>,
 ): Promise<void> {
   return familyMutex.run(async () => {

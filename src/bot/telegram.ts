@@ -12,10 +12,13 @@ import {
   isUserAuthorized,
   authorizeUser,
   addUser,
+  getAuthorizedTelegramIds,
+  recordTelegramMessageRef,
+  getTelegramMessageRef,
 } from '../storage/db.js';
 import type { ParsedRentalData, ParsedItemData, LocationScore } from '../types.js';
 import { wrapBroadcastPhotos, broadcastToFamily, assertBroadcastOk } from './broadcast.js';
-import { getAuthorizedTelegramIds } from '../storage/db.js';
+import { extractResultId, prefixResultIdHtml, prefixResultIdPlain } from '../utils/result-id.js';
 
 // ---------------------------------------------------------------------------
 // Bot instance (module-level for notification use)
@@ -107,17 +110,51 @@ function mdToHtml(text: string): string {
 // Enriched notification sender (used by scheduler)
 // ---------------------------------------------------------------------------
 
+function numericChatId(chatId: number | string): number {
+  return typeof chatId === 'number' ? chatId : Number(chatId);
+}
+
+function recordSentMessages(
+  chatId: number | string,
+  messages: Array<{ message_id: number }>,
+  resultId: string | undefined,
+  photoStartIndex: number | null = null,
+): void {
+  if (!resultId || messages.length === 0) return;
+  const cid = numericChatId(chatId);
+  if (!Number.isFinite(cid)) return;
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i]!;
+    const photoIndex = photoStartIndex == null ? null : photoStartIndex + i;
+    try {
+      recordTelegramMessageRef(cid, msg.message_id, resultId, photoIndex);
+    } catch (e) {
+      console.error('[telegram] recordTelegramMessageRef failed:', e instanceof Error ? e.message : e);
+    }
+  }
+}
+
 /** Send message that MUST succeed — throws if both HTML and plain text fallback fail.
  *  Used by scheduler where failure must prevent markListingSeen. */
-async function mustSend(bot: TelegramBot, chatId: number | string, text: string, opts?: TelegramBot.SendMessageOptions): Promise<void> {
+async function mustSend(
+  bot: TelegramBot,
+  chatId: number | string,
+  text: string,
+  opts?: TelegramBot.SendMessageOptions,
+  resultId?: string,
+): Promise<TelegramBot.Message> {
   try {
-    await bot.sendMessage(chatId, text, opts);
+    const msg = await bot.sendMessage(chatId, text, opts);
+    recordSentMessages(chatId, [msg], resultId, null);
+    return msg;
   } catch (err) {
     console.error('[telegram] mustSend failed:', err instanceof Error ? err.message : err);
     if (opts?.parse_mode && err instanceof Error && err.message.includes("can't parse entities")) {
       // Retry as plain text — if this also fails, let it throw
       const plain = stripHtml(text);
-      await bot.sendMessage(chatId, plain);
+      const msg = await bot.sendMessage(chatId, plain);
+      recordSentMessages(chatId, [msg], resultId, null);
+      return msg;
     } else {
       throw err; // re-throw non-parse errors (network, blocked, etc.)
     }
@@ -129,9 +166,10 @@ export async function broadcastEnrichedNotification(
   parsedData?: ParsedRentalData | ParsedItemData | null,
   locationScore?: LocationScore | null,
   fitReason?: string | null,
+  resultId?: string | null,
 ): Promise<void> {
   const result = await broadcastToFamily(async (chatId) => {
-    await sendEnrichedNotification(chatId, listing, parsedData, locationScore, fitReason);
+    await sendEnrichedNotification(chatId, listing, parsedData, locationScore, fitReason, resultId);
   });
   assertBroadcastOk(result, 'Monitor alert');
 }
@@ -143,9 +181,9 @@ export async function broadcastEnrichedNotification(
  *  wraps this in try/catch, so a throw never disturbs the monitor cycle. */
 export async function broadcastText(text: string): Promise<void> {
   const bot = getBot();
-  const result = await broadcastToFamily((id) =>
-    mustSend(bot, id, text, { parse_mode: 'HTML', disable_web_page_preview: true }),
-  );
+  const result = await broadcastToFamily(async (id) => {
+    await mustSend(bot, id, text, { parse_mode: 'HTML', disable_web_page_preview: true });
+  });
   assertBroadcastOk(result, 'Daily rejection report');
 }
 
@@ -155,25 +193,31 @@ export async function sendEnrichedNotification(
   parsedData?: ParsedRentalData | ParsedItemData | null,
   locationScore?: LocationScore | null,
   fitReason?: string | null,
+  resultId?: string | null,
 ): Promise<void> {
   const bot = getBot();
   const isItem = !('slug' in listing); // ItemListing lacks `slug`
 
-  let text: string;
+  let raw: string;
   if (isItem) {
-    text = formatRichItemNotification(listing as ItemListing, parsedData as ParsedItemData | undefined);
+    raw = formatRichItemNotification(listing as ItemListing, parsedData as ParsedItemData | undefined);
   } else {
-    text = formatRichRentalNotification(listing as Listing, parsedData as ParsedRentalData | undefined, locationScore ?? undefined, fitReason);
+    raw = formatRichRentalNotification(listing as Listing, parsedData as ParsedRentalData | undefined, locationScore ?? undefined, fitReason);
   }
+
+  const text = resultId ? prefixResultIdHtml(resultId, raw) : raw;
+  const caption = resultId ? prefixResultIdPlain(resultId, raw) : raw;
+  const rid = resultId ?? undefined;
 
   // Split long cards to stay under Telegram's 4096 char limit
   const chunks = splitMessage(text);
   const photos = listing.photos;
 
   // Try photo+caption for short single-chunk cards (visible length, not raw HTML length)
-  if (chunks.length === 1 && captionLength(text) <= CAPTION_LIMIT && photos.length > 0) {
+  if (chunks.length === 1 && captionLength(caption) <= CAPTION_LIMIT && photos.length > 0) {
     try {
-      await sendPhotoAlbum(bot, chatId, photos, text);
+      const msgs = await sendPhotoAlbum(bot, chatId, photos, caption);
+      recordSentMessages(chatId, msgs, rid, 0);
       return;
     } catch {
       // Fallback to text + separate photos below
@@ -182,10 +226,13 @@ export async function sendEnrichedNotification(
 
   // Send text chunks — mustSend throws on total failure so scheduler retries next cycle
   for (const chunk of chunks) {
-    await mustSend(bot, chatId, chunk, { parse_mode: 'HTML', disable_web_page_preview: false });
+    await mustSend(bot, chatId, chunk, { parse_mode: 'HTML', disable_web_page_preview: false }, rid);
   }
   if (photos.length > 0) {
-    try { await sendPhotoAlbum(bot, chatId, photos); } catch { /* photos are best-effort */ }
+    try {
+      const msgs = await sendPhotoAlbum(bot, chatId, photos);
+      recordSentMessages(chatId, msgs, rid, 0);
+    } catch { /* photos are best-effort */ }
   }
 }
 
@@ -194,7 +241,12 @@ export async function sendEnrichedNotification(
 // ---------------------------------------------------------------------------
 
 type SendFn = (chatId: number | string, text: string, opts?: Record<string, unknown>) => Promise<void>;
-type SendPhotosFn = (chatId: number | string, urls: string[], caption?: string) => Promise<void>;
+type SendPhotosFn = (
+  chatId: number | string,
+  urls: string[],
+  caption?: string,
+  meta?: { resultId?: string },
+) => Promise<void>;
 
 /** Strip all HTML tags for plain text fallback — never show raw <tg-emoji> to user.
  *  Uses sanitize-html with allowedTags:[] to handle all edge cases (unclosed, nested, malformed). */
@@ -207,9 +259,16 @@ function stripHtml(html: string): string {
 }
 
 // Safe sendMessage wrapper — catches errors, retries with stripped HTML on parse failures
-async function safeSend(bot: TelegramBot, chatId: number | string, text: string, opts?: TelegramBot.SendMessageOptions): Promise<void> {
+async function safeSend(
+  bot: TelegramBot,
+  chatId: number | string,
+  text: string,
+  opts?: TelegramBot.SendMessageOptions,
+  resultId?: string,
+): Promise<void> {
   try {
-    await bot.sendMessage(chatId, text, opts);
+    const msg = await bot.sendMessage(chatId, text, opts);
+    recordSentMessages(chatId, [msg], resultId, null);
   } catch (err) {
     console.error('[telegram] sendMessage failed:', err instanceof Error ? err.message : err);
     // If HTML parsing failed, retry as plain text (strip all tags). Carry the caller's
@@ -217,7 +276,8 @@ async function safeSend(bot: TelegramBot, chatId: number | string, text: string,
     if (opts?.parse_mode && err instanceof Error && err.message.includes("can't parse entities")) {
       try {
         const plain = stripHtml(text);
-        await bot.sendMessage(chatId, plain, opts?.disable_notification ? { disable_notification: true } : undefined);
+        const msg = await bot.sendMessage(chatId, plain, opts?.disable_notification ? { disable_notification: true } : undefined);
+        recordSentMessages(chatId, [msg], resultId, null);
       } catch (retryErr) {
         console.error('[telegram] Plain text fallback also failed:', retryErr instanceof Error ? retryErr.message : retryErr);
       }
@@ -228,27 +288,49 @@ async function safeSend(bot: TelegramBot, chatId: number | string, text: string,
 /** Family-broadcast send: renders Markdown→HTML ONCE, then fans out to every member. */
 function makeBroadcastSendFn(bot: TelegramBot): SendFn {
   return async (_chatId, text, opts?) => {
+    const resultId = typeof opts?.resultId === 'string' ? opts.resultId : undefined;
+    const { resultId: _drop, ...rest } = opts ?? {};
     // If no explicit parse_mode override, transform Claude's Markdown to HTML (once, not per recipient)
-    const finalText = (!opts || !('parse_mode' in opts)) ? mdToHtml(text) : text;
-    const sendOpts = { parse_mode: 'HTML', ...opts } as TelegramBot.SendMessageOptions;
-    await broadcastToFamily((id) => safeSend(bot, id, finalText, sendOpts));
+    const finalText = (!rest || !('parse_mode' in rest)) ? mdToHtml(text) : text;
+    const sendOpts = { parse_mode: 'HTML', ...rest } as TelegramBot.SendMessageOptions;
+    await broadcastToFamily((id) => safeSend(bot, id, finalText, sendOpts, resultId));
   };
 }
 
 /** Best-effort echo of one member's question to the OTHER members (not the asker),
  *  so the shared thread shows who asked what. Never blocks the reply. */
-function makeEchoFn(bot: TelegramBot): (askerChatId: number, senderName: string, text: string) => void {
-  return (askerChatId, senderName, text) => {
+function makeEchoFn(bot: TelegramBot): (askerChatId: number, senderName: string, text: string, replyHint?: string | null) => void {
+  return (askerChatId, senderName, text, replyHint?) => {
+    const prefix = replyHint ? `👤 ${senderName} (re: ${replyHint}): ` : `👤 ${senderName}: `;
     for (const id of getAuthorizedTelegramIds()) {
       if (id === askerChatId) continue;
       // Plain text (no parse_mode) — avoids having to HTML-escape arbitrary user input.
-      safeSend(bot, id, `👤 ${senderName}: ${text}`).catch(() => {});
+      safeSend(bot, id, `${prefix}${text}`).catch(() => {});
     }
   };
 }
 
 function makeSendPhotosFn(bot: TelegramBot): SendPhotosFn {
-  return (chatId, urls, caption?) => sendPhotoAlbum(bot, chatId, urls, caption);
+  return async (chatId, urls, caption?, meta?) => {
+    const msgs = await sendPhotoAlbum(bot, chatId, urls, caption);
+    recordSentMessages(chatId, msgs, meta?.resultId, 0);
+  };
+}
+
+/** Resolve a Telegram reply to a listing result ID (+ optional album photo index). */
+function resolveReplyContext(msg: Msg): { resultId: string; photoIndex: number | null } | null {
+  const replied = msg.reply_to_message;
+  if (!replied) return null;
+
+  const fromText = extractResultId(replied.text) ?? extractResultId(replied.caption);
+  if (fromText) {
+    const mapped = getTelegramMessageRef(msg.chat.id, replied.message_id);
+    return { resultId: fromText, photoIndex: mapped?.photoIndex ?? null };
+  }
+
+  const mapped = getTelegramMessageRef(msg.chat.id, replied.message_id);
+  if (!mapped) return null;
+  return { resultId: mapped.resultId, photoIndex: mapped.photoIndex };
 }
 
 // ---------------------------------------------------------------------------
@@ -313,6 +395,8 @@ export function startBot(): TelegramBot {
         '"Monitor iPhones under 3000 PLN in Warszawa"',
         '"Show my monitors"',
         '"Stop monitor 5"',
+        '',
+        'Tip: reply to a listing card (or its photo) to ask about that apartment.',
       ].join('\n');
       await safeSend(bot, msg.chat.id, text, { parse_mode: 'HTML' });
     } catch (err) {
@@ -325,15 +409,15 @@ export function startBot(): TelegramBot {
   // an unhandledRejection and main.ts hard-exits the process, killing the bot for everyone.
   bot.on('message', async (msg: Msg) => {
     try {
-      const text = (msg.text ?? '').trim();
+      const text = (msg.text ?? msg.caption ?? '').trim();
       if (!text) return;
 
       // Log custom emoji entities for collecting emoji IDs
-      const customEmojis = (msg.entities ?? []).filter((e: any) => e.type === 'custom_emoji');
+      const customEmojis = (msg.entities ?? msg.caption_entities ?? []).filter((e: { type: string }) => e.type === 'custom_emoji');
       if (customEmojis.length > 0) {
         for (const e of customEmojis) {
           const emojiChar = text.slice(e.offset, e.offset + e.length);
-          console.log(`[emoji] Custom emoji: "${emojiChar}" → id: ${(e as any).custom_emoji_id}`);
+          console.log(`[emoji] Custom emoji: "${emojiChar}" → id: ${(e as { custom_emoji_id?: string }).custom_emoji_id}`);
         }
       }
 
@@ -346,12 +430,19 @@ export function startBot(): TelegramBot {
       const chatId = msg.chat.id;
       const senderName = msg.from?.first_name ?? msg.from?.username ?? String(userId);
 
+      const replyCtx = resolveReplyContext(msg);
+      let agentText = text;
+      if (replyCtx) {
+        const photoBit = replyCtx.photoIndex != null ? ` photo ${replyCtx.photoIndex + 1}` : '';
+        agentText = `[Replying to listing ${replyCtx.resultId}${photoBit}]\n${text}`;
+      }
+
       const typingFn = async (cid: number) => { await bot.sendChatAction(cid, 'typing'); };
 
       // Show the other members what was asked (best-effort, never blocks the reply).
-      echoFn(chatId, senderName, text);
+      echoFn(chatId, senderName, text, replyCtx?.resultId ?? null);
 
-      await handleUserMessage(userId, chatId, text, senderName, sendFn, sendPhotosFn, typingFn);
+      await handleUserMessage(userId, chatId, agentText, senderName, sendFn, sendPhotosFn, typingFn);
     } catch (err) {
       console.error(`[telegram] message handler error for user ${msg.from?.id}:`, err);
       try { await safeSend(bot, msg.chat.id, 'Something went wrong. Please try again later.'); } catch { /* best-effort */ }

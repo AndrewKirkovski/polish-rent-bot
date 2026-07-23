@@ -194,6 +194,23 @@ const SCHEMA = `
   CREATE INDEX IF NOT EXISTS idx_monitor_rejections_at
     ON monitor_rejections(rejected_at);
 
+  -- Maps outbound Telegram messages (cards / album photos) back to result IDs
+  -- so a user reply can reference a listing without typing the code.
+  CREATE TABLE IF NOT EXISTS telegram_message_refs (
+    chat_id     INTEGER NOT NULL,
+    message_id  INTEGER NOT NULL,
+    result_id   TEXT NOT NULL,
+    photo_index INTEGER,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (chat_id, message_id)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_telegram_message_refs_result
+    ON telegram_message_refs(result_id);
+
+  CREATE INDEX IF NOT EXISTS idx_telegram_message_refs_created
+    ON telegram_message_refs(created_at);
+
   -- Tiny key/value store for small scalars (e.g. the daily-report bookkeeping).
   CREATE TABLE IF NOT EXISTS app_state (
     key    TEXT PRIMARY KEY,
@@ -1272,4 +1289,47 @@ export function getCachedListingByPlatform(platform: string, platformId: string)
     WHERE platform = ? AND platform_id = ?
   `).get(platform, platformId) as { kind: string; listing_json: string; result_id: string | null; cached_at: string } | undefined;
   return row ? decodeCached(row) : null;
+}
+
+// ---------------------------------------------------------------------------
+// Telegram message → result ID refs (reply-to-card / reply-to-photo)
+// ---------------------------------------------------------------------------
+
+export function recordTelegramMessageRef(
+  chatId: number,
+  messageId: number,
+  resultId: string,
+  photoIndex: number | null = null,
+): void {
+  const db = getDb();
+  db.prepare(`
+    INSERT INTO telegram_message_refs (chat_id, message_id, result_id, photo_index)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(chat_id, message_id) DO UPDATE SET
+      result_id   = excluded.result_id,
+      photo_index = excluded.photo_index,
+      created_at  = datetime('now')
+  `).run(chatId, messageId, resultId, photoIndex);
+}
+
+export function getTelegramMessageRef(
+  chatId: number,
+  messageId: number,
+): { resultId: string; photoIndex: number | null } | null {
+  const db = getDb();
+  const row = db.prepare(`
+    SELECT result_id AS resultId, photo_index AS photoIndex
+    FROM telegram_message_refs
+    WHERE chat_id = ? AND message_id = ?
+  `).get(chatId, messageId) as { resultId: string; photoIndex: number | null } | undefined;
+  return row ?? null;
+}
+
+export function cleanOldTelegramMessageRefs(maxAgeDays = 30): number {
+  const db = getDb();
+  const result = db.prepare(`
+    DELETE FROM telegram_message_refs
+    WHERE created_at < datetime('now', ? || ' days')
+  `).run(`-${maxAgeDays}`);
+  return result.changes;
 }

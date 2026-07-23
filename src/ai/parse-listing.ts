@@ -21,16 +21,101 @@ const PARSE_MODEL = process.env.PARSE_MODEL || 'claude-haiku-4-5';
 
 // Folded into the parse cache key; bump on any RENTAL_PROMPT/schema change so stale
 // old-schema rows miss instead of returning objects without the new fields.
-export const RENTAL_PARSE_VERSION = 'wfh-v1';
-export const ITEM_PARSE_VERSION = 'v1';
+export const RENTAL_PARSE_VERSION = 'wfh-v2-media';
+export const ITEM_PARSE_VERSION = 'v2';
 
 function hashText(text: string): string {
   return createHash('sha256').update(text, 'utf-8').digest('hex');
 }
 
-/** Cache key for a rental parse — version-prefixed so a schema/prompt bump misses old rows. */
-export function rentalParseCacheKey(descOrTitle: string, version = RENTAL_PARSE_VERSION): string {
-  return hashText(`${version}\n${descOrTitle}`);
+function triFact(v: boolean | null | undefined): string {
+  return v === true ? 'yes' : v === false ? 'no' : 'unknown';
+}
+
+/**
+ * Fingerprint for a rental parse — version + every field that goes into the LLM user
+ * message. Same inputs → cache hit (search ↔ monitor share). Different inputs → miss.
+ */
+export function rentalParseCacheKey(
+  listing: Pick<
+    Listing,
+    | 'description'
+    | 'title'
+    | 'price'
+    | 'rent'
+    | 'deposit'
+    | 'area'
+    | 'rooms'
+    | 'floor'
+    | 'buildingFloor'
+    | 'buildingType'
+    | 'heating'
+    | 'hasInternet'
+    | 'hasElevator'
+    | 'hasAc'
+    | 'buildYear'
+    | 'city'
+    | 'district'
+    | 'street'
+    | 'lat'
+    | 'lng'
+    | 'advertiserType'
+  >,
+  version = RENTAL_PARSE_VERSION,
+): string {
+  const desc = (listing.description || '').slice(0, 8000);
+  const parts = [
+    version,
+    `title:${listing.title}`,
+    desc,
+    `price:${listing.price}`,
+    `rent:${listing.rent ?? ''}`,
+    `deposit:${listing.deposit ?? ''}`,
+    `area:${listing.area ?? ''}`,
+    `rooms:${listing.rooms ?? ''}`,
+    `floor:${listing.floor ?? ''}`,
+    `buildingFloor:${listing.buildingFloor ?? ''}`,
+    `buildingType:${listing.buildingType ?? ''}`,
+    `heating:${listing.heating ?? ''}`,
+    `internet:${triFact(listing.hasInternet)}`,
+    `elevator:${triFact(listing.hasElevator)}`,
+    `ac:${triFact(listing.hasAc)}`,
+    `buildYear:${listing.buildYear ?? ''}`,
+    `city:${listing.city}`,
+    `district:${listing.district ?? ''}`,
+    `street:${listing.street ?? ''}`,
+    `lat:${listing.lat ?? ''}`,
+    `lng:${listing.lng ?? ''}`,
+    `advertiser:${listing.advertiserType ?? ''}`,
+  ];
+  return hashText(parts.join('\n'));
+}
+
+/** Fingerprint for an item parse — same rule as rentals. */
+export function itemParseCacheKey(
+  item: Pick<ItemListing, 'description' | 'title' | 'price' | 'currency' | 'negotiable' | 'condition' | 'city' | 'contactName' | 'isBusiness' | 'params'>,
+  version = ITEM_PARSE_VERSION,
+): string {
+  const desc = (item.description || '').slice(0, 8000);
+  const params = Object.entries(item.params)
+    .filter(([k]) => k !== 'price')
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([k, v]) => `${k}:${v}`)
+    .join(',');
+  const parts = [
+    version,
+    `title:${item.title}`,
+    desc,
+    `price:${item.price}`,
+    `currency:${item.currency}`,
+    `negotiable:${item.negotiable ? 1 : 0}`,
+    `condition:${item.condition ?? ''}`,
+    `city:${item.city}`,
+    `contact:${item.contactName ?? ''}`,
+    `business:${item.isBusiness ? 1 : 0}`,
+    `params:${params}`,
+  ];
+  return hashText(parts.join('\n'));
 }
 
 // ---------------------------------------------------------------------------
@@ -46,7 +131,18 @@ GROUND-TRUTH FACTS may be supplied in the input (internet / elevator / AC / buil
 Extraction notes:
 - deposit (kaucja): "kaucja", "depozyt", "zabezpieczenie", "kaucja zwrotna", "2x czynsz".
 - contractType: only if explicitly stated ("najem okazjonalny/instytucjonalny"); else null (never assume najem zwykły).
-- estimatedMedia: monthly PLN the tenant pays SEPARATELY on top of czynsz. If a utility is already in czynsz, leave it null (no double counting). Do not compute a total — the app does.
+- adminFee (czynsz administracyjny): prefer structured input when given; if missing, extract from the description ("czynsz admin.", "cz. adm.", "czynsz 800 zł" when clearly the admin fee, not najem).
+- estimatedMedia — CRITICAL for true monthly cost. Fill EVERY utility the TENANT pays SEPARATELY on top of czynsz. If a utility is already inside czynsz, leave that field null (no double counting). Do NOT invent a total — the app sums fields.
+  Categories: water, electricity, gas, heating (CO/ogrzewanie), internet, other (undifferentiated lump).
+  Polish patterns — be clever:
+  • "media w cenie" / "media w czynszu" / "czynsz z mediami" / "wszystkie opłaty w cenie" → all media null.
+  • "czynsz + media" / "+ media" / "media osobno" / "media wg zużycia" / "zaliczki na media" / "opłaty poza czynszem" → tenant pays media; extract amounts or ESTIMATE typical Warsaw monthly zł for this flat size — do not leave null just because no exact number.
+  • Lump only ("zaliczka na media 400 zł", "media ok. 500") with no breakdown → put the amount in "other"; do not fake a precise 5-way split.
+  • Partial breakdown ("prąd ~200, reszta media 300") → fill known keys; remainder → other.
+  • "CO w czynszu" / "ogrzewanie w czynszu" → heating null; "CO osobno" / "wg zużycia" → estimate heating.
+  • "internet w cenie" → internet null; "światłowód do podłączenia" / not included → estimate internet if tenant must pay.
+  • "prąd według licznika" with no number → still estimate electricity.
+  Prefer slightly conservative (higher) estimates over optimistic nulls when the ad is clearly "+ media" without numbers — underestimating breaks budget filters.
 - addressHint: exact ulica + number or a clear landmark, for geocoding; null if none.
 - isConcreteApartment: FALSE for agency/portfolio posts, investment/new-build sales, price ranges ("od X zł"), generic "we have flats" ads, or scams; TRUE for one real, specific flat.
 - separateRooms: number of CLOSABLE separate rooms (exclude a walk-through/przechodni room and the kitchen). layoutType: "rozkladowy" (rooms off a hall), "przechodni" (walk-through), or "open" (studio/open-plan).
@@ -62,7 +158,7 @@ JSON schema:
   "adminFee": number|null,
   "addressHint": "улица+номер или ориентир" | null,
   "isConcreteApartment": true|false,
-  "estimatedMedia": { "water": number|null, "electricity": number|null, "gas": number|null, "internet": number|null, "heating": number|null },
+  "estimatedMedia": { "water": number|null, "electricity": number|null, "gas": number|null, "internet": number|null, "heating": number|null, "other": number|null },
   "contractType": "najem_okazjonalny"|"najem_zwykly"|"najem_instytucjonalny"|null,
   "availableFrom": "дата / 'сразу'" | null,
   "minimumLease": "напр. '12 месяцев'" | null,
@@ -136,13 +232,17 @@ ${(listing.description || 'No description').slice(0, 600)}`;
 }
 
 export async function parseRentalListing(listing: Listing, ctx: AiCallCtx = {}): Promise<ParsedRentalData> {
-  const descHash = rentalParseCacheKey(listing.description || listing.title);
+  const descHash = rentalParseCacheKey(listing);
 
-  // Check cache
+  // Check cache — hit only when fingerprint matches (same parse inputs).
   const cached = getParsedListing(listing.platform, listing.platformId);
   if (cached && cached.description_hash === descHash) {
     try {
       const parsed = JSON.parse(cached.parsed_data);
+      // Old rows may predate estimatedMedia.other — normalize so consumers can rely on the key.
+      if (parsed?.estimatedMedia && parsed.estimatedMedia.other === undefined) {
+        parsed.estimatedMedia.other = null;
+      }
       recordLocalCacheHit({ feature: 'parse_rental', ...ctx }, PARSE_MODEL);
       return parsed;
     } catch {
@@ -150,7 +250,7 @@ export async function parseRentalListing(listing: Listing, ctx: AiCallCtx = {}):
     }
   }
 
-  const tri = (v: boolean | null) => (v === true ? 'yes' : v === false ? 'no' : 'unknown');
+  const tri = triFact;
   const userMessage = `Title: ${listing.title}
 Rent price: ${listing.price} PLN/month
 Czynsz admin (from structured data): ${listing.rent ?? 'not specified'} PLN
@@ -188,7 +288,8 @@ ${(listing.description || 'No description provided').slice(0, 8000)}`;
     messages: [{ role: 'user', content: userMessage }],
   }, { feature: 'parse_rental', ...ctx }); // uses client defaults: 120s timeout, 3 retries
 
-  if (response.stop_reason === 'max_tokens') {
+  const truncated = response.stop_reason === 'max_tokens';
+  if (truncated) {
     console.error(`[parse-listing] TRUNCATED (max_tokens) for ${listing.platform}:${listing.platformId} "${listing.title.slice(0, 40)}" — raise max_tokens or trim schema`);
   }
 
@@ -215,16 +316,21 @@ ${(listing.description || 'No description provided').slice(0, 8000)}`;
     throw new Error('AI returned invalid JSON');
   }
 
-  try {
-    saveParsedListing(
-      listing.platform,
-      listing.platformId,
-      'rental',
-      JSON.stringify(parsed),
-      descHash,
-    );
-  } catch (dbErr) {
-    console.error('[parse-listing] Cache write failed:', dbErr);
+  // Truncated responses may look valid but omit fields — do not poison the shared cache.
+  if (!truncated) {
+    try {
+      saveParsedListing(
+        listing.platform,
+        listing.platformId,
+        'rental',
+        JSON.stringify(parsed),
+        descHash,
+      );
+    } catch (dbErr) {
+      console.error('[parse-listing] Cache write failed:', dbErr);
+    }
+  } else {
+    console.warn(`[parse-listing] Skipping cache write for truncated parse ${listing.platform}:${listing.platformId}`);
   }
 
   return parsed;
@@ -258,7 +364,7 @@ Return ONLY valid JSON (no markdown fences):
 }`;
 
 export async function parseItemListing(item: ItemListing, ctx: AiCallCtx = {}): Promise<ParsedItemData> {
-  const descHash = hashText(`${ITEM_PARSE_VERSION}\n${item.description || item.title}`);
+  const descHash = itemParseCacheKey(item);
 
   const cached = getParsedListing(item.platform, item.platformId);
   if (cached && cached.description_hash === descHash) {
@@ -295,6 +401,11 @@ ${(item.description || 'No description provided').slice(0, 8000)}`;
     messages: [{ role: 'user', content: userMessage }],
   }, { feature: 'parse_item', ...ctx }); // uses client defaults: 120s timeout, 3 retries
 
+  const truncated = response.stop_reason === 'max_tokens';
+  if (truncated) {
+    console.error(`[parse-listing] TRUNCATED (max_tokens) item ${item.platform}:${item.platformId}`);
+  }
+
   const textBlock = response.content.find((b: { type: string }) => b.type === 'text');
   if (!textBlock || textBlock.type !== 'text') {
     throw new Error('No text in Claude response');
@@ -316,16 +427,20 @@ ${(item.description || 'No description provided').slice(0, 8000)}`;
     throw new Error('AI returned invalid JSON');
   }
 
-  try {
-    saveParsedListing(
-      item.platform,
-      item.platformId,
-      'item',
-      JSON.stringify(parsed),
-      descHash,
-    );
-  } catch (dbErr) {
-    console.error('[parse-listing] Cache write failed:', dbErr);
+  if (!truncated) {
+    try {
+      saveParsedListing(
+        item.platform,
+        item.platformId,
+        'item',
+        JSON.stringify(parsed),
+        descHash,
+      );
+    } catch (dbErr) {
+      console.error('[parse-listing] Cache write failed:', dbErr);
+    }
+  } else {
+    console.warn(`[parse-listing] Skipping cache write for truncated item parse ${item.platform}:${item.platformId}`);
   }
 
   return parsed;

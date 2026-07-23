@@ -8,6 +8,7 @@ export type BroadcastPhotosFn = (
   chatId: number | string,
   urls: string[],
   caption?: string,
+  meta?: { resultId?: string },
 ) => Promise<void>;
 
 function sleep(ms: number): Promise<void> {
@@ -50,7 +51,7 @@ export function assertBroadcastOk(result: { delivered: number; failed: number[] 
 }
 
 export function wrapBroadcastPhotos(baseSend: BroadcastPhotosFn): BroadcastPhotosFn {
-  return async (_chatId, urls, caption) => {
-    await broadcastToFamily((id) => baseSend(id, urls, caption));
+  return async (_chatId, urls, caption, meta) => {
+    await broadcastToFamily((id) => baseSend(id, urls, caption, meta));
   };
 }

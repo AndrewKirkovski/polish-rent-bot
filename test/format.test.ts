@@ -5,7 +5,7 @@ import { computeRentalCost } from '../src/cost.js';
 import { mkListing, mkParsed, mkScore } from './helpers.js';
 
 test('computeRentalCost sums najem + czynsz + media', () => {
-  const c = computeRentalCost({ price: 4000, rent: 500 }, mkParsed({ adminFee: 600, estimatedMedia: { water: null, electricity: 200, gas: null, internet: null, heating: null } }));
+  const c = computeRentalCost({ price: 4000, rent: 500 }, mkParsed({ adminFee: 600, estimatedMedia: { water: null, electricity: 200, gas: null, internet: null, heating: null, other: null } }));
   assert.equal(c.total, 4000 + 600 + 200); // adminFee overrides listing.rent
 });
 

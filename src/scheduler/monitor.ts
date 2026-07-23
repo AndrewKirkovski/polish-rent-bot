@@ -2,7 +2,7 @@
 // and calls a notification callback for each unseen result.
 
 import { searchItems, fetchItemPhone } from '../crawlers/olx-items.js';
-import { getMonitors, isListingSeen, markListingSeen, cleanOldSeen, cleanOldCachedListings, cleanOldNotifiedFingerprints, cleanOldMonitorRejections, startMonitorRun, finishMonitorRun, cacheListing, isFingerprintNotified, markFingerprintNotified, recordMonitorRejection, getMonitorRejectionsSince, getAppState, setAppState, type MonitorRow } from '../storage/db.js';
+import { getMonitors, isListingSeen, markListingSeen, cleanOldSeen, cleanOldCachedListings, cleanOldNotifiedFingerprints, cleanOldMonitorRejections, cleanOldTelegramMessageRefs, startMonitorRun, finishMonitorRun, cacheListing, getCachedListingByPlatform, isFingerprintNotified, markFingerprintNotified, recordMonitorRejection, getMonitorRejectionsSince, getAppState, setAppState, type MonitorRow } from '../storage/db.js';
 import { buildRejectionReport } from './rejection-report.js';
 import type { Listing, ParsedRentalData, ParsedItemData, LocationScore } from '../types.js';
 import type { ItemListing } from '../crawlers/olx-items.js';
@@ -14,6 +14,8 @@ import { enrichRentalListing } from '../search/enrich-listing.js';
 import { checkAmenityGate, resolveStrictAmenities } from '../search/amenity-gate.js';
 import { notificationDedupKey } from '../search/listing-fingerprint.js';
 import { computeFitScore, preScore } from '../search/fit-score.js';
+import { genResultId } from '../utils/result-id.js';
+import { seedResultIdForFamily } from '../ai/tools.js';
 
 // ---------------------------------------------------------------------------
 // Monitor config types (what lives inside monitor.config JSON column)
@@ -224,6 +226,7 @@ export function startScheduler(
     parsedData?: ParsedRentalData | ParsedItemData | null,
     locationScore?: LocationScore | null,
     fitReason?: string | null,
+    resultId?: string | null,
   ) => void | Promise<void>,
   reportFn?: (text: string) => void | Promise<void>,
 ): () => void {
@@ -337,11 +340,13 @@ export function startScheduler(
               }
 
               try {
+                // Best-effort early cache without ID — recall for rejected listings is low value.
+                // Delivered alerts overwrite with a real resultId below.
                 cacheListing({
                   platform: workingListing.platform,
                   platformId: workingListing.platformId,
                   kind: monitor.type === 'rental' ? 'rental' : 'item',
-                  resultId: null,
+                  resultId: getCachedListingByPlatform(workingListing.platform, workingListing.platformId)?.resultId ?? null,
                   listing: workingListing,
                 });
               } catch (cacheErr) {
@@ -434,12 +439,30 @@ export function startScheduler(
                 const fit = computeFitScore(workingListing as Listing, parsedData as ParsedRentalData | null, locationScore);
                 fitReason = `${fit.score}${fit.reason ? ' · ' + fit.reason : ''}`;
               }
+
+              // Reuse a prior search/monitor result ID when present so one flat ↔ one code.
+              const existingId = getCachedListingByPlatform(workingListing.platform, workingListing.platformId)?.resultId;
+              const resultId = existingId ?? genResultId();
+              try {
+                cacheListing({
+                  platform: workingListing.platform,
+                  platformId: workingListing.platformId,
+                  kind: monitor.type === 'rental' ? 'rental' : 'item',
+                  resultId,
+                  listing: workingListing,
+                });
+              } catch (cacheErr) {
+                console.error('[scheduler] cacheListing (deliver) failed:', cacheErr instanceof Error ? cacheErr.message : cacheErr);
+              }
+              seedResultIdForFamily(resultId, workingListing, monitor.user_id);
+
               await notifyFn(
                 monitor.user_id,
                 workingListing,
                 parsedData,
                 locationScore,
                 fitReason,
+                resultId,
               );
               markFingerprintNotified(dedupKey); // household-wide, so no other monitor re-alerts it
               markListingSeen(monitor.id, workingListing.platform, workingListing.platformId, workingListing.url, workingListing.title, workingListing.price);
@@ -464,6 +487,7 @@ export function startScheduler(
       cleanOldCachedListings(90);
       cleanOldNotifiedFingerprints(30);
       cleanOldMonitorRejections(7); // consumed by the daily report; keep a small buffer
+      cleanOldTelegramMessageRefs(30);
 
       // Once-per-day aggregated rejection digest (monitors are silent per-listing).
       if (reportFn) {

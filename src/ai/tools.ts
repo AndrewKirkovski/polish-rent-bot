@@ -1,7 +1,6 @@
 // Tool definitions for the Claude API + dispatcher that executes them
 // Deep pipeline tools: find_rentals, find_items, create_monitor, update_monitor, delete_monitor, list_monitors
 import type { Tool } from '@anthropic-ai/sdk/resources/messages.js';
-import { customAlphabet } from 'nanoid';
 
 import { searchItems, fetchItemPhone } from '../crawlers/olx-items.js';
 import type { ItemListing } from '../crawlers/olx-items.js';
@@ -29,13 +28,13 @@ import {
 } from '../storage/db.js';
 import type { Listing, ParsedRentalData, ParsedItemData, LocationScore } from '../types.js';
 import { computeRentalCost, exceedsBudgetFloor } from '../cost.js';
+import { genResultId, prefixResultIdHtml, prefixResultIdPlain } from '../utils/result-id.js';
 
 // ---------------------------------------------------------------------------
-// Short human-readable ID generator (nanoid, unambiguous alphabet)
+// Short human-readable ID generator (shared with monitor path)
 // ---------------------------------------------------------------------------
 
-// Unambiguous alphabet: removed 0/O, 1/I/L, U/V confusion
-const genId = customAlphabet('23456789ABCDEFGHJKMNPQRSTVWXYZ', 6);
+const genId = genResultId;
 
 // ---------------------------------------------------------------------------
 // User context -- tracks state across the conversation for a single user
@@ -65,9 +64,22 @@ export function getOrCreateContext(userId: number, chatId: number): UserContext 
 }
 
 function seedResultForFamily(ctx: UserContext, resultId: string, listing: Listing | ItemListing): void {
-  ctx.resultMap.set(resultId, listing);
-  for (const uid of getAuthorizedTelegramIds()) {
-    if (uid === ctx.userId) continue;
+  seedResultIdForFamily(resultId, listing, ctx.userId);
+}
+
+/** Seed every authorized member's in-memory resultMap (search + monitor alerts). */
+export function seedResultIdForFamily(
+  resultId: string,
+  listing: Listing | ItemListing,
+  primaryUserId?: number,
+): void {
+  const ids = getAuthorizedTelegramIds();
+  const primary = primaryUserId ?? ids[0];
+  if (primary != null) {
+    getOrCreateContext(primary, primary).resultMap.set(resultId, listing);
+  }
+  for (const uid of ids) {
+    if (uid === primary) continue;
     getOrCreateContext(uid, uid).resultMap.set(resultId, listing);
   }
 }
@@ -85,7 +97,12 @@ function seedSearchResultsForFamily(ctx: UserContext, listings: (Listing | ItemL
 // ---------------------------------------------------------------------------
 
 type SendFn = (chatId: number, text: string, opts?: Record<string, unknown>) => Promise<void>;
-type SendPhotosFn = (chatId: number, urls: string[], caption?: string) => Promise<void>;
+type SendPhotosFn = (
+  chatId: number,
+  urls: string[],
+  caption?: string,
+  meta?: { resultId?: string },
+) => Promise<void>;
 
 /** Escape HTML special chars for Telegram HTML parse_mode */
 function escHtml(s: string): string {
@@ -359,7 +376,7 @@ async function sendRejection(
     await sendFn(
       chatId,
       `❌ [<b>${resultId}</b>] ${escHtml(title.slice(0, 50))} — ${escHtml(reason)}`,
-      { parse_mode: 'HTML', disable_notification: true },
+      { parse_mode: 'HTML', disable_notification: true, resultId },
     );
   } catch (e) { console.error('[tools] rejection send failed:', e instanceof Error ? e.message : e); }
 }
@@ -380,13 +397,13 @@ async function sendRentalCard(
     locationScore ?? undefined,
     fitReason,
   );
-  const card = `<b>[${resultId}]</b>\n${rawCard}`;
+  const card = prefixResultIdHtml(resultId, rawCard);
 
   if (listing.photos.length > 0) {
-    const caption = `[${resultId}] ${rawCard}`;
+    const caption = prefixResultIdPlain(resultId, rawCard);
     if (captionLength(caption) <= CAPTION_LIMIT) {
       try {
-        await sendPhotosFn(chatId, listing.photos.slice(0, 10), caption);
+        await sendPhotosFn(chatId, listing.photos.slice(0, 10), caption, { resultId });
         return;
       } catch (e) {
         console.error('[tools] photo+caption failed:', e instanceof Error ? e.message : e);
@@ -397,15 +414,15 @@ async function sendRentalCard(
   const cardChunks = splitMessage(card);
   for (const chunk of cardChunks) {
     try {
-      await sendFn(chatId, chunk, { parse_mode: 'HTML' });
+      await sendFn(chatId, chunk, { parse_mode: 'HTML', resultId });
     } catch (cardErr) {
-      try { await sendFn(chatId, `[${resultId}] ${listing.title}\n${listing.url}\nPrice: ${listing.price} PLN`, { parse_mode: undefined }); } catch (e) { console.error('[tools] send failed:', e instanceof Error ? e.message : e); }
+      try { await sendFn(chatId, `[${resultId}] ${listing.title}\n${listing.url}\nPrice: ${listing.price} PLN`, { parse_mode: undefined, resultId }); } catch (e) { console.error('[tools] send failed:', e instanceof Error ? e.message : e); }
       break;
     }
   }
   if (listing.photos.length > 0) {
     try {
-      await sendPhotosFn(chatId, listing.photos.slice(0, 10));
+      await sendPhotosFn(chatId, listing.photos.slice(0, 10), undefined, { resultId });
     } catch (photoErr) {
       console.error(`[sendRentalCard] Photo send error for ${listing.url}:`, photoErr);
     }
@@ -421,13 +438,13 @@ async function sendItemCard(
   parsedData: ParsedItemData | null,
 ): Promise<void> {
   const rawCard = formatRichItemNotification(item, parsedData ?? undefined);
-  const card = `<b>[${resultId}]</b>\n${rawCard}`;
+  const card = prefixResultIdHtml(resultId, rawCard);
 
   if (item.photos.length > 0) {
-    const caption = `[${resultId}] ${rawCard}`;
+    const caption = prefixResultIdPlain(resultId, rawCard);
     if (captionLength(caption) <= CAPTION_LIMIT) {
       try {
-        await sendPhotosFn(chatId, item.photos.slice(0, 10), caption);
+        await sendPhotosFn(chatId, item.photos.slice(0, 10), caption, { resultId });
         return;
       } catch (e) {
         console.error('[tools] photo+caption failed:', e instanceof Error ? e.message : e);
@@ -438,15 +455,15 @@ async function sendItemCard(
   const itemChunks = splitMessage(card);
   for (const chunk of itemChunks) {
     try {
-      await sendFn(chatId, chunk, { parse_mode: 'HTML' });
+      await sendFn(chatId, chunk, { parse_mode: 'HTML', resultId });
     } catch (cardErr) {
-      try { await sendFn(chatId, `[${resultId}] ${item.title}\n${item.url}\nPrice: ${item.price} PLN`, { parse_mode: undefined }); } catch (e) { console.error('[tools] send failed:', e instanceof Error ? e.message : e); }
+      try { await sendFn(chatId, `[${resultId}] ${item.title}\n${item.url}\nPrice: ${item.price} PLN`, { parse_mode: undefined, resultId }); } catch (e) { console.error('[tools] send failed:', e instanceof Error ? e.message : e); }
       break;
     }
   }
   if (item.photos.length > 0) {
     try {
-      await sendPhotosFn(chatId, item.photos.slice(0, 10));
+      await sendPhotosFn(chatId, item.photos.slice(0, 10), undefined, { resultId });
     } catch (photoErr) {
       console.error(`[sendItemCard] Photo send error for ${item.url}:`, photoErr);
     }
@@ -1185,7 +1202,7 @@ export async function executeTool(
   _chatId: number,
   context: UserContext,
   sendFn: (chatId: number, text: string, opts?: Record<string, unknown>) => Promise<void>,
-  sendPhotosFn: (chatId: number, urls: string[], caption?: string) => Promise<void>,
+  sendPhotosFn: (chatId: number, urls: string[], caption?: string, meta?: { resultId?: string }) => Promise<void>,
 ): Promise<string> {
   try {
     switch (name) {
