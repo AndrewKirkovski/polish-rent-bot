@@ -90,6 +90,41 @@ All authorized bot users share one conversation and receive every message and mo
 |----------|---------|-------------|
 | `STRICT_WALKING_AMENITIES` | `false` | Global default for hard metro/tram/bus walking filter |
 | `LISTING_DEDUP_ENABLED` | `true` | Cross-platform duplicate merge (OLX + Otodom) |
+| `DASHBOARD_ADMIN_TOKEN` | `BOT_PASSWORD` | Dedicated token for destructive dashboard operations |
+
+### Operations API
+
+The dashboard exposes JSON APIs on port 8090. Its read routes are intended for a trusted LAN and are not authenticated; destructive operations require an admin token.
+
+`GET /api/stats?range=24h` returns aggregate operational statistics. Supported ranges are `24h`, `7d`, `30d`, and `all`. The response includes:
+
+- AI API calls, local cache hits, errors, token categories, total tokens, and estimated USD cost
+- average cost per API call, local cache hit rate, prompt-cache read share, and API latency (average, p50, p95, maximum)
+- usage grouped by feature and model
+- models with recorded tokens but no price, so zero-cost gaps are visible
+- monitor runs, failures, found/unseen/delivered listings, active monitors, and current cache sizes
+
+Costs are estimates calculated from the static per-model price table in `src/ai/pricing.ts`; they are not provider invoices. The response identifies unpriced models separately.
+
+`POST /api/cache/reset` clears derived caches. It requires `DASHBOARD_ADMIN_TOKEN`, or `BOT_PASSWORD` when a dedicated token is not configured, plus an exact confirmation string:
+
+```bash
+curl -X POST "http://<revo-lan-ip>:8090/api/cache/reset" \
+  -H "Authorization: Bearer $DASHBOARD_ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  --data '{"confirm":"RESET_CACHES","scope":"all"}'
+```
+
+Scopes:
+
+| Scope | Cleared data |
+|-------|--------------|
+| `all` | Parsed listings, AI rejection decisions, and Google Maps responses |
+| `location` | Parsed listings and Google Maps responses |
+| `maps` | Google Maps responses only |
+| `ai` | Parsed listings and AI rejection decisions |
+
+Every scope preserves seen listings, notification fingerprints, cached result cards, monitor history, conversations, and AI usage telemetry. A reset therefore refreshes derived analysis without replaying historical alerts or erasing cost statistics.
 
 ## Deployment (local)
 

@@ -743,8 +743,10 @@ export interface UsageSummary {
   errorCount: number;
 }
 
-export function getUsageSummary(range: UsageRange): UsageSummary {
-  const db = getDb();
+export function getUsageSummary(
+  range: UsageRange,
+  db: Database.Database = getDb(),
+): UsageSummary {
   const bind = rangeBind(range);
   const where = bind ? `WHERE ts >= datetime('now', ?)` : '';
   const sql = `
@@ -876,8 +878,10 @@ export interface CacheStats {
   localHitRate24h: number; // 0..1
 }
 
-export function getCacheStats(mapsTtlDays = 7): CacheStats {
-  const db = getDb();
+export function getCacheStats(
+  mapsTtlDays = 7,
+  db: Database.Database = getDb(),
+): CacheStats {
   const parsed = db.prepare(`SELECT COUNT(*) AS c, MIN(parsed_at) AS oldest, MAX(parsed_at) AS newest FROM parsed_listings`).get() as { c: number; oldest: string | null; newest: string | null };
   const rejection = db.prepare(`SELECT COUNT(*) AS c, MIN(cached_at) AS oldest, MAX(cached_at) AS newest FROM rejection_cache`).get() as { c: number; oldest: string | null; newest: string | null };
   const maps = db.prepare(`SELECT COUNT(*) AS c, MIN(cached_at) AS oldest, MAX(cached_at) AS newest FROM maps_cache`).get() as { c: number; oldest: string | null; newest: string | null };
@@ -897,6 +901,295 @@ export function getCacheStats(mapsTtlDays = 7): CacheStats {
     rejectionCache: { count: rejection.c, oldestTs: rejection.oldest, newestTs: rejection.newest },
     mapsCache: { count: maps.c, oldestTs: maps.oldest, newestTs: maps.newest, expiredCount: expired.c },
     localHitRate24h,
+  };
+}
+
+export type CacheResetScope = 'all' | 'location' | 'maps' | 'ai';
+
+export interface CacheResetResult {
+  scope: CacheResetScope;
+  clearedAt: string;
+  deleted: {
+    parsedListings: number;
+    rejectionCache: number;
+    mapsCache: number;
+  };
+  before: CacheStats;
+  after: CacheStats;
+  preserved: string[];
+}
+
+/**
+ * Clear derived caches without replaying or re-notifying historical listings.
+ * Seen/notified state, result-card recall data, monitor history, conversations,
+ * and usage telemetry are deliberately outside every reset scope.
+ */
+export function resetCaches(
+  scope: CacheResetScope,
+  db: Database.Database = getDb(),
+): CacheResetResult {
+  const before = getCacheStats(7, db);
+  const clearParsed = scope === 'all' || scope === 'location' || scope === 'ai';
+  const clearRejection = scope === 'all' || scope === 'ai';
+  const clearMaps = scope === 'all' || scope === 'location' || scope === 'maps';
+
+  const deleted = db.transaction(() => ({
+    parsedListings: clearParsed ? db.prepare('DELETE FROM parsed_listings').run().changes : 0,
+    rejectionCache: clearRejection ? db.prepare('DELETE FROM rejection_cache').run().changes : 0,
+    mapsCache: clearMaps ? db.prepare('DELETE FROM maps_cache').run().changes : 0,
+  }))();
+
+  return {
+    scope,
+    clearedAt: new Date().toISOString(),
+    deleted,
+    before,
+    after: getCacheStats(7, db),
+    preserved: [
+      'seen_listings',
+      'notified_fingerprints',
+      'cached_listings',
+      'monitor_runs',
+      'monitor_rejections',
+      'conversations',
+      'ai_usage',
+    ],
+  };
+}
+
+export interface UsageDimensionStats {
+  name: string;
+  apiCalls: number;
+  localCacheHits: number;
+  errorCount: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheCreationTokens: number;
+  cacheReadTokens: number;
+  totalTokens: number;
+  estimatedCostUsd: number;
+  averageDurationMs: number | null;
+}
+
+export interface OperationalStats {
+  range: UsageRange;
+  generatedAt: string;
+  usage: {
+    estimatedCostUsd: number;
+    apiCalls: number;
+    localCacheHits: number;
+    recordedEvents: number;
+    errorCount: number;
+    errorRate: number;
+    localCacheHitRate: number;
+    inputTokens: number;
+    outputTokens: number;
+    cacheCreationTokens: number;
+    cacheReadTokens: number;
+    totalTokens: number;
+    cacheReadShare: number;
+    averageCostPerApiCallUsd: number;
+  };
+  latencyMs: {
+    samples: number;
+    average: number | null;
+    p50: number | null;
+    p95: number | null;
+    max: number | null;
+  };
+  byFeature: UsageDimensionStats[];
+  byModel: UsageDimensionStats[];
+  unpricedModels: Array<{ model: string; calls: number; tokens: number }>;
+  monitors: {
+    active: number;
+    runs: number;
+    failedRuns: number;
+    listingsFound: number;
+    listingsUnseen: number;
+    listingsDelivered: number;
+  };
+  caches: CacheStats;
+  pricing: {
+    currency: 'USD';
+    kind: 'estimate';
+    note: string;
+  };
+}
+
+type UsageAggregateRecord = {
+  name: string;
+  api_calls: number;
+  local_cache_hits: number;
+  error_count: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_creation_tokens: number;
+  cache_read_tokens: number;
+  cost_usd: number;
+  average_duration_ms: number | null;
+};
+
+function mapUsageAggregate(row: UsageAggregateRecord): UsageDimensionStats {
+  const inputTokens = Number(row.input_tokens);
+  const outputTokens = Number(row.output_tokens);
+  const cacheCreationTokens = Number(row.cache_creation_tokens);
+  const cacheReadTokens = Number(row.cache_read_tokens);
+  return {
+    name: String(row.name),
+    apiCalls: Number(row.api_calls),
+    localCacheHits: Number(row.local_cache_hits),
+    errorCount: Number(row.error_count),
+    inputTokens,
+    outputTokens,
+    cacheCreationTokens,
+    cacheReadTokens,
+    totalTokens: inputTokens + outputTokens + cacheCreationTokens + cacheReadTokens,
+    estimatedCostUsd: Number(row.cost_usd),
+    averageDurationMs: row.average_duration_ms == null ? null : Math.round(Number(row.average_duration_ms)),
+  };
+}
+
+function percentile(sorted: number[], fraction: number): number | null {
+  if (sorted.length === 0) return null;
+  const index = Math.max(0, Math.ceil(sorted.length * fraction) - 1);
+  return sorted[index] ?? null;
+}
+
+export function getOperationalStats(
+  range: UsageRange,
+  db: Database.Database = getDb(),
+): OperationalStats {
+  const bind = rangeBind(range);
+  const usageWhere = bind ? `WHERE ts >= datetime('now', ?)` : '';
+  const monitorWhere = bind ? `WHERE started_at >= datetime('now', ?)` : '';
+  const summary = getUsageSummary(range, db);
+
+  const dimensionQuery = (column: 'feature' | 'model'): UsageDimensionStats[] => {
+    const sql = `
+      SELECT
+        ${column} AS name,
+        COALESCE(SUM(CASE WHEN local_cache_hit = 0 THEN 1 ELSE 0 END), 0) AS api_calls,
+        COALESCE(SUM(local_cache_hit), 0) AS local_cache_hits,
+        COALESCE(SUM(CASE WHEN error_message IS NOT NULL THEN 1 ELSE 0 END), 0) AS error_count,
+        COALESCE(SUM(input_tokens), 0) AS input_tokens,
+        COALESCE(SUM(output_tokens), 0) AS output_tokens,
+        COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens,
+        COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+        COALESCE(SUM(cost_usd), 0) AS cost_usd,
+        AVG(CASE WHEN local_cache_hit = 0 THEN duration_ms END) AS average_duration_ms
+      FROM ai_usage
+      ${usageWhere}
+      GROUP BY ${column}
+      ORDER BY cost_usd DESC, api_calls DESC, name ASC
+    `;
+    const statement = db.prepare(sql);
+    const rows = (bind ? statement.all(bind) : statement.all()) as UsageAggregateRecord[];
+    return rows.map(mapUsageAggregate);
+  };
+
+  const latencySql = `
+    SELECT duration_ms
+    FROM ai_usage
+    ${usageWhere ? `${usageWhere} AND` : 'WHERE'} local_cache_hit = 0
+      AND duration_ms IS NOT NULL
+    ORDER BY duration_ms ASC
+  `;
+  const latencyStatement = db.prepare(latencySql);
+  const durations = (bind ? latencyStatement.all(bind) : latencyStatement.all())
+    .map((row) => Number((row as { duration_ms: number }).duration_ms));
+  const latencyAverage = durations.length > 0
+    ? Math.round(durations.reduce((sum, duration) => sum + duration, 0) / durations.length)
+    : null;
+
+  const monitorSql = `
+    SELECT
+      COUNT(*) AS runs,
+      COALESCE(SUM(CASE WHEN error_message IS NOT NULL THEN 1 ELSE 0 END), 0) AS failed_runs,
+      COALESCE(SUM(listings_found), 0) AS listings_found,
+      COALESCE(SUM(listings_unseen), 0) AS listings_unseen,
+      COALESCE(SUM(listings_delivered), 0) AS listings_delivered
+    FROM monitor_runs
+    ${monitorWhere}
+  `;
+  const monitorStatement = db.prepare(monitorSql);
+  const monitor = (bind ? monitorStatement.get(bind) : monitorStatement.get()) as {
+    runs: number;
+    failed_runs: number;
+    listings_found: number;
+    listings_unseen: number;
+    listings_delivered: number;
+  };
+  const active = db.prepare('SELECT COUNT(*) AS count FROM monitors WHERE active = 1')
+    .get() as { count: number };
+
+  const unpricedSql = `
+    SELECT
+      model,
+      COALESCE(SUM(CASE WHEN local_cache_hit = 0 THEN 1 ELSE 0 END), 0) AS calls,
+      COALESCE(SUM(input_tokens + output_tokens + cache_creation_tokens + cache_read_tokens), 0) AS tokens
+    FROM ai_usage
+    ${usageWhere ? `${usageWhere} AND` : 'WHERE'}
+      local_cache_hit = 0
+      AND cost_usd = 0
+      AND (input_tokens + output_tokens + cache_creation_tokens + cache_read_tokens) > 0
+    GROUP BY model
+    ORDER BY tokens DESC
+  `;
+  const unpricedStatement = db.prepare(unpricedSql);
+  const unpricedModels = (bind ? unpricedStatement.all(bind) : unpricedStatement.all())
+    .map((row) => {
+      const value = row as { model: string; calls: number; tokens: number };
+      return { model: value.model, calls: Number(value.calls), tokens: Number(value.tokens) };
+    });
+
+  const recordedEvents = summary.apiCalls + summary.localCacheHits;
+  const totalTokens = summary.inputTokens + summary.outputTokens
+    + summary.cacheCreationTokens + summary.cacheReadTokens;
+  const cacheInputTokens = summary.inputTokens + summary.cacheCreationTokens + summary.cacheReadTokens;
+
+  return {
+    range,
+    generatedAt: new Date().toISOString(),
+    usage: {
+      estimatedCostUsd: summary.costUsd,
+      apiCalls: summary.apiCalls,
+      localCacheHits: summary.localCacheHits,
+      recordedEvents,
+      errorCount: summary.errorCount,
+      errorRate: summary.apiCalls > 0 ? summary.errorCount / summary.apiCalls : 0,
+      localCacheHitRate: recordedEvents > 0 ? summary.localCacheHits / recordedEvents : 0,
+      inputTokens: summary.inputTokens,
+      outputTokens: summary.outputTokens,
+      cacheCreationTokens: summary.cacheCreationTokens,
+      cacheReadTokens: summary.cacheReadTokens,
+      totalTokens,
+      cacheReadShare: cacheInputTokens > 0 ? summary.cacheReadTokens / cacheInputTokens : 0,
+      averageCostPerApiCallUsd: summary.apiCalls > 0 ? summary.costUsd / summary.apiCalls : 0,
+    },
+    latencyMs: {
+      samples: durations.length,
+      average: latencyAverage,
+      p50: percentile(durations, 0.5),
+      p95: percentile(durations, 0.95),
+      max: durations.at(-1) ?? null,
+    },
+    byFeature: dimensionQuery('feature'),
+    byModel: dimensionQuery('model'),
+    unpricedModels,
+    monitors: {
+      active: Number(active.count),
+      runs: Number(monitor.runs),
+      failedRuns: Number(monitor.failed_runs),
+      listingsFound: Number(monitor.listings_found),
+      listingsUnseen: Number(monitor.listings_unseen),
+      listingsDelivered: Number(monitor.listings_delivered),
+    },
+    caches: getCacheStats(7, db),
+    pricing: {
+      currency: 'USD',
+      kind: 'estimate',
+      note: 'Estimated from the static per-model pricing table in src/ai/pricing.ts; unpriced models are listed separately.',
+    },
   };
 }
 

@@ -5,6 +5,7 @@ import { Hono } from 'hono';
 import { serve } from '@hono/node-server';
 import { serveStatic } from '@hono/node-server/serve-static';
 import type { Server } from 'node:http';
+import { timingSafeEqual } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { resolve, dirname, join } from 'node:path';
@@ -14,6 +15,8 @@ import {
   getUsageTimeSeries,
   getRecentUsage,
   getCacheStats,
+  getOperationalStats,
+  resetCaches,
   getMonitorsWithStats,
   getMonitorRuns,
   getMonitorListings,
@@ -22,10 +25,12 @@ import {
   listRejectionCache,
   listMapsCache,
   getMapsCacheDetail,
+  type CacheResetScope,
   type UsageRange,
 } from '../storage/db.js';
 
 const VALID_RANGES: UsageRange[] = ['24h', '7d', '30d', 'all'];
+const VALID_CACHE_RESET_SCOPES: CacheResetScope[] = ['all', 'location', 'maps', 'ai'];
 
 function parseRange(raw: string | undefined, fallback: UsageRange): UsageRange {
   return VALID_RANGES.includes(raw as UsageRange) ? (raw as UsageRange) : fallback;
@@ -40,6 +45,31 @@ function parseLimit(raw: string | undefined, def: number, max: number): number {
 function parseId(raw: string): number | null {
   const n = Number(raw);
   return Number.isInteger(n) && n > 0 ? n : null;
+}
+
+export function parseCacheResetScope(raw: unknown): CacheResetScope | null {
+  return typeof raw === 'string' && VALID_CACHE_RESET_SCOPES.includes(raw as CacheResetScope)
+    ? raw as CacheResetScope
+    : null;
+}
+
+export function extractAdminToken(
+  authorization: string | undefined,
+  adminTokenHeader: string | undefined,
+): string | null {
+  const bearer = authorization?.match(/^Bearer\s+(.+)$/i)?.[1]?.trim();
+  return bearer || adminTokenHeader?.trim() || null;
+}
+
+export function adminTokenMatches(
+  expected: string | null | undefined,
+  provided: string | null | undefined,
+): boolean {
+  if (!expected || !provided) return false;
+  const expectedBytes = Buffer.from(expected, 'utf8');
+  const providedBytes = Buffer.from(provided, 'utf8');
+  return expectedBytes.length === providedBytes.length
+    && timingSafeEqual(expectedBytes, providedBytes);
 }
 
 export interface HttpServerHandle {
@@ -61,7 +91,7 @@ export function startHttpServer(): HttpServerHandle | null {
   const startedAt = new Date().toISOString();
 
   if (host !== '127.0.0.1' && host !== 'localhost' && host !== '::1') {
-    console.warn(`[http] WARNING: dashboard host is "${host}" (non-loopback). No auth is configured — make sure access is restricted by other means.`);
+    console.warn(`[http] WARNING: dashboard host is "${host}" (non-loopback). Read APIs are unauthenticated; cache reset requires an admin token.`);
   }
 
   const app = new Hono();
@@ -92,6 +122,11 @@ export function startHttpServer(): HttpServerHandle | null {
     }),
   );
 
+  app.get('/api/stats', (c) => {
+    const range = parseRange(c.req.query('range'), '24h');
+    return c.json(getOperationalStats(range));
+  });
+
   app.get('/api/usage/series', (c) => {
     const range = parseRange(c.req.query('range'), '7d');
     const bucket = c.req.query('bucket') === 'hour' ? 'hour' : 'day';
@@ -104,6 +139,41 @@ export function startHttpServer(): HttpServerHandle | null {
   });
 
   app.get('/api/cache', (c) => c.json(getCacheStats()));
+
+  app.post('/api/cache/reset', async (c) => {
+    const expectedToken = (
+      process.env.DASHBOARD_ADMIN_TOKEN
+      || process.env.BOT_PASSWORD
+      || ''
+    ).trim();
+    if (!expectedToken) {
+      return c.json({ error: 'cache reset is disabled: no admin token is configured' }, 503);
+    }
+
+    const providedToken = extractAdminToken(
+      c.req.header('Authorization'),
+      c.req.header('X-Admin-Token'),
+    );
+    if (!adminTokenMatches(expectedToken, providedToken)) {
+      return c.json({ error: 'unauthorized' }, 401);
+    }
+
+    const body = await c.req
+      .json<{ confirm?: unknown; scope?: unknown }>()
+      .catch(() => null);
+    if (body?.confirm !== 'RESET_CACHES') {
+      return c.json({ error: 'confirmation must be exactly RESET_CACHES' }, 400);
+    }
+
+    const scope = parseCacheResetScope(body.scope);
+    if (!scope) {
+      return c.json({
+        error: `scope must be one of: ${VALID_CACHE_RESET_SCOPES.join(', ')}`,
+      }, 400);
+    }
+
+    return c.json(resetCaches(scope));
+  });
 
   app.get('/api/cache/parsed-listings', (c) => {
     const limit = parseLimit(c.req.query('limit'), 50, 500);
