@@ -42,6 +42,13 @@ function trunc(text: string, max: number): string {
   return text.slice(0, max - 1).trimEnd() + '\u2026';
 }
 
+function metricRangeDistance(meters: number, bound: 'lower' | 'upper'): string {
+  const round = bound === 'lower' ? Math.floor : Math.ceil;
+  if (meters < 1000) return `${round(meters / 50) * 50} м`;
+  const km = round(meters / 100) / 10;
+  return `${km.toFixed(1).replace('.', ',')} км`;
+}
+
 /** Visible length as Telegram counts it for caption limits: HTML tags don't count,
  *  but a custom emoji counts as its fallback character(s). Used to decide whether a
  *  card fits the 1024-char photo-caption budget and to drive the safety-trim. */
@@ -172,8 +179,22 @@ export function formatRentalCard(
     const icons: Record<string, string> = { metro: '🚇', tram: '🚋', bus: '🚌', groceries: '🛒', gym: CE.gym, cafe: '☕', restaurant: '🍽', supermarket: '🛒', pharmacy: '💊', park: '🌳' };
     const amenParts = locationScore.amenities.map((a) => {
       const icon = icons[a.type] ?? '·';
-      const mark = a.withinLimit ? '✓' : '✗';
       const p = a.places[0];
+      const mark = a.withinLimit ? '✓' : a.uncertain ? '⚠️' : '✗';
+      if (a.type === 'metro') {
+        if (!p) {
+          const requested = a.requestedLine ? ` ${esc(a.requestedLine)}` : '';
+          return `${icon} метро${requested}: станция/расстояние неизвестны ⚠️`;
+        }
+        const station = `${esc(p.name)}${p.lineName ? ` (${esc(p.lineName)})` : ''}`;
+        const distance = p.distanceMetersRange
+          ? `~${metricRangeDistance(p.distanceMetersRange.min, 'lower')}–${metricRangeDistance(p.distanceMetersRange.max, 'upper')}`
+          : esc(p.distance);
+        const minutes = p.walkingMinutesRange
+          ? `~${p.walkingMinutesRange.min}–${p.walkingMinutesRange.max} мин`
+          : p.walkingMinutes >= 0 ? `${p.walkingMinutes} мин` : '?';
+        return `${icon} ${station} · ${distance} · ${minutes} ${mark}`;
+      }
       const mins = p && p.walkingMinutes >= 0 ? `${p.walkingMinutes}m` : '?';
       return `${icon}${mins}${mark}`;
     });
@@ -186,6 +207,9 @@ export function formatRentalCard(
   } else {
     locationLine = `${CE.location} ${listing.district ? esc(listing.district) + ', ' : ''}${esc(listing.city)}`;
   }
+  const locationWarningLine = locationScore?.locationWarning
+    ? `${CE.warning} ${esc(locationScore.locationWarning)}${locationScore.locationEvidence ? ` · ${esc(trunc(locationScore.locationEvidence, 100))}` : ''}`
+    : null;
 
   const contact: string[] = [];
   if (listing.phone) contact.push(`${CE.phone} ${esc(listing.phone)}`);
@@ -215,6 +239,7 @@ export function formatRentalCard(
     parts.push(payLineStr);
     parts.push(aptLine(!drop.restriction));
     parts.push(locationLine);
+    if (locationWarningLine) parts.push(locationWarningLine);
     if (!drop.positives && positivesLine) parts.push(positivesLine);
     if (!drop.redFlags && redFlagsLine) parts.push(redFlagsLine);
     if (contactLine) parts.push(contactLine);

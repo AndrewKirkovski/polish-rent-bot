@@ -5,7 +5,7 @@ import type { Tool } from '@anthropic-ai/sdk/resources/messages.js';
 import { searchItems, fetchItemPhone } from '../crawlers/olx-items.js';
 import type { ItemListing } from '../crawlers/olx-items.js';
 import { parseRentalListing, parseItemListing, evaluateRejection, triageRentalListing } from './parse-listing.js';
-import { scoreLocation } from './maps.js';
+import { createUnknownLocationScore, scoreLocation } from './maps.js';
 import type { AmenityPreference } from './maps.js';
 import { formatRichRentalNotification, formatRichItemNotification, splitMessage, captionLength } from '../bot/format.js';
 import { searchRentalListings, CITY_PROVINCE_MAP, resolveCityId } from '../search/rental-search.js';
@@ -158,10 +158,11 @@ export const TOOL_DEFINITIONS: Tool[] = [
             properties: {
               type: { type: 'string', enum: ['metro', 'tram', 'bus', 'gym', 'pool', 'supermarket', 'groceries', 'park', 'pharmacy', 'airport', 'cafe', 'restaurant'], description: 'Amenity type' },
               maxMinutes: { type: 'number', description: 'Maximum walking minutes to this amenity' },
+              line: { type: 'string', enum: ['M1', 'M2'], description: 'Required Warsaw metro line. Only valid when type is metro.' },
             },
             required: ['type', 'maxMinutes'],
           },
-          description: 'Desired nearby amenities with maximum walking time',
+          description: 'Desired nearby amenities with maximum walking time and optional Warsaw metro line',
         },
         workAddress: { type: 'string', description: 'Work/commute destination address for commute calculation' },
         commuteMode: {
@@ -184,7 +185,7 @@ export const TOOL_DEFINITIONS: Tool[] = [
         },
         strictAmenities: {
           type: 'boolean',
-          description: 'If true, hard-reject a listing when ANY requested amenity exceeds its maxMinutes (by its own metric — walking for transit/shops/gym, transit/driving for airport), not only metro/tram/bus. Default: score on card only. Set true only when the user asks for strict proximity (e.g. "really 5 min walk to metro").',
+          description: 'If true, hard-reject a listing when ANY requested amenity exceeds its maxMinutes. Set true whenever the user gives an explicit maximum such as "7 min walk to M1"; only leave false for non-binding preferences such as "metro nearby would be nice".',
         },
       },
       required: ['city'],
@@ -254,6 +255,7 @@ export const TOOL_DEFINITIONS: Tool[] = [
             properties: {
               type: { type: 'string', enum: ['metro', 'tram', 'bus', 'gym', 'pool', 'supermarket', 'groceries', 'park', 'pharmacy', 'airport', 'cafe', 'restaurant'] },
               maxMinutes: { type: 'number' },
+              line: { type: 'string', enum: ['M1', 'M2'], description: 'Required Warsaw metro line. Only valid when type is metro.' },
             },
             required: ['type', 'maxMinutes'],
           },
@@ -501,7 +503,7 @@ async function execFindRentals(
   const areaTo = input.areaTo as number | undefined;
   const ownerType = input.ownerType as string | undefined;
   const platformsInput = (input.platforms as string | undefined) ?? 'all';
-  const amenities = (input.amenities as Array<{ type: string; maxMinutes: number }> | undefined) ?? [];
+  const amenities = (input.amenities as AmenityPreference[] | undefined) ?? [];
   const workAddress = input.workAddress as string | undefined;
   const commuteMode = (input.commuteMode as string | undefined) ?? 'transit';
   const maxResults = Math.min(Math.max((input.maxResults as number) || 5, 1), 10);
@@ -707,35 +709,52 @@ async function execFindRentals(
       // Location scoring — geocode if no coordinates
       let locationScore: LocationScore | null = null;
       const wantLocation = amenities.length > 0 || !!workAddress;
+      const amenityPrefs: AmenityPreference[] = amenities.map((a) => ({
+        type: a.type,
+        maxMinutes: a.maxMinutes,
+        line: a.line,
+      }));
 
       if (wantLocation) {
         try {
           const { enrichListingLocation } = await import('./location.js');
           const enriched = await enrichListingLocation(enrichedListing, parsedData);
           if (enriched.lat != null && enriched.lng != null) {
-            // Write the precise coords back, and re-cache so disk recall (show_listing /
-            // get_listing) yields the same precise map link as the card we send now.
-            enrichedListing.lat = enriched.lat;
-            enrichedListing.lng = enriched.lng;
-            try {
-              cacheListing({ platform: enrichedListing.platform, platformId: enrichedListing.platformId, kind: 'rental', resultId, listing: enrichedListing });
-            } catch (e) { console.warn('[find_rentals] re-cache after enrich failed:', e instanceof Error ? e.message : e); }
-            const amenityPrefs: AmenityPreference[] = amenities.map((a) => ({
-              type: a.type,
-              maxMinutes: a.maxMinutes,
-            }));
-            locationScore = await scoreLocation(enriched.lat, enriched.lng, amenityPrefs, workAddress, commuteMode);
-            if (locationScore) locationScore.precision = enriched.precision;
+            // Only persist address-grade coordinates. Description anchors and district pins
+            // are deliberately approximate and must not become fake exact listing coordinates.
+            if (enriched.precision === 'exact' || enriched.precision === 'street') {
+              enrichedListing.lat = enriched.lat;
+              enrichedListing.lng = enriched.lng;
+              try {
+                cacheListing({ platform: enrichedListing.platform, platformId: enrichedListing.platformId, kind: 'rental', resultId, listing: enrichedListing });
+              } catch (e) { console.warn('[find_rentals] re-cache after enrich failed:', e instanceof Error ? e.message : e); }
+            }
+            locationScore = await scoreLocation(
+              enriched.lat,
+              enriched.lng,
+              amenityPrefs,
+              workAddress,
+              commuteMode,
+              enriched,
+            );
+          } else {
+            locationScore = createUnknownLocationScore(
+              amenityPrefs,
+              enrichedListing.city,
+              `точное местоположение не удалось определить (${enriched.source})`,
+              enriched.evidence,
+            );
           }
         } catch (locErr) {
           console.error(`[find_rentals] Location enrich/scoring error for ${enrichedListing.url}:`, locErr instanceof Error ? locErr.message : locErr);
+          locationScore = createUnknownLocationScore(
+            amenityPrefs,
+            enrichedListing.city,
+            'местоположение или расстояния не удалось проверить',
+          );
         }
       }
 
-      const amenityPrefs: AmenityPreference[] = amenities.map((a) => ({
-        type: a.type,
-        maxMinutes: a.maxMinutes,
-      }));
       const gate = checkAmenityGate(
         locationScore,
         amenityPrefs,
@@ -1086,8 +1105,8 @@ async function execListMonitors(
       parts.push(`  Rooms: ${rt != null && rt !== rf ? `${rf}-${rt}` : rf}`);
     }
     if (config.amenities) {
-      const amens = config.amenities as Array<{ type: string; maxMinutes: number }>;
-      parts.push(`  Amenities: ${amens.map((a) => `${a.type} (${a.maxMinutes}min)`).join(', ')}`);
+      const amens = config.amenities as AmenityPreference[];
+      parts.push(`  Amenities: ${amens.map((a) => `${a.type}${a.line ? ` ${a.line}` : ''} (${a.maxMinutes}min)`).join(', ')}`);
     }
     if (config.workAddress) parts.push(`  Commute to: ${config.workAddress}`);
     if (config.contractPreference) parts.push(`  Contract: ${config.contractPreference}`);

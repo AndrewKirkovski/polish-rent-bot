@@ -81,6 +81,17 @@ export interface ParsedRentalData {
   depositNote: string | null;
   adminFee: number | null;
   addressHint: string | null;
+  locationHint: {
+    /** Best Google-geocodable anchor for the apartment location, copied from the ad. */
+    query: string | null;
+    kind: 'address' | 'intersection' | 'building' | 'estate' | 'transit_stop' | 'landmark' | 'neighborhood' | 'none';
+    /** Claimed/estimated distance from the anchor to the apartment. */
+    anchorDistanceMeters: number | null;
+    /** Conservative uncertainty around anchorDistanceMeters. */
+    uncertaintyMeters: number | null;
+    /** Short source phrase or explanation grounded in the listing description. */
+    evidence: string | null;
+  };
   isConcreteApartment: boolean | null;
   estimatedMedia: {
     water: number | null;
@@ -140,6 +151,10 @@ export interface NearbyPlace {
   name: string;
   walkingMinutes: number;
   distance: string;
+  distanceMeters?: number;
+  walkingMinutesRange?: { min: number; max: number };
+  distanceMetersRange?: { min: number; max: number };
+  approximate?: boolean;
   transitMinutes?: number;      // for airport, groceries transit fallback
   drivingMinutes?: number;      // for airport (taxi estimate)
   frequencyMinutes?: number;    // service frequency at stop (metro/tram/bus)
@@ -148,9 +163,12 @@ export interface NearbyPlace {
 
 export interface AmenityResult {
   type: string;
-  places: NearbyPlace[];          // top 3 closest, sorted by distance
+  /** Requested Warsaw metro line, when this result is line-specific. */
+  requestedLine?: 'M1' | 'M2';
+  places: NearbyPlace[];          // closest candidates, sorted by expected/reachable distance
   nearest: NearbyPlace | null;    // shortcut to places[0]
   withinLimit: boolean;           // true if nearest <= maxMinutes
+  uncertain?: boolean;            // estimated range crosses the requested threshold
   error?: boolean;                // transient Maps API/measurement failure — verdict UNKNOWN,
                                   // not a genuine "nothing nearby" (empty places is ambiguous otherwise)
 }
@@ -162,7 +180,7 @@ export interface CommuteResult {
   mode: string;
 }
 
-export type LocationPrecision = 'exact' | 'street' | 'district' | 'none';
+export type LocationPrecision = 'exact' | 'street' | 'approximate' | 'district' | 'none';
 
 export interface LocationScore {
   amenities: AmenityResult[];
@@ -170,4 +188,7 @@ export interface LocationScore {
   overallScore: number;
   mapsLink: string;
   precision?: LocationPrecision;
+  locationUnknown?: boolean;
+  locationWarning?: string;
+  locationEvidence?: string;
 }

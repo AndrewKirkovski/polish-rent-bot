@@ -6,9 +6,6 @@
 import type { LocationScore, LocationPrecision, AmenityResult } from '../types.js';
 import type { AmenityPreference } from '../ai/maps.js';
 
-/** Extra minutes of tolerance when coordinates are only a district centroid (approximate). */
-const DISTRICT_SLACK_MIN = 5;
-
 export const AMENITY_LABELS: Record<string, string> = {
   metro: 'метро',
   tram: 'трамвай',
@@ -43,6 +40,26 @@ function nearestMinutes(result: AmenityResult): number | null {
   return null;
 }
 
+function metricDistance(meters: number, bound: 'lower' | 'upper'): string {
+  const round = bound === 'lower' ? Math.floor : Math.ceil;
+  if (meters < 1000) return `${round(meters / 50) * 50} м`;
+  return `${(round(meters / 100) / 10).toLocaleString('ru-RU', { minimumFractionDigits: 1, maximumFractionDigits: 1 })} км`;
+}
+
+function metroRejectionReason(result: AmenityResult, pref: AmenityPreference): string | null {
+  const nearest = result.nearest ?? result.places[0];
+  if (!nearest) return null;
+  const station = nearest.name;
+  const distance = nearest.distanceMetersRange
+    ? `~${metricDistance(nearest.distanceMetersRange.min, 'lower')}–${metricDistance(nearest.distanceMetersRange.max, 'upper')}`
+    : nearest.distance;
+  const minutes = nearest.walkingMinutesRange
+    ? `~${nearest.walkingMinutesRange.min}–${nearest.walkingMinutesRange.max}`
+    : String(nearest.walkingMinutes);
+  const line = pref.line ? ` ${pref.line}` : '';
+  return `метро${line}: ${station}, ${distance}, ${minutes} мин пешком (лимит ${pref.maxMinutes} мин)`;
+}
+
 export function resolveStrictAmenities(explicit?: boolean): boolean {
   if (explicit != null) return explicit;
   return process.env.STRICT_WALKING_AMENITIES === 'true';
@@ -62,38 +79,40 @@ export function checkAmenityGate(
   if (!strict) return { pass: true };
   if (amenities.length === 0) return { pass: true };
 
-  // Keep-with-flag when we have no usable coordinates: a district centroid is still
-  // checkable (with slack), but 'none'/null location can't be verified — don't drop
-  // the whole class of listings (e.g. OLX posts without a street address).
-  if (!locationScore || precision === 'none') {
+  // Missing/district-only location is an UNKNOWN verdict, not a rejection. The card carries
+  // a warning so users can decide whether to verify it with the landlord.
+  if (!locationScore || precision === 'none' || precision === 'district') {
     return { pass: true };
   }
 
-  const slack = precision === 'district' ? DISTRICT_SLACK_MIN : 0;
-
   for (const pref of amenities) {
-    const result = locationScore.amenities.find((a) => a.type === pref.type);
+    const sameType = locationScore.amenities.filter((a) => a.type === pref.type);
+    const result = pref.type !== 'metro'
+      ? sameType[0]
+      : pref.line
+        ? sameType.find((a) => a.requestedLine === pref.line)
+        : sameType.find((a) => a.requestedLine == null);
     // Transient Maps API/measurement failure → verdict unknown; keep-with-flag rather than
     // falsely rejecting "not nearby" (and, in the monitor, permanently dropping the listing).
     if (result?.error) continue;
     if (!result || result.places.length === 0) {
-      return { pass: false, reason: `${amenityLabel(pref.type)} рядом не найдено` };
+      if (precision === 'approximate') continue;
+      const line = pref.type === 'metro' && pref.line ? ` ${pref.line}` : '';
+      return { pass: false, reason: `${amenityLabel(pref.type)}${line} рядом не найдено` };
     }
 
-    // Exact/street coords: trust the strict withinLimit directly (no slack).
-    if (slack === 0) {
-      if (!result.withinLimit) {
-        const mins = nearestMinutes(result);
-        return { pass: false, reason: `${amenityLabel(pref.type)} ${mins ?? '?'} ${unit(pref.type)} (лимит ${pref.maxMinutes} мин)` };
+    // A range that crosses the requested threshold remains a warning. If the whole
+    // range is outside, the evidence is strong enough to enforce the user's limit.
+    if (result.uncertain) continue;
+
+    if (!result.withinLimit) {
+      if (pref.type === 'metro') {
+        const reason = metroRejectionReason(result, pref);
+        if (reason) return { pass: false, reason };
       }
-      continue;
-    }
-
-    // District centroid: allow a small slack margin before rejecting.
-    if (result.withinLimit) continue;
-    const mins = nearestMinutes(result);
-    if (mins != null && mins > pref.maxMinutes + slack) {
-      return { pass: false, reason: `${amenityLabel(pref.type)} ${mins} ${unit(pref.type)} (лимит ${pref.maxMinutes}+${slack} мин, район)` };
+      const mins = nearestMinutes(result);
+      const line = pref.type === 'metro' && pref.line ? ` ${pref.line}` : '';
+      return { pass: false, reason: `${amenityLabel(pref.type)}${line} ${mins ?? '?'} ${unit(pref.type)} (лимит ${pref.maxMinutes} мин)` };
     }
   }
 

@@ -28,8 +28,8 @@ if (!process.env.ANTHROPIC_API_KEY) {
   process.exit(1);
 }
 if (!process.env.GOOGLE_MAPS_API_KEY) {
-  // Not fatal, but without it location scoring returns nothing and strict amenities reject everything.
-  console.warn('[startup] GOOGLE_MAPS_API_KEY not set — location scoring and amenity filters are DISABLED');
+  // Not fatal: affected listings are kept with an explicit unknown-location warning.
+  console.warn('[startup] GOOGLE_MAPS_API_KEY not set — location checks are unavailable; listings will be kept with warnings');
 }
 
 // --- Bootstrap ---

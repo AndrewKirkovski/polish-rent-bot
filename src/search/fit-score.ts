@@ -74,9 +74,10 @@ export function computeFitScore(
   parts.push({ key: 'budget', weight: w.budget ?? 0, value: budget });
 
   // --- Amenities (fraction of requested within limit) ---
-  if (locationScore && locationScore.amenities.length > 0) {
+  if (locationScore && !locationScore.locationUnknown && locationScore.amenities.length > 0) {
     const within = locationScore.amenities.filter((a) => a.withinLimit).length;
-    parts.push({ key: 'amenities', weight: w.amenities ?? 0, value: within / locationScore.amenities.length });
+    const uncertain = locationScore.amenities.filter((a) => a.uncertain).length;
+    parts.push({ key: 'amenities', weight: w.amenities ?? 0, value: (within + uncertain * 0.5) / locationScore.amenities.length });
   }
 
   // --- Elevator ---
@@ -94,7 +95,13 @@ export function computeFitScore(
     const near = locationScore.amenities
       .filter((a) => a.withinLimit && (a.places[0]?.walkingMinutes ?? -1) >= 0)
       .sort((a, b) => a.places[0]!.walkingMinutes - b.places[0]!.walkingMinutes)[0];
-    if (near) reasons.push(`${amenityLabel(near.type)} ${near.places[0]!.walkingMinutes}м`);
+    if (near) {
+      const place = near.places[0]!;
+      const minutes = place.walkingMinutesRange
+        ? `${place.walkingMinutesRange.min}-${place.walkingMinutesRange.max}м`
+        : `${place.walkingMinutes}м`;
+      reasons.push(`${amenityLabel(near.type)} ${minutes}`);
+    }
   }
 
   return { score, reason: reasons.slice(0, 4).join(' · ') };

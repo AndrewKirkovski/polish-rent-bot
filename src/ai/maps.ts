@@ -4,13 +4,23 @@
 
 import { createHash } from 'node:crypto';
 import { getMapsCacheEntry, setMapsCacheEntry, clearEmptyMapsCache } from '../storage/db.js';
-import type { AmenityResult, NearbyPlace, CommuteResult, LocationScore } from '../types.js';
+import type { AmenityResult, NearbyPlace, CommuteResult, LocationScore, LocationPrecision } from '../types.js';
 
 export type { AmenityResult, CommuteResult, LocationScore } from '../types.js';
 
 export interface AmenityPreference {
   type: string;
   maxMinutes: number;
+  /** Optional transit line constraint. Currently supported for Warsaw metro (M1/M2). */
+  line?: 'M1' | 'M2';
+}
+
+export interface LocationEstimateContext {
+  precision: LocationPrecision;
+  anchorDistanceMeters: number;
+  uncertaintyMeters: number;
+  source: string;
+  evidence?: string | null;
 }
 
 const API_KEY = process.env.GOOGLE_MAPS_API_KEY ?? '';
@@ -19,6 +29,51 @@ const PLACES_NEW_BASE = 'https://places.googleapis.com/v1';
 const CACHE_TTL_DAYS = 7;
 const SEARCH_RADIUS = 5000; // 5km — OLX coordinates are often district-center, not exact address
 const MAX_PLACES_PER_TYPE = 3;
+const MAX_LINE_PLACES = 20;
+const MAX_DIRECTIONLESS_ANCHOR_FOR_STRICT_METERS = 3000;
+
+type WarsawMetroLine = 'M1' | 'M2';
+
+const WARSAW_METRO_STATIONS: Record<WarsawMetroLine, readonly string[]> = {
+  M1: [
+    'Kabaty', 'Natolin', 'Imielin', 'Stokłosy', 'Ursynów', 'Służew',
+    'Wilanowska', 'Wierzbno', 'Racławicka', 'Pole Mokotowskie',
+    'Politechnika', 'Centrum', 'Świętokrzyska', 'Ratusz Arsenał',
+    'Dworzec Gdański', 'Plac Wilsona', 'Marymont', 'Słodowiec',
+    'Stare Bielany', 'Wawrzyszew', 'Młociny',
+  ],
+  M2: [
+    'Bemowo', 'Ulrychów', 'Księcia Janusza', 'Młynów', 'Płocka',
+    'Rondo Daszyńskiego', 'Rondo ONZ', 'Świętokrzyska',
+    'Nowy Świat Uniwersytet', 'Centrum Nauki Kopernik',
+    'Stadion Narodowy', 'Dworzec Wileński', 'Szwedzka',
+    'Targówek Mieszkaniowy', 'Trocka', 'Zacisze',
+    'Kondratowicza', 'Bródno',
+  ],
+};
+
+function normalizePlaceName(name: string): string {
+  return name
+    .normalize('NFD')
+    .replace(/\p{Diacritic}/gu, '')
+    .toLowerCase()
+    .replace(/^(?:stacja\s+)?metr[oa]\s+/, '')
+    .replace(/^m[12]\s+/, '')
+    .replace(/\s+(?:metro|m[12])$/, '')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
+const WARSAW_METRO_STATION_KEYS: Record<WarsawMetroLine, ReadonlySet<string>> = {
+  M1: new Set(WARSAW_METRO_STATIONS.M1.map(normalizePlaceName)),
+  M2: new Set(WARSAW_METRO_STATIONS.M2.map(normalizePlaceName)),
+};
+
+/** Canonical Warsaw line membership derived from the official station network. */
+export function warsawMetroLinesForStation(name: string): WarsawMetroLine[] {
+  const key = normalizePlaceName(name);
+  return (['M1', 'M2'] as const).filter((line) => WARSAW_METRO_STATION_KEYS[line].has(key));
+}
 
 // For frequency estimation: route from the stop to a point ~2.5km north.
 // Using a local offset instead of a fixed city center ensures it works in any Polish city.
@@ -58,7 +113,9 @@ interface TransportConfig {
 }
 
 const TRANSPORT_CONFIG: Record<string, TransportConfig> = {
-  metro:       { walking: true,  transit: false, driving: false, checkFrequency: true,  transitFallback: false },
+  // Directions from station coordinates can choose a nearby bus and mislabel metro as
+  // route 122/103/etc. Metro line identity comes from the canonical station map above.
+  metro:       { walking: true,  transit: false, driving: false, checkFrequency: false, transitFallback: false },
   tram:        { walking: true,  transit: false, driving: false, checkFrequency: true,  transitFallback: false },
   bus:         { walking: true,  transit: false, driving: false, checkFrequency: true,  transitFallback: false },
   airport:     { walking: false, transit: true,  driving: true,  checkFrequency: false, transitFallback: false },
@@ -90,6 +147,15 @@ export function computeWithinLimit(nearest: NearbyPlace | null, tc: TransportCon
   }
   if (tc.transitFallback && !within && nearest.transitMinutes != null) within = nearest.transitMinutes <= maxMinutes;
   return within;
+}
+
+/** Incomplete external evidence can confirm a pass, but must never prove rejection. */
+export function shouldTreatAmenityMeasurementAsUnknown(
+  hadApiError: boolean,
+  hadDistanceError: boolean,
+  withinLimit: boolean,
+): boolean {
+  return (hadApiError || hadDistanceError) && !withinLimit;
 }
 
 // ---------------------------------------------------------------------------
@@ -191,8 +257,25 @@ interface DistanceMatrixElement {
   status: string;
 }
 interface DistanceMatrixResponse { rows: Array<{ elements: DistanceMatrixElement[] }>; status: string; error_message?: string }
-interface GeocodeResult { geometry: { location: { lat: number; lng: number } } }
+interface GeocodeResult {
+  geometry: {
+    location: { lat: number; lng: number };
+    location_type?: string;
+  };
+  partial_match?: boolean;
+  types?: string[];
+  formatted_address?: string;
+}
 interface GeocodeResponse { results: GeocodeResult[]; status: string; error_message?: string }
+
+export interface GeocodedLocation {
+  lat: number;
+  lng: number;
+  locationType: string | null;
+  partialMatch: boolean;
+  resultTypes: string[];
+  formattedAddress: string | null;
+}
 
 // Directions API types (for transit frequency)
 interface DirectionsTransitDetails {
@@ -236,10 +319,10 @@ try {
 // Geocoding — fallback when listing has no coordinates
 // ---------------------------------------------------------------------------
 
-export async function geocodeAddress(address: string): Promise<{ lat: number; lng: number } | null> {
-  const cacheKey = `geocode:${hashStr(address)}`;
+export async function geocodeAddress(address: string): Promise<GeocodedLocation | null> {
+  const cacheKey = `geocode2:${hashStr(address)}`;
   const cached = getMapsCacheEntry(cacheKey);
-  if (isCacheValid(cached)) return unwrapCache<{ lat: number; lng: number }>(cached!);
+  if (isCacheValid(cached)) return unwrapCache<GeocodedLocation>(cached!);
 
   const url = `${MAPS_BASE}/geocode/json?address=${encodeURIComponent(address)}&key=${API_KEY}&language=pl`;
   const res = await fetchJson<GeocodeResponse>(url);
@@ -249,8 +332,16 @@ export async function geocodeAddress(address: string): Promise<{ lat: number; ln
     return null;
   }
 
-  const loc = res.results[0].geometry.location;
-  const result = { lat: loc.lat, lng: loc.lng };
+  const first = res.results[0];
+  const loc = first.geometry.location;
+  const result: GeocodedLocation = {
+    lat: loc.lat,
+    lng: loc.lng,
+    locationType: first.geometry.location_type ?? null,
+    partialMatch: first.partial_match === true,
+    resultTypes: first.types ?? [],
+    formattedAddress: first.formatted_address ?? null,
+  };
   setMapsCacheEntry(cacheKey, wrapCache(result));
   return result;
 }
@@ -407,12 +498,13 @@ export async function findNearbyAmenities(
     const searches = AMENITY_SEARCHES[pref.type];
     if (!searches) {
       console.warn(`[maps] Unknown amenity type "${pref.type}", skipping`);
-      results.push({ type: pref.type, places: [], nearest: null, withinLimit: false });
+      results.push({ type: pref.type, requestedLine: pref.line, places: [], nearest: null, withinLimit: false });
       continue;
     }
 
     const tc = getTransportConfig(pref.type);
-    const cacheKey = `nearby5:${roundCoord(lat)}:${roundCoord(lng)}:${pref.type}`;
+    const requestedMetroLine = pref.type === 'metro' ? pref.line : undefined;
+    const cacheKey = `nearby9:${roundCoord(lat)}:${roundCoord(lng)}:${pref.type}:${requestedMetroLine ?? 'any'}`;
     const cached = getMapsCacheEntry(cacheKey);
     if (isCacheValid(cached)) {
       const r = unwrapCache<AmenityResult>(cached!);
@@ -429,13 +521,15 @@ export async function findNearbyAmenities(
     let hadApiError = false;
 
     // Airport needs larger search radius (Chopin is ~10km from center, Modlin ~40km)
-    const searchRadius = pref.type === 'airport' ? 50_000 : SEARCH_RADIUS;
+    const searchRadius = pref.type === 'airport'
+      ? 50_000
+      : requestedMetroLine ? 50_000 : SEARCH_RADIUS;
 
     for (const types of searches) {
       try {
         const body = {
           includedTypes: types,
-          maxResultCount: 10,
+          maxResultCount: requestedMetroLine ? 20 : 10,
           rankPreference: 'DISTANCE',
           languageCode: 'pl',
           locationRestriction: {
@@ -477,12 +571,31 @@ export async function findNearbyAmenities(
     if (allPlaces.size === 0 && hadApiError) {
       console.error(`[maps] All searches for ${pref.type} failed with API errors — not caching`);
       // error:true → the strict gate keeps-with-flag rather than falsely rejecting "not nearby".
-      results.push({ type: pref.type, places: [], nearest: null, withinLimit: false, error: true });
+      results.push({
+        type: pref.type,
+        requestedLine: requestedMetroLine,
+        places: [],
+        nearest: null,
+        withinLimit: false,
+        uncertain: true,
+        error: true,
+      });
       continue;
     }
 
-    if (allPlaces.size === 0) {
-      const emptyResult: AmenityResult = { type: pref.type, places: [], nearest: null, withinLimit: false };
+    const eligiblePlaces = requestedMetroLine
+      ? Array.from(allPlaces.values()).filter((place) =>
+          warsawMetroLinesForStation(place.displayName?.text ?? '').includes(requestedMetroLine))
+      : Array.from(allPlaces.values());
+
+    if (eligiblePlaces.length === 0) {
+      const emptyResult: AmenityResult = {
+        type: pref.type,
+        requestedLine: requestedMetroLine,
+        places: [],
+        nearest: null,
+        withinLimit: false,
+      };
       setMapsCacheEntry(cacheKey, wrapCache(emptyResult));
       results.push(emptyResult);
       continue;
@@ -490,9 +603,9 @@ export async function findNearbyAmenities(
 
     // ---- B. Measure distances ----
     // Filter to places with valid location FIRST — keeps placesArr[i] aligned with elements[i]
-    const placesArr = Array.from(allPlaces.values())
+    const placesArr = eligiblePlaces
       .filter(p => p.location != null)
-      .slice(0, 10);
+      .slice(0, requestedMetroLine ? MAX_LINE_PLACES : 10);
     const destinations = placesArr
       .map(p => `${p.location!.latitude},${p.location!.longitude}`)
       .join('|');
@@ -500,7 +613,9 @@ export async function findNearbyAmenities(
     let nearbyPlaces: NearbyPlace[] = [];
     // Track Distance-Matrix failures so a transient DM error isn't cached for 7 days as a
     // false "amenity not reachable" (which would poison the card, fit-score and strict gate).
-    let hadDistanceError = false;
+    // A place without coordinates cannot be measured and might be the closer option.
+    // Preserve that incompleteness so an over-limit result remains UNKNOWN.
+    let hadDistanceError = placesArr.length < eligiblePlaces.length;
 
     // B1. Walking distances (for most amenities)
     if (tc.walking && destinations) {
@@ -515,6 +630,7 @@ export async function findNearbyAmenities(
           }
         } else {
           const elements = distRes.rows[0]?.elements ?? [];
+          if (elements.length < placesArr.length) hadDistanceError = true;
           for (let i = 0; i < elements.length && i < placesArr.length; i++) {
             const el = elements[i];
             if (el.status === 'OK') {
@@ -522,7 +638,14 @@ export async function findNearbyAmenities(
                 name: placesArr[i].displayName?.text ?? 'Unknown',
                 walkingMinutes: Math.round(el.duration.value / 60),
                 distance: el.distance.text,
+                distanceMeters: el.distance.value,
+                ...(pref.type === 'metro'
+                  ? { lineName: requestedMetroLine ?? (warsawMetroLinesForStation(placesArr[i].displayName?.text ?? '').join('/') || undefined) }
+                  : {}),
               });
+            } else {
+              hadDistanceError = true;
+              console.error(`[maps] Walking DM element for ${pref.type}/${placesArr[i].displayName?.text ?? 'Unknown'}: ${el.status}`);
             }
           }
         }
@@ -536,7 +659,7 @@ export async function findNearbyAmenities(
 
       nearbyPlaces = nearbyPlaces.filter(p => p.walkingMinutes >= 0);
       nearbyPlaces.sort((a, b) => a.walkingMinutes - b.walkingMinutes);
-      nearbyPlaces = nearbyPlaces.slice(0, MAX_PLACES_PER_TYPE);
+      nearbyPlaces = nearbyPlaces.slice(0, requestedMetroLine ? MAX_LINE_PLACES : MAX_PLACES_PER_TYPE);
     }
 
     // B2. Transit distances (airport always, groceries as fallback)
@@ -558,6 +681,7 @@ export async function findNearbyAmenities(
         }
         if (transitRes.status === 'OK') {
           const elements = transitRes.rows[0]?.elements ?? [];
+          if (elements.length < placesArr.length) hadDistanceError = true;
           for (let i = 0; i < elements.length && i < placesArr.length; i++) {
             const el = elements[i];
             if (el.status === 'OK') {
@@ -584,6 +708,9 @@ export async function findNearbyAmenities(
                   });
                 }
               }
+            } else {
+              hadDistanceError = true;
+              console.error(`[maps] Transit DM element for ${pref.type}/${placesArr[i].displayName?.text ?? 'Unknown'}: ${el.status}`);
             }
           }
         }
@@ -598,8 +725,13 @@ export async function findNearbyAmenities(
       const drivingUrl = `${MAPS_BASE}/distancematrix/json?origins=${lat},${lng}&destinations=${destinations}&mode=driving&language=pl&key=${API_KEY}`;
       try {
         const drivingRes = await fetchJson<DistanceMatrixResponse>(drivingUrl);
+        if (drivingRes.status !== 'OK') {
+          console.error(`[maps] Driving DM for ${pref.type}: ${drivingRes.status} — ${drivingRes.error_message ?? ''}`);
+          hadDistanceError = true;
+        }
         if (drivingRes.status === 'OK') {
           const elements = drivingRes.rows[0]?.elements ?? [];
+          if (elements.length < placesArr.length) hadDistanceError = true;
           for (let i = 0; i < elements.length && i < placesArr.length; i++) {
             const el = elements[i];
             if (el.status === 'OK') {
@@ -608,6 +740,9 @@ export async function findNearbyAmenities(
               if (existing) {
                 existing.drivingMinutes = drivingMins;
               }
+            } else {
+              hadDistanceError = true;
+              console.error(`[maps] Driving DM element for ${pref.type}/${placesArr[i].displayName?.text ?? 'Unknown'}: ${el.status}`);
             }
           }
         }
@@ -621,7 +756,7 @@ export async function findNearbyAmenities(
     if (!tc.walking) {
       nearbyPlaces.sort((a, b) => (a.transitMinutes ?? 999) - (b.transitMinutes ?? 999));
     }
-    nearbyPlaces = nearbyPlaces.slice(0, MAX_PLACES_PER_TYPE);
+    nearbyPlaces = nearbyPlaces.slice(0, requestedMetroLine ? MAX_LINE_PLACES : MAX_PLACES_PER_TYPE);
 
     // ---- C. Transit frequency for nearest stop (metro/tram/bus) ----
     if (tc.checkFrequency && nearbyPlaces.length > 0) {
@@ -649,19 +784,17 @@ export async function findNearbyAmenities(
 
     const amenityResult: AmenityResult = {
       type: pref.type,
+      requestedLine: requestedMetroLine,
       places: nearbyPlaces,
       nearest,
       withinLimit,
     };
 
-    // Don't cache a result a transient DM failure could have turned into a false negative —
-    // otherwise a temporary Google hiccup pins a false "not reachable" for the full 7-day TTL.
-    // Two cases: no usable places at all, OR a transitFallback type (groceries) that's over the
-    // walking limit whose transit rescue couldn't be measured (transitMinutes missing).
-    const transitRescueMissing = tc.transitFallback && !withinLimit && (nearest == null || nearest.transitMinutes == null);
-    if (hadDistanceError && (nearbyPlaces.length === 0 || transitRescueMissing)) {
-      console.error(`[maps] Distance measurement failed for ${pref.type} — returning uncached (will retry next lookup)`);
-      results.push({ ...amenityResult, error: true }); // unknown, not "not nearby" — gate keeps-with-flag
+    // Missing candidates or route measurements can only hide a closer result.
+    // A measured pass remains valid; an apparent failure is UNKNOWN and must be retried.
+    if (shouldTreatAmenityMeasurementAsUnknown(hadApiError, hadDistanceError, withinLimit)) {
+      console.error(`[maps] Incomplete evidence for ${pref.type} — returning uncached unknown (will retry next lookup)`);
+      results.push({ ...amenityResult, uncertain: true, error: true });
       continue;
     }
 
@@ -708,16 +841,128 @@ export async function calculateCommute(
 // scoreLocation — orchestrates amenity search + commute, computes score
 // ---------------------------------------------------------------------------
 
+/** Expand point-based Google distances by the uncertainty of a description-derived anchor. */
+export function applyLocationUncertainty(
+  amenities: AmenityResult[],
+  amenityPrefs: AmenityPreference[],
+  uncertaintyMeters: number,
+  anchorDistanceMeters = 0,
+): AmenityResult[] {
+  if (uncertaintyMeters <= 0 && anchorDistanceMeters <= 0) return amenities;
+  const radiusMin = Math.max(0, anchorDistanceMeters - uncertaintyMeters);
+  const radiusMax = anchorDistanceMeters + uncertaintyMeters;
+  const anchorTooBroadForStrictVerdict = anchorDistanceMeters > MAX_DIRECTIONLESS_ANCHOR_FOR_STRICT_METERS;
+
+  return amenities.map((amenity) => {
+    const places = amenity.places.map((place) => {
+      if (place.walkingMinutes < 0) return place;
+      const baseMeters = place.distanceMeters ?? place.walkingMinutes * 75;
+      const minMeters = baseMeters < radiusMin
+        ? radiusMin - baseMeters
+        : baseMeters > radiusMax ? baseMeters - radiusMax : 0;
+      const maxMeters = baseMeters + radiusMax;
+      const observedMetersPerMinute = place.walkingMinutes > 0 && baseMeters > 0
+        ? baseMeters / place.walkingMinutes
+        : 75;
+      const walkingMinutesRange = {
+        min: Math.max(0, Math.floor(minMeters / observedMetersPerMinute)),
+        max: Math.max(1, Math.ceil(maxMeters / observedMetersPerMinute)),
+      };
+      const distanceMetersRange = { min: minMeters, max: maxMeters };
+      return { ...place, walkingMinutesRange, distanceMetersRange, approximate: true };
+    }).sort((a, b) => {
+      const aRange = a.distanceMetersRange;
+      const bRange = b.distanceMetersRange;
+      if (aRange && bRange) {
+        return aRange.min - bRange.min || aRange.max - bRange.max;
+      }
+      return a.walkingMinutes - b.walkingMinutes;
+    });
+    const pref = amenityPrefs.find((candidate) =>
+      candidate.type === amenity.type &&
+      (candidate.type !== 'metro' || candidate.line === amenity.requestedLine));
+    const ranges = places
+      .map((place) => place.walkingMinutesRange)
+      .filter((range): range is { min: number; max: number } => range != null);
+    if (places.length === 0) {
+      return { ...amenity, places, nearest: null, withinLimit: false, uncertain: true };
+    }
+    if (!pref || ranges.length === 0) {
+      return { ...amenity, places, nearest: places[0] ?? null };
+    }
+    const withinLimit = ranges.some((range) => range.max <= pref.maxMinutes);
+    const uncertain = amenity.error === true
+      || (!withinLimit && anchorTooBroadForStrictVerdict)
+      || (!withinLimit && ranges.some((range) => range.min <= pref.maxMinutes));
+    const representative = withinLimit
+      ? places
+          .filter((place) => (place.walkingMinutesRange?.max ?? Infinity) <= pref.maxMinutes)
+          .sort((a, b) => (a.walkingMinutesRange?.max ?? Infinity) - (b.walkingMinutesRange?.max ?? Infinity))[0]
+      : uncertain
+        ? places
+            .filter((place) => (place.walkingMinutesRange?.min ?? Infinity) <= pref.maxMinutes)
+            .sort((a, b) =>
+              (a.walkingMinutesRange?.min ?? Infinity) - (b.walkingMinutesRange?.min ?? Infinity) ||
+              (a.walkingMinutesRange?.max ?? Infinity) - (b.walkingMinutesRange?.max ?? Infinity))[0]
+          ?? places[0]
+        : places[0];
+    const orderedPlaces = representative
+      ? [representative, ...places.filter((place) => place !== representative)]
+      : places;
+    return {
+      ...amenity,
+      places: orderedPlaces,
+      nearest: representative ?? null,
+      withinLimit,
+      uncertain,
+    };
+  });
+}
+
+export function createUnknownLocationScore(
+  amenityPrefs: AmenityPreference[],
+  city: string,
+  warning = 'точное местоположение не удалось определить',
+  evidence?: string | null,
+): LocationScore {
+  return {
+    amenities: amenityPrefs.map((pref) => ({
+      type: pref.type,
+      requestedLine: pref.type === 'metro' ? pref.line : undefined,
+      places: [],
+      nearest: null,
+      withinLimit: false,
+      uncertain: true,
+    })),
+    commute: null,
+    overallScore: 50,
+    mapsLink: `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(city)}`,
+    precision: 'none',
+    locationUnknown: true,
+    locationWarning: warning,
+    locationEvidence: evidence ?? undefined,
+  };
+}
+
 export async function scoreLocation(
   lat: number,
   lng: number,
   amenityPrefs: AmenityPreference[],
   workAddress?: string,
   commuteMode = 'transit',
+  estimate?: LocationEstimateContext,
 ): Promise<LocationScore> {
   console.log(`[maps] Scoring location ${lat},${lng} for ${amenityPrefs.length} amenities`);
 
-  const amenities = await findNearbyAmenities(lat, lng, amenityPrefs);
+  const pointAmenities = await findNearbyAmenities(lat, lng, amenityPrefs);
+  const amenities = estimate && (estimate.uncertaintyMeters > 0 || estimate.anchorDistanceMeters > 0)
+    ? applyLocationUncertainty(
+        pointAmenities,
+        amenityPrefs,
+        estimate.uncertaintyMeters,
+        estimate.anchorDistanceMeters,
+      )
+    : pointAmenities;
 
   let commute: CommuteResult | null = null;
   if (workAddress) {
@@ -728,12 +973,24 @@ export async function scoreLocation(
 
   const total = amenityPrefs.length;
   const met = amenities.filter(a => a.withinLimit).length;
-  const overallScore = total === 0 ? 100 : Math.round((met / total) * 100);
+  const uncertain = amenities.filter(a => a.uncertain).length;
+  const overallScore = total === 0 ? 100 : Math.round(((met + uncertain * 0.5) / total) * 100);
+
+  const approximate = estimate && estimate.precision !== 'exact' && estimate.precision !== 'street';
+  const uncertaintyText = estimate && estimate.uncertaintyMeters >= 1000
+    ? `${(estimate.uncertaintyMeters / 1000).toLocaleString('ru-RU', { maximumFractionDigits: 1 })} км`
+    : `${estimate?.uncertaintyMeters ?? 0} м`;
+  const locationWarning = approximate
+    ? `примерная локация: ${estimate.source}, погрешность ±${uncertaintyText}`
+    : undefined;
 
   return {
     amenities,
     commute,
     overallScore,
     mapsLink: `https://www.google.com/maps?q=${lat},${lng}`,
+    precision: estimate?.precision,
+    locationWarning,
+    locationEvidence: estimate?.evidence ?? undefined,
   };
 }

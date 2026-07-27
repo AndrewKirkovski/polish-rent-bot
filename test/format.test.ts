@@ -52,3 +52,94 @@ test('card location line renders cafe/restaurant icons', () => {
   assert.match(card, /☕/);
   assert.match(card, /🍽/);
 });
+
+test('metro result always shows station name and measured distance', () => {
+  const score = mkScore([{
+    type: 'metro',
+    places: [{ name: 'Racławicka', lineName: 'M1', walkingMinutes: 7, distance: '500 m', distanceMeters: 500 }],
+    nearest: { name: 'Racławicka', lineName: 'M1', walkingMinutes: 7, distance: '500 m', distanceMeters: 500 },
+    withinLimit: true,
+  }]);
+  const card = formatRentalCard(mkListing(), mkParsed(), score);
+  assert.match(card, /Racławicka \(M1\)/);
+  assert.match(card, /500 m · 7 мин/);
+});
+
+test('approximate metro result shows distance range and warning evidence', () => {
+  const score = mkScore([{
+    type: 'metro',
+    places: [{
+      name: 'Bemowo', lineName: 'M2', walkingMinutes: 0, distance: '1 m',
+      walkingMinutesRange: { min: 11, max: 16 },
+      distanceMetersRange: { min: 850, max: 1150 },
+      approximate: true,
+    }],
+    nearest: {
+      name: 'Bemowo', lineName: 'M2', walkingMinutes: 0, distance: '1 m',
+      walkingMinutesRange: { min: 11, max: 16 },
+      distanceMetersRange: { min: 850, max: 1150 },
+      approximate: true,
+    },
+    withinLimit: false,
+    uncertain: false,
+  }], {
+    precision: 'approximate',
+    locationWarning: 'примерная локация: описание, оценка ±150 м',
+    locationEvidence: '1000 m od metra',
+  });
+  const card = formatRentalCard(mkListing(), mkParsed(), score);
+  assert.match(card, /Bemowo \(M2\)/);
+  assert.match(card, /~850 м–1,2 км · ~11–16 мин/);
+  assert.match(card, /1000 m od metra/);
+});
+
+test('unknown metro distance still identifies the requested line', () => {
+  const score = mkScore([{
+    type: 'metro',
+    requestedLine: 'M1',
+    places: [],
+    nearest: null,
+    withinLimit: false,
+    uncertain: true,
+  }], {
+    precision: 'none',
+    locationUnknown: true,
+    locationWarning: 'местоположение не удалось определить',
+  });
+
+  const card = formatRentalCard(mkListing(), mkParsed(), score);
+  assert.match(card, /метро M1: станция\/расстояние неизвестны/);
+  assert.match(card, /местоположение не удалось определить/);
+});
+
+test('partial Maps evidence renders a warning, not a false metro failure mark', () => {
+  const score = mkScore([{
+    type: 'metro',
+    requestedLine: 'M1',
+    places: [{
+      name: 'Ratusz Arsenał',
+      lineName: 'M1',
+      walkingMinutes: 30,
+      distance: '2 km',
+      distanceMetersRange: { min: 1800, max: 2200 },
+      walkingMinutesRange: { min: 27, max: 33 },
+      approximate: true,
+    }],
+    nearest: {
+      name: 'Ratusz Arsenał',
+      lineName: 'M1',
+      walkingMinutes: 30,
+      distance: '2 km',
+      distanceMetersRange: { min: 1800, max: 2200 },
+      walkingMinutesRange: { min: 27, max: 33 },
+      approximate: true,
+    },
+    withinLimit: false,
+    uncertain: true,
+    error: true,
+  }]);
+
+  const card = formatRentalCard(mkListing(), mkParsed(), score);
+  assert.match(card, /Ratusz Arsenał \(M1\).*⚠️/);
+  assert.doesNotMatch(card, /Ratusz Arsenał \(M1\).*✗/);
+});

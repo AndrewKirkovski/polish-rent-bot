@@ -7,7 +7,8 @@ import { buildRejectionReport } from './rejection-report.js';
 import type { Listing, ParsedRentalData, ParsedItemData, LocationScore } from '../types.js';
 import type { ItemListing } from '../crawlers/olx-items.js';
 import { parseRentalListing, parseItemListing, evaluateRejection, triageRentalListing } from '../ai/parse-listing.js';
-import { scoreLocation } from '../ai/maps.js';
+import { createUnknownLocationScore, scoreLocation } from '../ai/maps.js';
+import type { AmenityPreference } from '../ai/maps.js';
 import { computeRentalCost, exceedsBudgetFloor } from '../cost.js';
 import { searchRentalListings, resolveCityId } from '../search/rental-search.js';
 import { enrichRentalListing } from '../search/enrich-listing.js';
@@ -34,7 +35,7 @@ interface RentalConfig {
   areaTo?: number;
   ownerType?: 'ALL' | 'PRIVATE' | 'AGENCY';
   limit?: number;
-  amenities?: Array<{ type: string; maxMinutes: number }>;
+  amenities?: AmenityPreference[];
   workAddress?: string;
   commuteMode?: string;
   contractPreference?: string;
@@ -401,21 +402,35 @@ export function startScheduler(
               if (monitor.type === 'rental' && ((config.amenities?.length ?? 0) > 0 || config.workAddress)) {
                 try {
                   const { enrichListingLocation } = await import('../ai/location.js');
-                  const enriched = await enrichListingLocation(workingListing as Listing, parsedData as { addressHint?: string | null } | null);
+                  const enriched = await enrichListingLocation(workingListing as Listing, parsedData as ParsedRentalData | null);
                   if (enriched.lat != null && enriched.lng != null) {
-                    (workingListing as Listing).lat = enriched.lat;
-                    (workingListing as Listing).lng = enriched.lng;
+                    if (enriched.precision === 'exact' || enriched.precision === 'street') {
+                      (workingListing as Listing).lat = enriched.lat;
+                      (workingListing as Listing).lng = enriched.lng;
+                    }
                     locationScore = await scoreLocation(
                       enriched.lat,
                       enriched.lng,
                       config.amenities ?? [],
                       config.workAddress,
                       config.commuteMode,
+                      enriched,
                     );
-                    if (locationScore) locationScore.precision = enriched.precision;
+                  } else {
+                    locationScore = createUnknownLocationScore(
+                      config.amenities ?? [],
+                      (workingListing as Listing).city,
+                      `точное местоположение не удалось определить (${enriched.source})`,
+                      enriched.evidence,
+                    );
                   }
                 } catch (mapErr) {
                   console.error('[scheduler] Location enrich/scoring failed:', mapErr);
+                  locationScore = createUnknownLocationScore(
+                    config.amenities ?? [],
+                    (workingListing as Listing).city,
+                    'местоположение или расстояния не удалось проверить',
+                  );
                 }
               }
 

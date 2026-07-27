@@ -21,7 +21,7 @@ const PARSE_MODEL = process.env.PARSE_MODEL || 'claude-haiku-4-5';
 
 // Folded into the parse cache key; bump on any RENTAL_PROMPT/schema change so stale
 // old-schema rows miss instead of returning objects without the new fields.
-export const RENTAL_PARSE_VERSION = 'wfh-v2-media';
+export const RENTAL_PARSE_VERSION = 'wfh-v6-location-evidence-validation';
 export const ITEM_PARSE_VERSION = 'v2';
 
 function hashText(text: string): string {
@@ -30,6 +30,83 @@ function hashText(text: string): string {
 
 function triFact(v: boolean | null | undefined): string {
   return v === true ? 'yes' : v === false ? 'no' : 'unknown';
+}
+
+function locationWords(value: string): string[] {
+  const generic = new Set([
+    'metro', 'metra', 'stacja', 'station', 'przystanek', 'przystanku', 'stop',
+    'warszawa', 'warsaw', 'polska', 'poland', 'ul', 'ulica', 'aleja',
+    'od', 'do', 'przy', 'obok', 'm', 'km', 'min', 'm1', 'm2',
+  ]);
+  return value
+    .normalize('NFD')
+    .replace(/\p{Diacritic}/gu, '')
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((word) => word.length > 1 && !/^\d+$/.test(word) && !generic.has(word));
+}
+
+export function locationEvidenceSupportsAnchor(query: string, evidence: string): boolean {
+  const anchorWords = locationWords(query);
+  const evidenceWords = locationWords(evidence);
+  if (anchorWords.length === 0 || evidenceWords.length === 0) return false;
+  const matched = anchorWords.filter((anchor) => evidenceWords.some((word) =>
+    word === anchor || (word.length >= 4 && anchor.length >= 4 && word.slice(0, 4) === anchor.slice(0, 4))));
+  const required = anchorWords.length === 1 ? 1 : Math.ceil(anchorWords.length * 0.6);
+  return matched.length >= required;
+}
+
+/**
+ * Enforce the meaning of a selected location anchor independently of the LLM.
+ * An address, intersection, building/estate, or neighborhood identifies where
+ * the apartment is; a distance quoted to some other place must not move it.
+ */
+export function normalizeLocationHint(
+  hint: ParsedRentalData['locationHint'],
+): ParsedRentalData['locationHint'] {
+  const fixedAnchorKinds = new Set(['address', 'intersection', 'building', 'estate', 'neighborhood']);
+  if (!fixedAnchorKinds.has(hint.kind) || (hint.anchorDistanceMeters ?? 0) === 0) {
+    const usesRemoteAnchor = hint.kind === 'transit_stop' || hint.kind === 'landmark';
+    const hasPositiveDistance = (hint.anchorDistanceMeters ?? 0) > 0;
+    if (
+      usesRemoteAnchor &&
+      hasPositiveDistance &&
+      (!hint.query || !hint.evidence || !locationEvidenceSupportsAnchor(hint.query, hint.evidence))
+    ) {
+      return {
+        query: null,
+        kind: 'none',
+        anchorDistanceMeters: null,
+        uncertaintyMeters: null,
+        evidence: hint.evidence,
+      };
+    }
+    return hint;
+  }
+
+  if (
+    hint.query &&
+    hint.evidence &&
+    locationEvidenceSupportsAnchor(hint.query, hint.evidence)
+  ) {
+    const normalizedQuery = hint.query
+      .normalize('NFD')
+      .replace(/\p{Diacritic}/gu, '')
+      .toLowerCase();
+    const transitAnchor = /\b(?:metro|metra|stacja|przystanek|dworzec)\b/.test(normalizedQuery);
+    return {
+      ...hint,
+      kind: transitAnchor ? 'transit_stop' : 'landmark',
+    };
+  }
+
+  return {
+    ...hint,
+    anchorDistanceMeters: 0,
+    // The model coupled this evidence to the wrong anchor, so do not display it
+    // as support for the selected location.
+    evidence: null,
+  };
 }
 
 /**
@@ -143,7 +220,16 @@ Extraction notes:
   • "internet w cenie" → internet null; "światłowód do podłączenia" / not included → estimate internet if tenant must pay.
   • "prąd według licznika" with no number → still estimate electricity.
   Prefer slightly conservative (higher) estimates over optimistic nulls when the ad is clearly "+ media" without numbers — underestimating breaks budget filters.
-- addressHint: exact ulica + number or a clear landmark, for geocoding; null if none.
+- addressHint: ONLY an exact street/address or intersection that identifies the apartment location; null for a vague district or a destination merely described as nearby.
+- locationHint: reason carefully about every location clue in the title and description. Extract the best GOOGLE-GEOCODABLE ANCHOR for where the apartment probably is:
+  • Prefer exact address/number, then intersection, named building, named residential estate, a stop explicitly said to be at/under the building, then a landmark or named transit stop with a stated distance from the apartment.
+  • Use kind "building" only for one point-like building or complex. Use kind "estate" for an osiedle or other named residential area (for example "osiedle Przyjaźń"); an estate is not precise enough to treat as one building.
+  • Preserve names verbatim from the listing. NEVER invent, silently correct, merge, or rename a station/stop. Google will validate the name later.
+  • The query must include city and enough Polish context to geocode (e.g. "przystanek Hala Wola, Warszawa" or "metro Bemowo Ratusz, Warszawa").
+  • anchorDistanceMeters is ONLY the distance from THE SELECTED query anchor to the apartment. Exact address/intersection/building/estate or "at/under the stop" → 0. If query is "metro X" and the ad says "1000m from metro X" → 1000. If query is the apartment's estate/building, keep 0 even when the same sentence mentions 1000m to a DIFFERENT place. Never attach one place's distance to another anchor. Do not convert bus/tram stop counts into walking metres.
+  • uncertaintyMeters is the conservative ± margin around anchorDistanceMeters: address 50-100m; intersection/building 100-250m; estate 500-1200m; exact stated metric distance ±100-250m; "next to stop" ±200-400m; vague landmark ±400-800m; neighborhood ±1200-2500m. If only "nearby" is stated, use a broad margin, not false precision.
+  • If the ad only gives a district with no better clue, set query null/kind none; the platform district pin is handled separately.
+  • evidence is one short quote-like source phrase from the ad, not an inference.
 - isConcreteApartment: FALSE for agency/portfolio posts, investment/new-build sales, price ranges ("od X zł"), generic "we have flats" ads, or scams; TRUE for one real, specific flat.
 - separateRooms: number of CLOSABLE separate rooms (exclude a walk-through/przechodni room and the kitchen). layoutType: "rozkladowy" (rooms off a hall), "przechodni" (walk-through), or "open" (studio/open-plan).
 - twoOfficeCapable: true if the flat plausibly fits TWO private desks/offices with doors for calls (needs ≥2 separable rooms, not przechodni).
@@ -156,7 +242,14 @@ JSON schema:
   "deposit": number|null,
   "depositNote": "напр. 6000 zł (2x аренды), возвратный" | null,
   "adminFee": number|null,
-  "addressHint": "улица+номер или ориентир" | null,
+  "addressHint": "точный адрес/перекрёсток" | null,
+  "locationHint": {
+    "query": "Google query grounded in the ad, with city" | null,
+    "kind": "address"|"intersection"|"building"|"estate"|"transit_stop"|"landmark"|"neighborhood"|"none",
+    "anchorDistanceMeters": number|null,
+    "uncertaintyMeters": number|null,
+    "evidence": "short source phrase from the listing" | null
+  },
   "isConcreteApartment": true|false,
   "estimatedMedia": { "water": number|null, "electricity": number|null, "gas": number|null, "internet": number|null, "heating": number|null, "other": number|null },
   "contractType": "najem_okazjonalny"|"najem_zwykly"|"najem_instytucjonalny"|null,
@@ -243,6 +336,9 @@ export async function parseRentalListing(listing: Listing, ctx: AiCallCtx = {}):
       if (parsed?.estimatedMedia && parsed.estimatedMedia.other === undefined) {
         parsed.estimatedMedia.other = null;
       }
+      if (!parsed?.locationHint) {
+        parsed.locationHint = { query: null, kind: 'none', anchorDistanceMeters: null, uncertaintyMeters: null, evidence: null };
+      }
       recordLocalCacheHit({ feature: 'parse_rental', ...ctx }, PARSE_MODEL);
       return parsed;
     } catch {
@@ -311,6 +407,7 @@ ${(listing.description || 'No description provided').slice(0, 8000)}`;
   try {
     const raw = JSON.parse(jsonStr);
     parsed = ParsedRentalDataSchema.parse(raw) as ParsedRentalData;
+    parsed.locationHint = normalizeLocationHint(parsed.locationHint);
   } catch (parseErr) {
     console.error('[parse-listing] Failed to parse/validate AI JSON:', jsonStr.slice(0, 200));
     throw new Error('AI returned invalid JSON');

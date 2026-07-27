@@ -1,7 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { exceedsBudgetFloor, computeRentalCost } from '../src/cost.js';
-import { rentalParseCacheKey } from '../src/ai/parse-listing.js';
+import { locationEvidenceSupportsAnchor, normalizeLocationHint, rentalParseCacheKey } from '../src/ai/parse-listing.js';
+import { ParsedRentalDataSchema } from '../src/ai/schemas.js';
 import { mkListing, mkParsed } from './helpers.js';
 import { extractResultId, prefixResultIdHtml } from '../src/utils/result-id.js';
 
@@ -36,6 +37,114 @@ test('rentalParseCacheKey stable for identical listing inputs', () => {
   const a = mkListing({ description: 'x', price: 4000, hasInternet: true });
   const b = mkListing({ description: 'x', price: 4000, hasInternet: true });
   assert.equal(rentalParseCacheKey(a), rentalParseCacheKey(b));
+});
+
+test('building anchor cannot inherit distance evidence about another place', () => {
+  const hint = normalizeLocationHint({
+    query: 'osiedle Przyjaźń Jelonki Bemowo, Warszawa',
+    kind: 'building',
+    anchorDistanceMeters: 1000,
+    uncertaintyMeters: 250,
+    evidence: '3 przystanki (1000 m) od metra Bemowo Ratusz',
+  });
+
+  assert.equal(hint.anchorDistanceMeters, 0);
+  assert.equal(hint.evidence, null);
+  assert.equal(hint.uncertaintyMeters, 250);
+});
+
+test('remote building named by its own distance evidence becomes a landmark anchor', () => {
+  const hint = normalizeLocationHint({
+    query: 'Hala Targowa Wola, Warszawa',
+    kind: 'building',
+    anchorDistanceMeters: 1000,
+    uncertaintyMeters: 250,
+    evidence: '1000 m od Hali Targowej Wola',
+  });
+
+  assert.equal(hint.kind, 'landmark');
+  assert.equal(hint.anchorDistanceMeters, 1000);
+  assert.equal(hint.evidence, '1000 m od Hali Targowej Wola');
+});
+
+test('transit anchor keeps an explicitly stated distance', () => {
+  const hint = normalizeLocationHint({
+    query: 'metro Bemowo, Warszawa',
+    kind: 'transit_stop',
+    anchorDistanceMeters: 1000,
+    uncertaintyMeters: 200,
+    evidence: '1000 m od metra Bemowo',
+  });
+
+  assert.equal(hint.anchorDistanceMeters, 1000);
+  assert.equal(hint.evidence, '1000 m od metra Bemowo');
+});
+
+test('distance evidence cannot be attached to a different transit anchor', () => {
+  const hint = normalizeLocationHint({
+    query: 'przystanek Hala Wola, Warszawa',
+    kind: 'transit_stop',
+    anchorDistanceMeters: 250,
+    uncertaintyMeters: 100,
+    evidence: '250 m od przystanku Ciepłownia Wola',
+  });
+
+  assert.equal(hint.kind, 'none');
+  assert.equal(hint.query, null);
+  assert.equal(hint.anchorDistanceMeters, null);
+  assert.equal(hint.evidence, '250 m od przystanku Ciepłownia Wola');
+});
+
+test('anchor evidence matching tolerates normal Polish inflection', () => {
+  assert.equal(
+    locationEvidenceSupportsAnchor('Hala Targowa Wola, Warszawa', 'blisko Hali Targowej Wola'),
+    true,
+  );
+  assert.equal(
+    locationEvidenceSupportsAnchor('M1 Centrum, Warszawa', '7 minut pieszo do metra Centrum'),
+    true,
+  );
+});
+
+test('city-scale stated anchor distance is preserved', () => {
+  const hint = normalizeLocationHint({
+    query: 'metro Młociny, Warszawa',
+    kind: 'transit_stop',
+    anchorDistanceMeters: 12_000,
+    uncertaintyMeters: 500,
+    evidence: '12 km od metra Młociny',
+  });
+
+  assert.equal(hint.anchorDistanceMeters, 12_000);
+  assert.equal(hint.uncertaintyMeters, 500);
+});
+
+test('rental schema accepts city-scale location evidence without failing the whole parse', () => {
+  const parsed = ParsedRentalDataSchema.parse({
+    locationHint: {
+      query: 'metro Młociny, Warszawa',
+      kind: 'transit_stop',
+      anchorDistanceMeters: 12_000,
+      uncertaintyMeters: 500,
+      evidence: '12 km od metra Młociny',
+    },
+  });
+
+  assert.equal(parsed.locationHint.anchorDistanceMeters, 12_000);
+});
+
+test('named estate is a fixed area anchor, not a displaced point', () => {
+  const hint = normalizeLocationHint({
+    query: 'osiedle Przyjaźń, Warszawa',
+    kind: 'estate',
+    anchorDistanceMeters: 800,
+    uncertaintyMeters: 700,
+    evidence: '800 m od przystanku',
+  });
+
+  assert.equal(hint.anchorDistanceMeters, 0);
+  assert.equal(hint.evidence, null);
+  assert.equal(hint.uncertaintyMeters, 700);
 });
 
 test('computeRentalCost includes estimatedMedia.other lump', () => {

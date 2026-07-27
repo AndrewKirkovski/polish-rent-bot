@@ -15,6 +15,19 @@ export const ParsedRentalDataSchema = z.looseObject({
   depositNote: z.string().nullable().default(null),
   adminFee: z.number().nullable().default(null),
   addressHint: z.string().nullable().default(null),
+  locationHint: z.object({
+    query: z.string().nullable().default(null),
+    kind: z.enum(['address', 'intersection', 'building', 'estate', 'transit_stop', 'landmark', 'neighborhood', 'none']).default('none'),
+    anchorDistanceMeters: z.number().min(0).max(50_000).nullable().default(null),
+    uncertaintyMeters: z.number().min(0).max(20_000).nullable().default(null),
+    evidence: z.string().nullable().default(null),
+  }).default({
+    query: null,
+    kind: 'none',
+    anchorDistanceMeters: null,
+    uncertaintyMeters: null,
+    evidence: null,
+  }),
   isConcreteApartment: z.boolean().nullable().default(true),
   estimatedMedia: z.object({
     water: z.number().nullable().default(null),
