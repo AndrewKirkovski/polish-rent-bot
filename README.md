@@ -126,6 +126,19 @@ Scopes:
 
 Every scope preserves seen listings, notification fingerprints, cached result cards, monitor history, conversations, and AI usage telemetry. A reset therefore refreshes derived analysis without replaying historical alerts or erasing cost statistics.
 
+Cache reset does not reprocess previously seen listings. Use the protected full-rescan operation when every current monitor result must be analyzed again:
+
+```bash
+curl -X POST "http://<revo-lan-ip>:8090/api/rescan" \
+  -H "Authorization: Bearer $DASHBOARD_ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  --data '{"confirm":"FULL_RESCAN"}'
+```
+
+`POST /api/rescan` queues an immediate rescan of all active monitors. Once the current scheduler cycle is idle, it atomically clears parsed, rejection, and Maps caches plus active-monitor seen/rejection state. It then processes every current candidate without the normal 25-listing cap. Existing notification fingerprints and result cards are preserved, and individual listing notifications are suppressed during the rescan.
+
+`GET /api/rescan` reports `queued`, `running`, `completed`, or `failed` state together with cache/seen rows cleared, total candidates found, candidates attempted, processing errors, timestamps, and notification policy. A successful full rescan requires `state: "completed"`, `attempted` equal to `totalFound`, and `processingErrors: 0`.
+
 ## Deployment (local)
 
 Runs on Docker with Watchtower auto-updates:

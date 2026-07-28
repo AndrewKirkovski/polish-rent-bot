@@ -53,14 +53,16 @@ try {
 startBot();
 
 const MONITOR_INTERVAL_MINUTES = 10;
-const stopScheduler = startScheduler(
+const scheduler = startScheduler(
   MONITOR_INTERVAL_MINUTES,
   (_userId, listing, parsedData, locationScore, fitReason, resultId) =>
     broadcastEnrichedNotification(listing, parsedData, locationScore, fitReason, resultId),
   (text) => broadcastText(text),
 );
 
-const httpServer = startHttpServer();
+const httpServer = startHttpServer({
+  requestFullRescan: scheduler.requestFullRescan,
+});
 
 console.log(`Polish Rent Bot started. Monitoring every ${MONITOR_INTERVAL_MINUTES} minutes.`);
 
@@ -68,7 +70,7 @@ console.log(`Polish Rent Bot started. Monitoring every ${MONITOR_INTERVAL_MINUTE
 
 async function shutdown(signal: string): Promise<void> {
   console.log(`\nReceived ${signal}. Shutting down...`);
-  stopScheduler();
+  scheduler.stop();
   if (httpServer) {
     try { await httpServer.close(); } catch (err) { console.error('[shutdown] http close failed:', err); }
   }

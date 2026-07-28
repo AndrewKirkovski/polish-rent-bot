@@ -2,7 +2,7 @@
 // and calls a notification callback for each unseen result.
 
 import { searchItems, fetchItemPhone } from '../crawlers/olx-items.js';
-import { getMonitors, isListingSeen, markListingSeen, cleanOldSeen, cleanOldCachedListings, cleanOldNotifiedFingerprints, cleanOldMonitorRejections, cleanOldTelegramMessageRefs, startMonitorRun, finishMonitorRun, cacheListing, getCachedListingByPlatform, isFingerprintNotified, markFingerprintNotified, recordMonitorRejection, getMonitorRejectionsSince, getAppState, setAppState, type MonitorRow } from '../storage/db.js';
+import { getMonitors, isListingSeen, markListingSeen, cleanOldSeen, cleanOldCachedListings, cleanOldNotifiedFingerprints, cleanOldMonitorRejections, cleanOldTelegramMessageRefs, startMonitorRun, finishMonitorRun, cacheListing, getCachedListingByPlatform, isFingerprintNotified, markFingerprintNotified, recordMonitorRejection, getMonitorRejectionsSince, getAppState, setAppState, getFullRescanStatus, queueFullRescan, beginFullRescan, finishFullRescan, recoverInterruptedFullRescan, type FullRescanStatus, type MonitorRow } from '../storage/db.js';
 import { buildRejectionReport } from './rejection-report.js';
 import type { Listing, ParsedRentalData, ParsedItemData, LocationScore } from '../types.js';
 import type { ItemListing } from '../crawlers/olx-items.js';
@@ -66,7 +66,14 @@ export interface RunMonitorResult {
   newListings: (Listing | ItemListing)[];
 }
 
-export async function runMonitor(monitor: MonitorRow): Promise<RunMonitorResult> {
+export interface RunMonitorOptions {
+  ignoreSeen?: boolean;
+}
+
+export async function runMonitor(
+  monitor: MonitorRow,
+  options: RunMonitorOptions = {},
+): Promise<RunMonitorResult> {
   const config = JSON.parse(monitor.config);
   const newListings: (Listing | ItemListing)[] = [];
   let totalFound = 0;
@@ -97,7 +104,7 @@ export async function runMonitor(monitor: MonitorRow): Promise<RunMonitorResult>
     totalFound = deduped.length;
 
     for (const listing of deduped) {
-      if (!isListingSeen(monitor.id, listing.platform, listing.platformId)) {
+      if (options.ignoreSeen || !isListingSeen(monitor.id, listing.platform, listing.platformId)) {
         newListings.push(listing);
       }
     }
@@ -124,7 +131,7 @@ export async function runMonitor(monitor: MonitorRow): Promise<RunMonitorResult>
 
     totalFound = filteredItems.length;
     for (const item of filteredItems) {
-      if (!isListingSeen(monitor.id, item.platform, item.platformId)) {
+      if (options.ignoreSeen || !isListingSeen(monitor.id, item.platform, item.platformId)) {
         newListings.push(item);
       }
     }
@@ -141,14 +148,14 @@ export interface MonitorResult {
   searchError: string | null;
 }
 
-export async function runAllMonitors(): Promise<MonitorResult[]> {
+export async function runAllMonitors(options: RunMonitorOptions = {}): Promise<MonitorResult[]> {
   const monitors = getMonitors();
   const results: MonitorResult[] = [];
 
   for (const monitor of monitors) {
     const runId = startMonitorRun(monitor.id);
     try {
-      const { totalFound, newListings } = await runMonitor(monitor);
+      const { totalFound, newListings } = await runMonitor(monitor, options);
       results.push({ monitor, runId, totalFound, newListings, searchError: null });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -219,6 +226,22 @@ async function maybeSendDailyRejectionReport(reportFn: (text: string) => void | 
   }
 }
 
+export function shouldSkipNotifiedFingerprint(
+  alreadyNotified: boolean,
+  fullRescan: boolean,
+): boolean {
+  return alreadyNotified && !fullRescan;
+}
+
+export function shouldEmitMonitorNotification(fullRescan: boolean): boolean {
+  return !fullRescan;
+}
+
+export interface SchedulerHandle {
+  stop: () => void;
+  requestFullRescan: () => FullRescanStatus;
+}
+
 export function startScheduler(
   intervalMinutes: number,
   notifyFn: (
@@ -230,22 +253,46 @@ export function startScheduler(
     resultId?: string | null,
   ) => void | Promise<void>,
   reportFn?: (text: string) => void | Promise<void>,
-): () => void {
+): SchedulerHandle {
   let stopped = false;
+  let running = false;
   let timer: ReturnType<typeof setTimeout> | null = null;
 
+  recoverInterruptedFullRescan();
+
   async function cycle(): Promise<void> {
-    if (stopped) return;
+    if (stopped || running) return;
+    running = true;
+    if (timer !== null) {
+      clearTimeout(timer);
+      timer = null;
+    }
 
     console.log(`[scheduler] Starting monitor cycle at ${new Date().toISOString()}`);
 
+    let fullRescan = false;
+    let rescanAttempted = 0;
+    let rescanProcessingErrors = 0;
+    let rescanTotalFound = 0;
+
     try {
-      const results = await runAllMonitors();
+      fullRescan = getFullRescanStatus()?.state === 'queued';
+      if (fullRescan) {
+        const status = beginFullRescan();
+        console.log(`[scheduler] Full rescan ${status.id} started for ${status.activeMonitors} active monitor(s); notifications suppressed`);
+      }
+
+      const results = await runAllMonitors({ ignoreSeen: fullRescan });
+      rescanTotalFound = results.reduce((sum, result) => sum + result.totalFound, 0);
 
       for (const { monitor, runId, totalFound, newListings, searchError } of results) {
-        if (searchError !== null) continue;
+        if (searchError !== null) {
+          if (fullRescan) rescanProcessingErrors++;
+          continue;
+        }
         if (newListings.length > 0) {
-          console.log(`[scheduler] Monitor #${monitor.id} (${monitor.type}): ${newListings.length} new listing(s)`);
+          const candidateKind = fullRescan ? 'full-rescan candidate' : 'new listing';
+          console.log(`[scheduler] Monitor #${monitor.id} (${monitor.type}): ${newListings.length} ${candidateKind}(s)`);
         }
         let delivered = 0;
         let cycleError: string | null = null;
@@ -257,16 +304,17 @@ export function startScheduler(
           // 100+ enrich+parse calls at once. Overflow stays unseen for the next cycle.
           // Best-fit first (rentals) so the cap keeps the strongest candidates, matching
           // the interactive path's preScore ordering.
-          const PER_CYCLE_CAP = 25;
+          const perCycleCap = fullRescan ? Number.POSITIVE_INFINITY : 25;
           const ordered = monitor.type === 'rental'
             ? [...newListings].sort((a, b) => preScore(b as Listing) - preScore(a as Listing))
             : newListings;
-          const toProcess = ordered.slice(0, PER_CYCLE_CAP);
-          if (newListings.length > PER_CYCLE_CAP) {
-            console.log(`[scheduler] Monitor #${monitor.id}: capping ${newListings.length} new → ${PER_CYCLE_CAP} this cycle (rest next cycle)`);
+          const toProcess = ordered.slice(0, perCycleCap);
+          if (newListings.length > perCycleCap) {
+            console.log(`[scheduler] Monitor #${monitor.id}: capping ${newListings.length} new listings at ${perCycleCap} this cycle`);
           }
 
           for (const listing of toProcess) {
+            if (fullRescan) rescanAttempted++;
             try {
               // Cross-monitor notification dedup — persistent (across cycles + monitors), so a
               // shared flat isn't re-alerted when one monitor defers it past the per-cycle cap.
@@ -274,7 +322,7 @@ export function startScheduler(
               const dedupKey = monitor.type === 'rental'
                 ? notificationDedupKey(listing as Listing)
                 : `item:${listing.platform}:${listing.platformId}`;
-              if (isFingerprintNotified(dedupKey)) {
+              if (shouldSkipNotifiedFingerprint(isFingerprintNotified(dedupKey), fullRescan)) {
                 markListingSeen(monitor.id, listing.platform, listing.platformId, listing.url, listing.title, listing.price);
                 continue;
               }
@@ -471,22 +519,26 @@ export function startScheduler(
               }
               seedResultIdForFamily(resultId, workingListing, monitor.user_id);
 
-              await notifyFn(
-                monitor.user_id,
-                workingListing,
-                parsedData,
-                locationScore,
-                fitReason,
-                resultId,
-              );
-              markFingerprintNotified(dedupKey); // household-wide, so no other monitor re-alerts it
+              if (shouldEmitMonitorNotification(fullRescan)) {
+                await notifyFn(
+                  monitor.user_id,
+                  workingListing,
+                  parsedData,
+                  locationScore,
+                  fitReason,
+                  resultId,
+                );
+                markFingerprintNotified(dedupKey); // household-wide, so no other monitor re-alerts it
+                delivered++;
+              }
               markListingSeen(monitor.id, workingListing.platform, workingListing.platformId, workingListing.url, workingListing.title, workingListing.price);
-              delivered++;
-            } catch (notifyErr) {
-              console.error(`[scheduler] Notify failed — listing NOT marked as seen (will retry next cycle):`, notifyErr);
+            } catch (listingErr) {
+              if (fullRescan) rescanProcessingErrors++;
+              console.error('[scheduler] Listing processing failed — listing NOT marked as seen (will retry next cycle):', listingErr);
             }
           }
         } catch (perMonitorErr) {
+          if (fullRescan) rescanProcessingErrors++;
           cycleError = perMonitorErr instanceof Error ? perMonitorErr.message : String(perMonitorErr);
           console.error(`[scheduler] Monitor #${monitor.id} pipeline error:`, perMonitorErr);
         }
@@ -498,6 +550,18 @@ export function startScheduler(
         });
       }
 
+      if (fullRescan) {
+        const status = finishFullRescan({
+          totalFound: rescanTotalFound,
+          attempted: rescanAttempted,
+          processingErrors: rescanProcessingErrors,
+          error: rescanProcessingErrors > 0
+            ? `${rescanProcessingErrors} search or listing processing error(s)`
+            : null,
+        });
+        console.log(`[scheduler] Full rescan ${status.id} ${status.state}: ${status.attempted}/${status.totalFound ?? 0} candidate(s) attempted, ${status.processingErrors} error(s), notifications suppressed`);
+      }
+
       cleanOldSeen(30);
       cleanOldCachedListings(90);
       cleanOldNotifiedFingerprints(30);
@@ -505,7 +569,7 @@ export function startScheduler(
       cleanOldTelegramMessageRefs(30);
 
       // Once-per-day aggregated rejection digest (monitors are silent per-listing).
-      if (reportFn) {
+      if (reportFn && !fullRescan) {
         try {
           await maybeSendDailyRejectionReport(reportFn);
         } catch (err) {
@@ -517,21 +581,48 @@ export function startScheduler(
       console.log(`[scheduler] Cycle complete — ${results.length} monitors, ${totalNew} unseen listings`);
     } catch (err) {
       console.error('[scheduler] Cycle error:', err);
-    }
-
-    if (!stopped) {
-      timer = setTimeout(cycle, intervalMinutes * 60 * 1000);
+      if (fullRescan && getFullRescanStatus()?.state === 'running') {
+        try {
+          finishFullRescan({
+            totalFound: rescanTotalFound,
+            attempted: rescanAttempted,
+            processingErrors: rescanProcessingErrors + 1,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        } catch (finishErr) {
+          console.error('[scheduler] Failed to persist full rescan failure state:', finishErr);
+        }
+      }
+    } finally {
+      running = false;
+      if (!stopped) {
+        const rescanQueued = getFullRescanStatus()?.state === 'queued';
+        timer = setTimeout(cycle, rescanQueued ? 0 : intervalMinutes * 60 * 1000);
+      }
     }
   }
 
-  cycle();
+  void cycle();
 
-  return () => {
-    stopped = true;
-    if (timer !== null) {
-      clearTimeout(timer);
-      timer = null;
-    }
-    console.log('[scheduler] Stopped');
+  return {
+    stop: () => {
+      stopped = true;
+      if (timer !== null) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      console.log('[scheduler] Stopped');
+    },
+    requestFullRescan: () => {
+      const status = queueFullRescan();
+      if (timer !== null) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      if (!running) {
+        timer = setTimeout(cycle, 0);
+      }
+      return status;
+    },
   };
 }

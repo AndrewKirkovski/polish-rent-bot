@@ -515,6 +515,182 @@ export function setAppState(key: string, value: string): void {
   `).run(key, value);
 }
 
+const FULL_RESCAN_STATE_KEY = 'monitor.fullRescan';
+
+export type FullRescanState = 'queued' | 'running' | 'completed' | 'failed';
+
+export interface FullRescanStatus {
+  id: string;
+  state: FullRescanState;
+  requestedAt: string;
+  startedAt: string | null;
+  completedAt: string | null;
+  activeMonitors: number;
+  totalFound: number | null;
+  attempted: number;
+  processingErrors: number;
+  cleared: {
+    parsedListings: number;
+    rejectionCache: number;
+    mapsCache: number;
+    seenListings: number;
+    monitorRejections: number;
+  } | null;
+  notificationsSuppressed: true;
+  preserved: string[];
+  error: string | null;
+}
+
+export class FullRescanAlreadyActiveError extends Error {
+  constructor(state: FullRescanState) {
+    super(`full rescan is already ${state}`);
+    this.name = 'FullRescanAlreadyActiveError';
+  }
+}
+
+function saveFullRescanStatus(
+  status: FullRescanStatus,
+  db: Database.Database,
+): FullRescanStatus {
+  db.prepare(`
+    INSERT INTO app_state (key, value) VALUES (?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+  `).run(FULL_RESCAN_STATE_KEY, JSON.stringify(status));
+  return status;
+}
+
+export function getFullRescanStatus(
+  db: Database.Database = getDb(),
+): FullRescanStatus | null {
+  const row = db.prepare('SELECT value FROM app_state WHERE key = ?')
+    .get(FULL_RESCAN_STATE_KEY) as { value: string } | undefined;
+  if (!row) return null;
+  return JSON.parse(row.value) as FullRescanStatus;
+}
+
+/**
+ * Queue a full rescan without touching live state. The scheduler performs the
+ * destructive preparation only after the current cycle is idle.
+ */
+export function queueFullRescan(
+  db: Database.Database = getDb(),
+): FullRescanStatus {
+  const existing = getFullRescanStatus(db);
+  if (existing?.state === 'queued' || existing?.state === 'running') {
+    throw new FullRescanAlreadyActiveError(existing.state);
+  }
+
+  const activeMonitors = db.prepare('SELECT COUNT(*) AS count FROM monitors WHERE active = 1')
+    .get() as { count: number };
+  if (activeMonitors.count === 0) {
+    throw new Error('no active monitors are available to rescan');
+  }
+
+  const now = new Date().toISOString();
+  return saveFullRescanStatus({
+    id: `rescan-${Date.now()}`,
+    state: 'queued',
+    requestedAt: now,
+    startedAt: null,
+    completedAt: null,
+    activeMonitors: Number(activeMonitors.count),
+    totalFound: null,
+    attempted: 0,
+    processingErrors: 0,
+    cleared: null,
+    notificationsSuppressed: true,
+    preserved: [
+      'notified_fingerprints',
+      'cached_listings',
+      'monitor_runs',
+      'conversations',
+      'ai_usage',
+    ],
+    error: null,
+  }, db);
+}
+
+/**
+ * Atomically clear derived analysis plus active-monitor seen/rejection state.
+ * Notification fingerprints remain intact and the scheduler suppresses alerts
+ * during the rescan, so every candidate is analyzed without replaying cards.
+ */
+export function beginFullRescan(
+  db: Database.Database = getDb(),
+): FullRescanStatus {
+  const queued = getFullRescanStatus(db);
+  if (!queued || queued.state !== 'queued') {
+    throw new Error('no queued full rescan is available to start');
+  }
+
+  return db.transaction(() => {
+    const parsedListings = db.prepare('DELETE FROM parsed_listings').run().changes;
+    const rejectionCache = db.prepare('DELETE FROM rejection_cache').run().changes;
+    const mapsCache = db.prepare('DELETE FROM maps_cache').run().changes;
+    const seenListings = db.prepare(`
+      DELETE FROM seen_listings
+      WHERE monitor_id IN (SELECT id FROM monitors WHERE active = 1)
+    `).run().changes;
+    const monitorRejections = db.prepare(`
+      DELETE FROM monitor_rejections
+      WHERE monitor_id IN (SELECT id FROM monitors WHERE active = 1)
+    `).run().changes;
+
+    return saveFullRescanStatus({
+      ...queued,
+      state: 'running',
+      startedAt: new Date().toISOString(),
+      cleared: {
+        parsedListings,
+        rejectionCache,
+        mapsCache,
+        seenListings,
+        monitorRejections,
+      },
+      error: null,
+    }, db);
+  })();
+}
+
+export function finishFullRescan(
+  finish: {
+    totalFound: number;
+    attempted: number;
+    processingErrors: number;
+    error?: string | null;
+  },
+  db: Database.Database = getDb(),
+): FullRescanStatus {
+  const running = getFullRescanStatus(db);
+  if (!running || running.state !== 'running') {
+    throw new Error('no running full rescan is available to finish');
+  }
+  const failed = finish.processingErrors > 0 || Boolean(finish.error);
+  return saveFullRescanStatus({
+    ...running,
+    state: failed ? 'failed' : 'completed',
+    completedAt: new Date().toISOString(),
+    totalFound: finish.totalFound,
+    attempted: finish.attempted,
+    processingErrors: finish.processingErrors,
+    error: finish.error ?? null,
+  }, db);
+}
+
+export function recoverInterruptedFullRescan(
+  db: Database.Database = getDb(),
+): FullRescanStatus | null {
+  const status = getFullRescanStatus(db);
+  if (!status || status.state !== 'running') return status;
+  return saveFullRescanStatus({
+    ...status,
+    state: 'queued',
+    startedAt: null,
+    completedAt: null,
+    error: 'previous rescan was interrupted; queued for a clean restart',
+  }, db);
+}
+
 // ---------------------------------------------------------------------------
 // Conversations
 // ---------------------------------------------------------------------------

@@ -7,7 +7,7 @@
     "start": "tsx src/main.ts",
     "typecheck": "tsc --noEmit",
     "typecheck:test": "tsc -p tsconfig.test.json",
-    "test": "node --import tsx --test test/dedup.test.ts test/fit-score.test.ts test/amenity-gate.test.ts test/format.test.ts test/budget.test.ts test/pricing.test.ts test/otodom-parse.test.ts test/maps.test.ts test/rejection.test.ts test/http.test.ts test/operations-db.test.ts",
+    "test": "node --import tsx --test test/dedup.test.ts test/fit-score.test.ts test/amenity-gate.test.ts test/format.test.ts test/budget.test.ts test/pricing.test.ts test/otodom-parse.test.ts test/maps.test.ts test/rejection.test.ts test/http.test.ts test/operations-db.test.ts test/scheduler-rescan.test.ts",
     "dashboard:install": "pnpm --dir dashboard install",
     "dashboard:dev": "pnpm --dir dashboard dev",
     "dashboard:build": "pnpm --dir dashboard build",

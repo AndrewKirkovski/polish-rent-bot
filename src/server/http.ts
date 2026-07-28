@@ -17,6 +17,7 @@ import {
   getCacheStats,
   getOperationalStats,
   resetCaches,
+  getFullRescanStatus,
   getMonitorsWithStats,
   getMonitorRuns,
   getMonitorListings,
@@ -25,7 +26,9 @@ import {
   listRejectionCache,
   listMapsCache,
   getMapsCacheDetail,
+  FullRescanAlreadyActiveError,
   type CacheResetScope,
+  type FullRescanStatus,
   type UsageRange,
 } from '../storage/db.js';
 
@@ -77,7 +80,13 @@ export interface HttpServerHandle {
   url: string;
 }
 
-export function startHttpServer(): HttpServerHandle | null {
+export interface HttpServerOptions {
+  requestFullRescan?: () => FullRescanStatus;
+}
+
+export function startHttpServer(
+  options: HttpServerOptions = {},
+): HttpServerHandle | null {
   const enabled = (process.env.DASHBOARD_ENABLED ?? 'true').toLowerCase() !== 'false';
   if (!enabled) {
     console.log('[http] DASHBOARD_ENABLED=false, skipping HTTP server');
@@ -91,7 +100,7 @@ export function startHttpServer(): HttpServerHandle | null {
   const startedAt = new Date().toISOString();
 
   if (host !== '127.0.0.1' && host !== 'localhost' && host !== '::1') {
-    console.warn(`[http] WARNING: dashboard host is "${host}" (non-loopback). Read APIs are unauthenticated; cache reset requires an admin token.`);
+    console.warn(`[http] WARNING: dashboard host is "${host}" (non-loopback). Read APIs are unauthenticated; cache reset and full rescan require an admin token.`);
   }
 
   const app = new Hono();
@@ -139,6 +148,51 @@ export function startHttpServer(): HttpServerHandle | null {
   });
 
   app.get('/api/cache', (c) => c.json(getCacheStats()));
+
+  app.get('/api/rescan', (c) => c.json({
+    status: getFullRescanStatus(),
+  }));
+
+  app.post('/api/rescan', async (c) => {
+    if (!options.requestFullRescan) {
+      return c.json({ error: 'full rescan is unavailable in this process' }, 503);
+    }
+
+    const expectedToken = (
+      process.env.DASHBOARD_ADMIN_TOKEN
+      || process.env.BOT_PASSWORD
+      || ''
+    ).trim();
+    if (!expectedToken) {
+      return c.json({ error: 'full rescan is disabled: no admin token is configured' }, 503);
+    }
+
+    const providedToken = extractAdminToken(
+      c.req.header('Authorization'),
+      c.req.header('X-Admin-Token'),
+    );
+    if (!adminTokenMatches(expectedToken, providedToken)) {
+      return c.json({ error: 'unauthorized' }, 401);
+    }
+
+    const body = await c.req
+      .json<{ confirm?: unknown }>()
+      .catch(() => null);
+    if (body?.confirm !== 'FULL_RESCAN') {
+      return c.json({ error: 'confirmation must be exactly FULL_RESCAN' }, 400);
+    }
+
+    try {
+      return c.json(options.requestFullRescan(), 202);
+    } catch (err) {
+      if (err instanceof FullRescanAlreadyActiveError) {
+        return c.json({ error: err.message, status: getFullRescanStatus() }, 409);
+      }
+      return c.json({
+        error: err instanceof Error ? err.message : 'failed to queue full rescan',
+      }, 500);
+    }
+  });
 
   app.post('/api/cache/reset', async (c) => {
     const expectedToken = (
