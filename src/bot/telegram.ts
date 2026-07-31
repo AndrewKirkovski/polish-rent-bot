@@ -198,15 +198,19 @@ export async function sendEnrichedNotification(
   const bot = getBot();
   const isItem = !('slug' in listing); // ItemListing lacks `slug`
 
-  let raw: string;
+  let text: string;
+  let caption: string;
   if (isItem) {
-    raw = formatRichItemNotification(listing as ItemListing, parsedData as ParsedItemData | undefined);
+    // Item cards don't render the id themselves — keep the external [ID] prefix.
+    const raw = formatRichItemNotification(listing as ItemListing, parsedData as ParsedItemData | undefined);
+    text = resultId ? prefixResultIdHtml(resultId, raw) : raw;
+    caption = resultId ? prefixResultIdPlain(resultId, raw) : raw;
   } else {
-    raw = formatRichRentalNotification(listing as Listing, parsedData as ParsedRentalData | undefined, locationScore ?? undefined, fitReason);
+    // Rental cards render [ID] on line 1, so no external prefix.
+    const raw = formatRichRentalNotification(listing as Listing, parsedData as ParsedRentalData | undefined, locationScore ?? undefined, resultId, fitReason);
+    text = raw;
+    caption = raw;
   }
-
-  const text = resultId ? prefixResultIdHtml(resultId, raw) : raw;
-  const caption = resultId ? prefixResultIdPlain(resultId, raw) : raw;
   const rid = resultId ?? undefined;
 
   // Split long cards to stay under Telegram's 4096 char limit

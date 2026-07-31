@@ -3,7 +3,7 @@
 
 import type TelegramBot from 'node-telegram-bot-api';
 import sanitizeHtml from 'sanitize-html';
-import type { Listing, ParsedRentalData, ParsedItemData, LocationScore } from '../types.js';
+import type { Listing, ParsedRentalData, ParsedItemData, LocationScore, NearbyPlace } from '../types.js';
 import type { ItemListing } from '../crawlers/olx-items.js';
 import { computeRentalCost } from '../cost.js';
 
@@ -66,11 +66,6 @@ export function captionLength(html: string): number {
 /** Telegram photo-caption limit. */
 export const CAPTION_LIMIT = 1024;
 
-/** Escape `&` so a raw URL is a valid HTML attribute value (Telegram HTML parse_mode). */
-function escAttr(url: string): string {
-  return url.replace(/&/g, '&amp;');
-}
-
 /** Split text into chunks that fit Telegram's 4096 char limit.
  *  Each chunk is passed through sanitize-html to repair any broken HTML from the split. */
 export function splitMessage(text: string, limit = 3500): string[] {
@@ -115,108 +110,95 @@ const CE = {
 // Rental card — comprehensive
 // ---------------------------------------------------------------------------
 
+/** Render one nearby metro station: "Politechnika (M1) ~450 м · 6 мин" (ranges when approximate). */
+function renderMetroPlace(p: NearbyPlace): string {
+  const station = `${esc(p.name)}${p.lineName ? ` (${esc(p.lineName)})` : ''}`;
+  const distance = p.distanceMetersRange
+    ? `~${metricRangeDistance(p.distanceMetersRange.min, 'lower')}–${metricRangeDistance(p.distanceMetersRange.max, 'upper')}`
+    : esc(p.distance);
+  const minutes = p.walkingMinutesRange
+    ? `~${p.walkingMinutesRange.min}–${p.walkingMinutesRange.max} мин`
+    : p.walkingMinutes >= 0 ? `${p.walkingMinutes} мин` : '?';
+  return `${station} ${distance} · ${minutes}`;
+}
+
 export function formatRentalCard(
   listing: Listing,
   parsed: ParsedRentalData | null | undefined,
   locationScore: LocationScore | null | undefined,
+  resultId?: string | null,
   fitReason?: string | null,
 ): string {
   const cost = computeRentalCost(listing, parsed);
   const num = (n: number) => n.toLocaleString('pl-PL');
   const zl = (n: number) => `${num(n)} zł`;
 
-  // --- Essential lines (never dropped) ---
-  const breakdown = cost.czynsz > 0 || cost.mediaSum > 0
-    ? ` (${num(cost.najem)}+${num(cost.czynsz)}${cost.mediaSum > 0 ? `+~${num(cost.mediaSum)}` : ''})`
-    : '';
-  const priceLine = `<b>${CE.price} ~${zl(cost.total)}/мес</b>${breakdown}`;
-  const titleLine = `${CE.house} ${esc(listing.title.slice(0, 80))}`;
-  const urlLine = listing.url;
+  // --- Line 1 (no emoji): rooms · m² · total price · [ID] ---
+  const headParts: string[] = [];
+  if (listing.rooms != null) headParts.push(`${listing.rooms}к`);
+  if (listing.area != null) headParts.push(`${listing.area}m²`);
+  headParts.push(zl(cost.total));
+  if (resultId) headParts.push(`[${resultId}]`);
+  const headLine = `<b>${headParts.join(' · ')}</b>`;
 
+  // --- Line 2: the 2 nearest metro stations with walk distance/time ---
+  const metroLine = locationScore && locationScore.metroNearest.length > 0
+    ? `Метро: ${locationScore.metroNearest.slice(0, 2).map(renderMetroPlace).join(' · ')}`
+    : `Метро: станции неизвестны ⚠️`;
+
+  // --- Line 3: transit to Warszawa Centralna + approximate-location triangle + range ---
+  let centralLine: string;
+  const central = locationScore?.centralStation ?? null;
+  if (central) {
+    const time = central.durationMinRange
+      ? (central.durationMinRange.min === central.durationMinRange.max
+          ? `~${central.durationMinRange.min} мин`
+          : `~${central.durationMinRange.min}–${central.durationMinRange.max} мин`)
+      : `время ⚠️`;
+    centralLine = `Центральный вокзал: ${esc(central.distanceText)} · ${time}`;
+  } else {
+    centralLine = `Центральный вокзал: не определён ⚠️`;
+  }
+  if (locationScore?.locationWarning) {
+    centralLine += ` · ⚠️ ${esc(locationScore.locationWarning)}`;
+  }
+
+  // --- Line 4: contract · kaucja · payment nuances ---
   const payLine: string[] = [];
+  if (parsed?.contractType) payLine.push(`Umowa: ${esc(parsed.contractType.replace(/_/g, ' '))}`);
   if (parsed?.depositNote) payLine.push(`Kaucja: ${esc(trunc(parsed.depositNote, 48))}`);
   else if (parsed?.deposit != null) payLine.push(`Kaucja: ${zl(parsed.deposit)}`);
   else payLine.push(`Kaucja: ${CE.warning} ?`);
-  if (parsed?.contractType) payLine.push(esc(parsed.contractType.replace(/_/g, ' ')));
-  if (parsed?.availableFrom) payLine.push(`📅 ${esc(trunc(parsed.availableFrom, 24))}`);
+  if (cost.czynsz > 0 || cost.mediaSum > 0) {
+    payLine.push(`${num(cost.najem)}+${num(cost.czynsz)}${cost.mediaSum > 0 ? `+~${num(cost.mediaSum)}` : ''}`);
+  }
+  if (parsed?.availableFrom) payLine.push(`с ${esc(trunc(parsed.availableFrom, 24))}`);
   if (parsed?.minimumLease) payLine.push(`мин. ${esc(trunc(parsed.minimumLease, 24))}`);
   const payLineStr = payLine.join(' · ');
 
-  // --- Apartment line; the trailing restriction note is droppable ---
-  const aptBase: string[] = [];
-  if (listing.rooms != null) aptBase.push(`${listing.rooms}к`);
-  if (listing.area != null) aptBase.push(`${listing.area}m²`);
-  // Floor + total, with elevator flag (a high walk-up matters when moving desks/gear).
+  // --- Rest: title, key details, description, pros/cons, contact — link goes LAST ---
+  const titleLine = esc(listing.title.slice(0, 80));
+
+  const details: string[] = [];
   if (listing.floor != null) {
     const floorTxt = listing.buildingFloor != null ? `${listing.floor}/${listing.buildingFloor}эт` : `${listing.floor}эт`;
     const lift = listing.hasElevator === true ? ' 🛗' : listing.hasElevator === false ? ' без лифта' : '';
-    aptBase.push(`${floorTxt}${lift}`);
+    details.push(`${floorTxt}${lift}`);
   }
-  if (parsed?.furnished) aptBase.push(parsed.furnished === 'none' ? 'без мебели' : parsed.furnished === 'full' ? 'меблир.' : 'част. мебл.');
-  if (listing.buildYear != null) aptBase.push(`${listing.buildYear}г`);
+  if (parsed?.furnished) details.push(parsed.furnished === 'none' ? 'без мебели' : parsed.furnished === 'full' ? 'меблир.' : 'част. мебл.');
+  if (listing.buildYear != null) details.push(`${listing.buildYear}г`);
+  if (parsed?.quiet === 'quiet') details.push('🔇 тихо');
+  else if (parsed?.quiet === 'noisy') details.push('🔊 шумно');
+  if (parsed?.naturalLight === 'bright') details.push('☀️ светло');
+  else if (parsed?.naturalLight === 'dark') details.push('🌑 тёмно');
+  if (listing.hasAc === true) details.push('❄️ кондиц.');
   const restriction = (parsed?.restrictions ?? [])[0];
-  const aptLine = (withRestriction: boolean) =>
-    `${CE.house} ${[...aptBase, ...(withRestriction && restriction ? [esc(restriction)] : [])].join(' · ')}`;
+  const detailsLine = (withRestriction: boolean) => {
+    const parts = [...details, ...(withRestriction && restriction ? [esc(restriction)] : [])];
+    return parts.length > 0 ? parts.join(' · ') : null;
+  };
 
-  // --- WFH persona strip: the signals this household actually ranks on ---
-  const wfhParts: string[] = [];
-  const fiber = parsed?.internetType === 'fiber';   // fibre is an AI inference (parsed only)
-  const anyInternet = fiber || listing.hasInternet === true || parsed?.internetType === 'cable';
-  wfhParts.push(fiber ? '🌐 оптика ✓' : anyInternet ? '🌐 интернет ✓' : '🌐 интернет: уточнить');
-  if (parsed?.twoOfficeCapable === true) wfhParts.push('🪑 2 офиса ✓');
-  else if (parsed?.twoOfficeCapable === false) wfhParts.push('🪑 2 офиса ✗');
-  else if (parsed?.separateRooms != null) wfhParts.push(`🪑 ${parsed.separateRooms} разд. комн.`);
-  if (parsed?.quiet === 'quiet') wfhParts.push('🔇 тихо');
-  else if (parsed?.quiet === 'noisy') wfhParts.push('🔊 шумно');
-  if (parsed?.naturalLight === 'bright') wfhParts.push('☀️ светло');
-  else if (parsed?.naturalLight === 'dark') wfhParts.push('🌑 тёмно');
-  if (listing.hasAc === true) wfhParts.push('❄️ кондиц.');
-  const wfhLine = wfhParts.length > 0 ? wfhParts.join(' · ') : null;
-
-  // --- Location line; the map link is folded into the 🗺 icon (no standalone line) ---
-  let locationLine: string;
-  if (locationScore) {
-    const icons: Record<string, string> = { metro: '🚇', tram: '🚋', bus: '🚌', groceries: '🛒', gym: CE.gym, cafe: '☕', restaurant: '🍽', supermarket: '🛒', pharmacy: '💊', park: '🌳' };
-    const amenParts = locationScore.amenities.map((a) => {
-      const icon = icons[a.type] ?? '·';
-      const p = a.places[0];
-      const mark = a.withinLimit ? '✓' : a.uncertain ? '⚠️' : '✗';
-      if (a.type === 'metro') {
-        if (!p) {
-          const requested = a.requestedLine ? ` ${esc(a.requestedLine)}` : '';
-          return `${icon} метро${requested}: станция/расстояние неизвестны ⚠️`;
-        }
-        const station = `${esc(p.name)}${p.lineName ? ` (${esc(p.lineName)})` : ''}`;
-        const distance = p.distanceMetersRange
-          ? `~${metricRangeDistance(p.distanceMetersRange.min, 'lower')}–${metricRangeDistance(p.distanceMetersRange.max, 'upper')}`
-          : esc(p.distance);
-        const minutes = p.walkingMinutesRange
-          ? `~${p.walkingMinutesRange.min}–${p.walkingMinutesRange.max} мин`
-          : p.walkingMinutes >= 0 ? `${p.walkingMinutes} мин` : '?';
-        return `${icon} ${station} · ${distance} · ${minutes} ${mark}`;
-      }
-      const mins = p && p.walkingMinutes >= 0 ? `${p.walkingMinutes}m` : '?';
-      return `${icon}${mins}${mark}`;
-    });
-    // Fold the map link into the place name (no standalone URL line). Plain text inside
-    // <a> is safe; avoid nesting a <tg-emoji> in the anchor.
-    const where = listing.district ? esc(listing.district) : esc(listing.city);
-    const whereLinked = `<a href="${escAttr(locationScore.mapsLink)}">${where}</a>`;
-    const commute = locationScore.commute ? ` →${esc(locationScore.commute.duration)}` : '';
-    locationLine = `${CE.location} ${locationScore.overallScore} · ${amenParts.join(' ')}${commute} · ${whereLinked}`;
-  } else {
-    locationLine = `${CE.location} ${listing.district ? esc(listing.district) + ', ' : ''}${esc(listing.city)}`;
-  }
-  const locationWarningLine = locationScore?.locationWarning
-    ? `${CE.warning} ${esc(locationScore.locationWarning)}${locationScore.locationEvidence ? ` · ${esc(trunc(locationScore.locationEvidence, 100))}` : ''}`
-    : null;
-
-  const contact: string[] = [];
-  if (listing.phone) contact.push(`${CE.phone} ${esc(listing.phone)}`);
-  if (listing.agencyName) contact.push(esc(listing.agencyName));
-  const contactLine = contact.length > 0 ? contact.join(' · ') : null;
-
-  // --- Droppable lines ---
+  const fitLine = fitReason ? `${CE.fire} ${esc(trunc(fitReason, 80))}` : null;
   const summaryLine = parsed?.descriptionSummary
     ? `${CE.thinking} ${esc(trunc(parsed.descriptionSummary, 200))}`
     : null;
@@ -225,35 +207,36 @@ export function formatRentalCard(
   const redFlags = (parsed?.redFlags ?? []).slice(0, 2);
   const redFlagsLine = redFlags.length > 0 ? `${CE.cons} ${redFlags.map((f) => esc(f)).join(', ')}` : null;
 
-  // Assemble with progressively dropped non-essential content so a rich card still
-  // fits the photo-caption budget. Essentials (price/title/url/kaucja/apt/location/contact)
-  // are never dropped. Drop order: summary → positives → restriction note → red flags.
-  // Capped like other free-text: fitLine is never dropped by the safety-trim.
-  const fitLine = fitReason ? `${CE.fire} ${esc(trunc(fitReason, 80))}` : null;
+  const contact: string[] = [];
+  if (listing.phone) contact.push(`${CE.phone} ${esc(listing.phone)}`);
+  if (listing.agencyName) contact.push(esc(listing.agencyName));
+  const contactLine = contact.length > 0 ? contact.join(' · ') : null;
 
-  const assemble = (drop: { summary?: boolean; positives?: boolean; restriction?: boolean; redFlags?: boolean }): string => {
-    const parts: string[] = [priceLine, titleLine, urlLine];
-    if (fitLine) parts.push(fitLine);
-    if (wfhLine) parts.push(wfhLine);
+  // Assemble. Essentials (line 1-4 + link) never drop; the safety-trim sheds rest content
+  // in order: summary → positives → red flags → details/restriction → fit.
+  const assemble = (drop: { summary?: boolean; positives?: boolean; redFlags?: boolean; details?: boolean; fit?: boolean }): string => {
+    const parts: string[] = [headLine, metroLine, centralLine];
+    if (payLineStr) parts.push(payLineStr);
+    parts.push(titleLine);
+    const dl = drop.details ? null : detailsLine(true);
+    if (dl) parts.push(dl);
+    if (!drop.fit && fitLine) parts.push(fitLine);
     if (!drop.summary && summaryLine) parts.push(summaryLine);
-    parts.push(payLineStr);
-    parts.push(aptLine(!drop.restriction));
-    parts.push(locationLine);
-    if (locationWarningLine) parts.push(locationWarningLine);
     if (!drop.positives && positivesLine) parts.push(positivesLine);
     if (!drop.redFlags && redFlagsLine) parts.push(redFlagsLine);
     if (contactLine) parts.push(contactLine);
+    parts.push(listing.url); // link LAST
     return parts.join('\n');
   };
 
-  // Budget kept below CAPTION_LIMIT to leave room for the interactive path's "[ID] " prefix.
-  const BUDGET = CAPTION_LIMIT - 24;
-  const stages: Array<{ summary?: boolean; positives?: boolean; restriction?: boolean; redFlags?: boolean }> = [
+  const BUDGET = CAPTION_LIMIT - 8;
+  const stages: Array<{ summary?: boolean; positives?: boolean; redFlags?: boolean; details?: boolean; fit?: boolean }> = [
     {},
     { summary: true },
     { summary: true, positives: true },
-    { summary: true, positives: true, restriction: true },
-    { summary: true, positives: true, restriction: true, redFlags: true },
+    { summary: true, positives: true, redFlags: true },
+    { summary: true, positives: true, redFlags: true, details: true },
+    { summary: true, positives: true, redFlags: true, details: true, fit: true },
   ];
   let card = assemble(stages[0]!);
   for (let i = 1; i < stages.length && captionLength(card) > BUDGET; i++) {

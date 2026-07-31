@@ -31,5 +31,5 @@ export function mkParsed(over: Partial<ParsedRentalData> = {}): ParsedRentalData
 }
 
 export function mkScore(amenities: LocationScore['amenities'], over: Partial<LocationScore> = {}): LocationScore {
-  return { amenities, commute: null, overallScore: 50, mapsLink: 'http://m', precision: 'exact', ...over };
+  return { amenities, commute: null, metroNearest: [], centralStation: null, overallScore: 50, mapsLink: 'http://m', precision: 'exact', ...over };
 }

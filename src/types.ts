@@ -180,11 +180,22 @@ export interface CommuteResult {
   mode: string;
 }
 
+/** Public-transport estimate to Warszawa Centralna (weekday 11:00). Time is a min-based range;
+ *  null time means the routing API failed (distance is still an offline straight-line fallback). */
+export interface CentralStationEstimate {
+  distanceText: string;
+  durationMinRange: { min: number; max: number } | null;
+}
+
 export type LocationPrecision = 'exact' | 'street' | 'approximate' | 'district' | 'none';
 
 export interface LocationScore {
   amenities: AmenityResult[];
   commute: CommuteResult | null;
+  /** The 2 nearest metro stations (any line), computed offline from coordinates. */
+  metroNearest: NearbyPlace[];
+  /** Transit time + distance to Warszawa Centralna; null when location is unknown. */
+  centralStation: CentralStationEstimate | null;
   overallScore: number;
   mapsLink: string;
   precision?: LocationPrecision;

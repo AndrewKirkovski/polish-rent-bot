@@ -447,7 +447,9 @@ export function startScheduler(
               }
 
               let locationScore: LocationScore | null = null;
-              if (monitor.type === 'rental' && ((config.amenities?.length ?? 0) > 0 || config.workAddress)) {
+              // Always enrich rentals: every card now shows nearest metro + Warszawa Centralna,
+              // even when no amenity/workAddress filter was requested.
+              if (monitor.type === 'rental') {
                 try {
                   const { enrichListingLocation } = await import('../ai/location.js');
                   const enriched = await enrichListingLocation(workingListing as Listing, parsedData as ParsedRentalData | null);

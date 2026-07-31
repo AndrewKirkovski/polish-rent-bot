@@ -6,6 +6,7 @@ import {
   createUnknownLocationScore,
   shouldTreatAmenityMeasurementAsUnknown,
   warsawMetroLinesForStation,
+  metroNearestWithUncertainty,
 } from '../src/ai/maps.js';
 import { classifyGeocodePrecision, isUsableDescriptionLocationHint } from '../src/ai/location.js';
 
@@ -46,6 +47,18 @@ test('Warsaw metro station names resolve to canonical lines', () => {
 
 test('invented station name does not resolve to a metro line', () => {
   assert.deepEqual(warsawMetroLinesForStation('Bemowo Ratusz'), []);
+});
+
+test('metroNearestWithUncertainty keeps the truly-nearest station first when anchor offset > uncertainty', () => {
+  // At Politechnika: nearest is Politechnika (0 m), second is Pole Mokotowskie (~1.6 km walk).
+  // With anchorDistanceMeters(1500) > uncertaintyMeters(600) the derived range-min inverts
+  // (Politechnika range-min 900 > Pole Mokotowskie range-min 0), which previously reordered
+  // the display. The nearest station must still be shown first.
+  const places = metroNearestWithUncertainty(52.21866, 21.01530, {
+    precision: 'approximate', anchorDistanceMeters: 1500, uncertaintyMeters: 600, source: 't',
+  });
+  assert.equal(places[0]!.name, 'Politechnika');
+  assert.ok(places[0]!.distanceMetersRange, 'ranges applied when approximate');
 });
 
 test('invented Warsaw metro name cannot become a description geocoding anchor', () => {

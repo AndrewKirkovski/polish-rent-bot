@@ -4,9 +4,21 @@
 
 import { createHash } from 'node:crypto';
 import { getMapsCacheEntry, setMapsCacheEntry, clearEmptyMapsCache } from '../storage/db.js';
-import type { AmenityResult, NearbyPlace, CommuteResult, LocationScore, LocationPrecision } from '../types.js';
+import type { AmenityResult, NearbyPlace, CommuteResult, LocationScore, LocationPrecision, CentralStationEstimate } from '../types.js';
+import {
+  WARSZAWA_CENTRALNA,
+  WALK_METERS_PER_MINUTE,
+  METRO_SERVICE_RADIUS_M,
+  nearestMetroStations,
+  straightLineToCentralnaMeters,
+  warsawMetroLinesForStation,
+} from '../geo/metro.js';
+import type { NearbyMetro, WarsawMetroLine } from '../geo/metro.js';
 
 export type { AmenityResult, CommuteResult, LocationScore } from '../types.js';
+// Metro line membership is now table-driven (verified coordinates); re-export so existing
+// importers (location.ts, tests) keep resolving it from maps.
+export { warsawMetroLinesForStation };
 
 export interface AmenityPreference {
   type: string;
@@ -32,48 +44,9 @@ const MAX_PLACES_PER_TYPE = 3;
 const MAX_LINE_PLACES = 20;
 const MAX_DIRECTIONLESS_ANCHOR_FOR_STRICT_METERS = 3000;
 
-type WarsawMetroLine = 'M1' | 'M2';
-
-const WARSAW_METRO_STATIONS: Record<WarsawMetroLine, readonly string[]> = {
-  M1: [
-    'Kabaty', 'Natolin', 'Imielin', 'Stokłosy', 'Ursynów', 'Służew',
-    'Wilanowska', 'Wierzbno', 'Racławicka', 'Pole Mokotowskie',
-    'Politechnika', 'Centrum', 'Świętokrzyska', 'Ratusz Arsenał',
-    'Dworzec Gdański', 'Plac Wilsona', 'Marymont', 'Słodowiec',
-    'Stare Bielany', 'Wawrzyszew', 'Młociny',
-  ],
-  M2: [
-    'Bemowo', 'Ulrychów', 'Księcia Janusza', 'Młynów', 'Płocka',
-    'Rondo Daszyńskiego', 'Rondo ONZ', 'Świętokrzyska',
-    'Nowy Świat Uniwersytet', 'Centrum Nauki Kopernik',
-    'Stadion Narodowy', 'Dworzec Wileński', 'Szwedzka',
-    'Targówek Mieszkaniowy', 'Trocka', 'Zacisze',
-    'Kondratowicza', 'Bródno',
-  ],
-};
-
-function normalizePlaceName(name: string): string {
-  return name
-    .normalize('NFD')
-    .replace(/\p{Diacritic}/gu, '')
-    .toLowerCase()
-    .replace(/^(?:stacja\s+)?metr[oa]\s+/, '')
-    .replace(/^m[12]\s+/, '')
-    .replace(/\s+(?:metro|m[12])$/, '')
-    .replace(/[^a-z0-9]+/g, ' ')
-    .trim();
-}
-
-const WARSAW_METRO_STATION_KEYS: Record<WarsawMetroLine, ReadonlySet<string>> = {
-  M1: new Set(WARSAW_METRO_STATIONS.M1.map(normalizePlaceName)),
-  M2: new Set(WARSAW_METRO_STATIONS.M2.map(normalizePlaceName)),
-};
-
-/** Canonical Warsaw line membership derived from the official station network. */
-export function warsawMetroLinesForStation(name: string): WarsawMetroLine[] {
-  const key = normalizePlaceName(name);
-  return (['M1', 'M2'] as const).filter((line) => WARSAW_METRO_STATION_KEYS[line].has(key));
-}
+// Warsaw metro station data, coordinates, line membership, and nearest-station search live
+// in ../geo/metro.ts (verified, offline). warsawMetroLinesForStation is imported + re-exported
+// above; nearest-station lookups use nearestMetroStations.
 
 // For frequency estimation: route from the stop to a point ~2.5km north.
 // Using a local offset instead of a fixed city center ensures it works in any Polish city.
@@ -86,7 +59,8 @@ function localTransitDest(stopLat: number, stopLng: number): string {
 // ---------------------------------------------------------------------------
 
 const AMENITY_SEARCHES: Record<string, string[][]> = {
-  metro:       [['subway_station']],
+  // metro is NOT here — it is computed offline from the verified station table (geo/metro.ts),
+  // not from Google Places, so it can never return an invented station.
   tram:        [['tram_stop']],                          // tram_stop works in Warsaw; light_rail_station returns 0
   bus:         [['bus_stop']],                            // bus_stop for local stops; bus_station is intercity terminals
   airport:     [['airport']],
@@ -113,9 +87,7 @@ interface TransportConfig {
 }
 
 const TRANSPORT_CONFIG: Record<string, TransportConfig> = {
-  // Directions from station coordinates can choose a nearby bus and mislabel metro as
-  // route 122/103/etc. Metro line identity comes from the canonical station map above.
-  metro:       { walking: true,  transit: false, driving: false, checkFrequency: false, transitFallback: false },
+  // metro is computed offline (geo/metro.ts), so it has no Google transport config here.
   tram:        { walking: true,  transit: false, driving: false, checkFrequency: true,  transitFallback: false },
   bus:         { walking: true,  transit: false, driving: false, checkFrequency: true,  transitFallback: false },
   airport:     { walking: false, transit: true,  driving: true,  checkFrequency: false, transitFallback: false },
@@ -197,9 +169,11 @@ function unwrapCache<T>(entry: string): T { return (JSON.parse(entry) as { data:
 // Next Monday 10:00 Warsaw time — baseline for transit frequency queries
 // ---------------------------------------------------------------------------
 
-function getNextMondayWarsaw10am(): number {
+function getNextMondayWarsawTs(targetHour = 10): number {
   // Timezone-safe: uses Intl.DateTimeFormat for all Warsaw time checks.
   // Works correctly regardless of system timezone (UTC in Docker, Warsaw locally, etc.)
+  // Pinning transit routing to a fixed weekday hour keeps ETAs stable and reproducible
+  // (avoids "now"-optimism, weekend gaps, and rush-hour skew).
   const now = new Date();
 
   // Get current day-of-week and hour in Warsaw
@@ -214,7 +188,7 @@ function getNextMondayWarsaw10am(): number {
   const dayIdx = dayMap[weekday] ?? 0;
 
   let daysUntilMonday: number;
-  if (dayIdx === 1 && hour < 10) daysUntilMonday = 0;
+  if (dayIdx === 1 && hour < targetHour) daysUntilMonday = 0;
   else if (dayIdx === 0) daysUntilMonday = 1;
   else daysUntilMonday = (8 - dayIdx) % 7 || 7;
 
@@ -228,13 +202,14 @@ function getNextMondayWarsaw10am(): number {
   const m = parseInt(dateParts.find(p => p.type === 'month')!.value) - 1;
   const d = parseInt(dateParts.find(p => p.type === 'day')!.value);
 
-  // Guess UTC: 10:00 Warsaw is 08:00 UTC (CEST/UTC+2) or 09:00 UTC (CET/UTC+1)
-  const guessUtcMs = Date.UTC(y, m, d, 8, 0, 0);
+  // Guess UTC (targetHour Warsaw ≈ targetHour-2 UTC in CEST); the checkHour correction
+  // below fixes the ±1h CET/CEST offset automatically for any target hour.
+  const guessUtcMs = Date.UTC(y, m, d, targetHour - 2, 0, 0);
   // Check what hour Warsaw shows for this guess and adjust
   const checkHour = parseInt(new Intl.DateTimeFormat('en-US', {
     timeZone: 'Europe/Warsaw', hour: 'numeric', hour12: false,
   }).format(new Date(guessUtcMs)));
-  return Math.floor((guessUtcMs - (checkHour - 10) * 3_600_000) / 1000);
+  return Math.floor((guessUtcMs - (checkHour - targetHour) * 3_600_000) / 1000);
 }
 
 // ---------------------------------------------------------------------------
@@ -373,7 +348,7 @@ async function estimateTransitFrequency(
   const cached = getMapsCacheEntry(cacheKey);
   if (isCacheValid(cached)) return unwrapCache<FrequencyResult>(cached!);
 
-  const mondayTs = getNextMondayWarsaw10am();
+  const mondayTs = getNextMondayWarsawTs();
   const origin = `${stopLat},${stopLng}`;
 
   // Call 1: directions at Monday 10:00 — route to a local point ~2.5km away
@@ -484,6 +459,99 @@ async function estimateTransitFrequency(
 }
 
 // ---------------------------------------------------------------------------
+// Offline metro (verified station table) — never invents a station
+// ---------------------------------------------------------------------------
+
+/** Russian distance label from metres: "450 м" / "1,2 км". */
+function formatRuMeters(m: number): string {
+  if (m < 1000) return `${Math.round(m / 10) * 10} м`;
+  return `${(m / 1000).toFixed(1).replace('.', ',')} км`;
+}
+
+/** Localize a Google distance string ("4,2 km" / "850 m") to Russian units. */
+function ruDistanceText(text: string): string {
+  return text.replace(/\bkm\b/i, 'км').replace(/\bm\b/i, 'м');
+}
+
+function offlineMetroPlace(n: NearbyMetro, requestedLine?: WarsawMetroLine): NearbyPlace {
+  return {
+    name: n.station.name,
+    lineName: requestedLine ?? n.station.lines.join('/'),
+    walkingMinutes: n.walkMinutes,
+    distance: formatRuMeters(n.walkMeters),
+    distanceMeters: n.walkMeters,
+  };
+}
+
+/** Metro AmenityResult computed offline from coordinates (line-filtered when pref.line set). */
+function offlineMetroAmenity(lat: number, lng: number, pref: AmenityPreference): AmenityResult {
+  const near = nearestMetroStations(lat, lng, { line: pref.line, limit: MAX_PLACES_PER_TYPE });
+  const places = near.map((n) => offlineMetroPlace(n, pref.line));
+  const nearest = places[0] ?? null;
+  const withinLimit = nearest != null && nearest.walkingMinutes <= pref.maxMinutes;
+  return { type: 'metro', requestedLine: pref.line, places, nearest, withinLimit };
+}
+
+/** Expand one place's point distance into a ± range using the anchor uncertainty. Order-preserving:
+ *  unlike applyLocationUncertainty (which re-sorts by the derived range for gate selection), this
+ *  keeps the input's nearest-first-by-true-distance order for display. */
+function expandPlaceRange(place: NearbyPlace, radiusMin: number, radiusMax: number): NearbyPlace {
+  if (place.walkingMinutes < 0) return place;
+  const baseMeters = place.distanceMeters ?? place.walkingMinutes * 75;
+  const minMeters = baseMeters < radiusMin
+    ? radiusMin - baseMeters
+    : baseMeters > radiusMax ? baseMeters - radiusMax : 0;
+  const maxMeters = baseMeters + radiusMax;
+  const metersPerMinute = place.walkingMinutes > 0 && baseMeters > 0 ? baseMeters / place.walkingMinutes : 75;
+  return {
+    ...place,
+    walkingMinutesRange: { min: Math.max(0, Math.floor(minMeters / metersPerMinute)), max: Math.max(1, Math.ceil(maxMeters / metersPerMinute)) },
+    distanceMetersRange: { min: minMeters, max: maxMeters },
+    approximate: true,
+  };
+}
+
+/** The 2 closest stations (any line) for the card, widened to ranges when location is approximate. */
+export function metroNearestWithUncertainty(
+  lat: number,
+  lng: number,
+  estimate?: LocationEstimateContext,
+): NearbyPlace[] {
+  // nearestMetroStations returns nearest-first by true distance — preserve that order for display.
+  const raw = nearestMetroStations(lat, lng, { limit: 2 }).map((n) => offlineMetroPlace(n));
+  if (!estimate || (estimate.uncertaintyMeters <= 0 && estimate.anchorDistanceMeters <= 0)) return raw;
+  const radiusMin = Math.max(0, estimate.anchorDistanceMeters - estimate.uncertaintyMeters);
+  const radiusMax = estimate.anchorDistanceMeters + estimate.uncertaintyMeters;
+  return raw.map((p) => expandPlaceRange(p, radiusMin, radiusMax));
+}
+
+/**
+ * Public-transport estimate to Warszawa Centralna, pinned to a weekday 11:00 departure and
+ * returned as a min-based range. Falls back to an offline straight-line distance (no time)
+ * if the routing API fails — never a fabricated time.
+ */
+export async function centralStationEstimate(
+  lat: number,
+  lng: number,
+  approximate = false,
+  uncertaintyMeters = 0,
+): Promise<CentralStationEstimate> {
+  try {
+    const c = await calculateCommute(lat, lng, WARSZAWA_CENTRALNA.address, 'transit', getNextMondayWarsawTs(11));
+    const min = c.durationMinutes;
+    const extra = approximate ? Math.ceil(uncertaintyMeters / WALK_METERS_PER_MINUTE) : 0;
+    const max = Math.max(min + 1, Math.ceil(min * 1.25) + extra);
+    return { distanceText: ruDistanceText(c.distance), durationMinRange: { min, max } };
+  } catch (err) {
+    console.error('[maps] Centralna estimate failed:', err instanceof Error ? err.message : err);
+    return {
+      distanceText: `~${formatRuMeters(straightLineToCentralnaMeters(lat, lng))}`,
+      durationMinRange: null,
+    };
+  }
+}
+
+// ---------------------------------------------------------------------------
 // findNearbyAmenities — smart, transport-mode-aware
 // ---------------------------------------------------------------------------
 
@@ -495,6 +563,12 @@ export async function findNearbyAmenities(
   const results: AmenityResult[] = [];
 
   for (const pref of amenityPrefs) {
+    // Metro is deterministic and offline — nearest station(s) from the verified table.
+    if (pref.type === 'metro') {
+      results.push(offlineMetroAmenity(lat, lng, pref));
+      continue;
+    }
+
     const searches = AMENITY_SEARCHES[pref.type];
     if (!searches) {
       console.warn(`[maps] Unknown amenity type "${pref.type}", skipping`);
@@ -671,7 +745,7 @@ export async function findNearbyAmenities(
     const needTransitFallback = tc.transitFallback;
 
     if ((needTransit || needTransitFallback) && destinations) {
-      const mondayTs = getNextMondayWarsaw10am();
+      const mondayTs = getNextMondayWarsawTs();
       const transitUrl = `${MAPS_BASE}/distancematrix/json?origins=${lat},${lng}&destinations=${destinations}&mode=transit&departure_time=${mondayTs}&language=pl&key=${API_KEY}`;
       try {
         const transitRes = await fetchJson<DistanceMatrixResponse>(transitUrl);
@@ -810,13 +884,17 @@ export async function findNearbyAmenities(
 // ---------------------------------------------------------------------------
 
 export async function calculateCommute(
-  lat: number, lng: number, destAddress: string, mode = 'transit',
+  lat: number, lng: number, destAddress: string, mode = 'transit', departureTime?: number,
 ): Promise<CommuteResult> {
-  const cacheKey = `commute:${roundCoord(lat)}:${roundCoord(lng)}:${hashStr(destAddress)}:${mode}`;
+  // Fold the departure day into the cache key so a pinned weekday ETA stays stable within a day
+  // but refreshes across days.
+  const depKey = departureTime != null ? `:dep${Math.floor(departureTime / 86_400)}` : '';
+  const cacheKey = `commute:${roundCoord(lat)}:${roundCoord(lng)}:${hashStr(destAddress)}:${mode}${depKey}`;
   const cached = getMapsCacheEntry(cacheKey);
   if (isCacheValid(cached)) return unwrapCache<CommuteResult>(cached!);
 
-  const url = `${MAPS_BASE}/distancematrix/json?origins=${lat},${lng}&destinations=${encodeURIComponent(destAddress)}&mode=${mode}&language=pl&key=${API_KEY}`;
+  const depParam = departureTime != null ? `&departure_time=${departureTime}` : '';
+  const url = `${MAPS_BASE}/distancematrix/json?origins=${lat},${lng}&destinations=${encodeURIComponent(destAddress)}&mode=${mode}${depParam}&language=pl&key=${API_KEY}`;
   const res = await fetchJson<DistanceMatrixResponse>(url);
 
   if (res.status !== 'OK') {
@@ -935,6 +1013,8 @@ export function createUnknownLocationScore(
       uncertain: true,
     })),
     commute: null,
+    metroNearest: [],
+    centralStation: null,
     overallScore: 50,
     mapsLink: `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(city)}`,
     precision: 'none',
@@ -964,6 +1044,19 @@ export async function scoreLocation(
       )
     : pointAmenities;
 
+  const approximate = !!estimate && estimate.precision !== 'exact' && estimate.precision !== 'street';
+
+  // Always-present card content: 2 nearest stations + transit time to Warszawa Centralna — but
+  // only inside the Warsaw metro service area. For a listing in another city (multi-city search),
+  // the nearest "Warsaw" station would be 100+ km away, so suppress metro + Centralna entirely
+  // (also spares a pointless Distance Matrix call).
+  const nearestStation = nearestMetroStations(lat, lng, { limit: 1 })[0];
+  const inMetroArea = nearestStation != null && nearestStation.crowMeters <= METRO_SERVICE_RADIUS_M;
+  const metroNearest = inMetroArea ? metroNearestWithUncertainty(lat, lng, estimate) : [];
+  const centralStation = inMetroArea
+    ? await centralStationEstimate(lat, lng, approximate, estimate?.uncertaintyMeters ?? 0)
+    : null;
+
   let commute: CommuteResult | null = null;
   if (workAddress) {
     try {
@@ -976,17 +1069,18 @@ export async function scoreLocation(
   const uncertain = amenities.filter(a => a.uncertain).length;
   const overallScore = total === 0 ? 100 : Math.round(((met + uncertain * 0.5) / total) * 100);
 
-  const approximate = estimate && estimate.precision !== 'exact' && estimate.precision !== 'street';
   const uncertaintyText = estimate && estimate.uncertaintyMeters >= 1000
     ? `${(estimate.uncertaintyMeters / 1000).toLocaleString('ru-RU', { maximumFractionDigits: 1 })} км`
     : `${estimate?.uncertaintyMeters ?? 0} м`;
   const locationWarning = approximate
-    ? `примерная локация: ${estimate.source}, погрешность ±${uncertaintyText}`
+    ? `примерная локация: ${estimate!.source}, погрешность ±${uncertaintyText}`
     : undefined;
 
   return {
     amenities,
     commute,
+    metroNearest,
+    centralStation,
     overallScore,
     mapsLink: `https://www.google.com/maps?q=${lat},${lng}`,
     precision: estimate?.precision,

@@ -393,19 +393,19 @@ async function sendRentalCard(
   locationScore: LocationScore | null,
   fitReason?: string | null,
 ): Promise<void> {
-  const rawCard = formatRichRentalNotification(
+  // The result id is rendered on line 1 of the card itself now, so no external prefix.
+  const card = formatRichRentalNotification(
     listing,
     parsedData ?? undefined,
     locationScore ?? undefined,
+    resultId,
     fitReason,
   );
-  const card = prefixResultIdHtml(resultId, rawCard);
 
   if (listing.photos.length > 0) {
-    const caption = prefixResultIdPlain(resultId, rawCard);
-    if (captionLength(caption) <= CAPTION_LIMIT) {
+    if (captionLength(card) <= CAPTION_LIMIT) {
       try {
-        await sendPhotosFn(chatId, listing.photos.slice(0, 10), caption, { resultId });
+        await sendPhotosFn(chatId, listing.photos.slice(0, 10), card, { resultId });
         return;
       } catch (e) {
         console.error('[tools] photo+caption failed:', e instanceof Error ? e.message : e);
@@ -706,9 +706,10 @@ async function execFindRentals(
         }
       }
 
-      // Location scoring — geocode if no coordinates
+      // Location scoring — geocode if no coordinates. Always on: every card shows nearest
+      // metro + Warszawa Centralna, even without an amenity/workAddress filter.
       let locationScore: LocationScore | null = null;
-      const wantLocation = amenities.length > 0 || !!workAddress;
+      const wantLocation = true;
       const amenityPrefs: AmenityPreference[] = amenities.map((a) => ({
         type: a.type,
         maxMinutes: a.maxMinutes,

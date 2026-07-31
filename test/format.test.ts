@@ -9,15 +9,89 @@ test('computeRentalCost sums najem + czynsz + media', () => {
   assert.equal(c.total, 4000 + 600 + 200); // adminFee overrides listing.rent
 });
 
-test('card has no pet/smoking icons and shows WFH strip', () => {
+test('line 1 is rooms · m² · total price · [id] with no emoji', () => {
+  const card = formatRentalCard(mkListing(), mkParsed(), null, 'ABC234');
+  const line1 = card.split('\n')[0];
+  assert.match(line1, /3к/);
+  assert.match(line1, /60m²/);
+  assert.match(line1, /zł/);
+  assert.match(line1, /\[ABC234\]/);
+  assert.doesNotMatch(line1, /[🏠💰🚇🔥📞]/); // no emoji on the headline
+});
+
+test('internet and "2 offices" tokens are dropped', () => {
   const card = formatRentalCard(
-    mkListing({ hasInternet: true, hasElevator: true, phone: '123' }),
-    mkParsed({ twoOfficeCapable: true, quiet: 'quiet', internetType: 'fiber' }),
+    mkListing({ hasInternet: true }),
+    mkParsed({ twoOfficeCapable: true, internetType: 'fiber' }),
     null,
+    'ABC234',
   );
-  assert.doesNotMatch(card, /🐾|🚬/);          // pet/smoking removed
-  assert.match(card, /2 офиса/);               // persona strip present
-  assert.match(card, /оптика/);
+  assert.doesNotMatch(card, /интернет|оптика|2 офиса/);
+});
+
+test('metro line shows the 2 nearest stations with walk distance/time', () => {
+  const score = mkScore([], {
+    metroNearest: [
+      { name: 'Politechnika', lineName: 'M1', walkingMinutes: 6, distance: '450 м', distanceMeters: 450 },
+      { name: 'Pole Mokotowskie', lineName: 'M1', walkingMinutes: 9, distance: '700 м', distanceMeters: 700 },
+    ],
+  });
+  const card = formatRentalCard(mkListing(), mkParsed(), score, 'ABC234');
+  assert.match(card, /Метро: Politechnika \(M1\) 450 м · 6 мин · Pole Mokotowskie \(M1\) 700 м · 9 мин/);
+});
+
+test('no coords → metro line says stations unknown', () => {
+  const card = formatRentalCard(mkListing(), mkParsed(), mkScore([], { metroNearest: [], precision: 'none' }), 'ABC234');
+  assert.match(card, /Метро: станции неизвестны/);
+});
+
+test('central station line shows distance + a min-based time range', () => {
+  const score = mkScore([], {
+    metroNearest: [{ name: 'Centrum', lineName: 'M1', walkingMinutes: 3, distance: '250 м', distanceMeters: 250 }],
+    centralStation: { distanceText: '4,2 км', durationMinRange: { min: 17, max: 21 } },
+  });
+  const card = formatRentalCard(mkListing(), mkParsed(), score, 'ABC234');
+  assert.match(card, /Центральный вокзал: 4,2 км · ~17–21 мин/);
+});
+
+test('central station line renders "не определён" when routing failed', () => {
+  const score = mkScore([], {
+    metroNearest: [{ name: 'Centrum', lineName: 'M1', walkingMinutes: 3, distance: '250 м', distanceMeters: 250 }],
+    centralStation: null,
+  });
+  const card = formatRentalCard(mkListing(), mkParsed(), score, 'ABC234');
+  assert.match(card, /Центральный вокзал: не определён/);
+});
+
+test('approximate location shows metro range and a warning on the central line', () => {
+  const score = mkScore([], {
+    precision: 'approximate',
+    locationWarning: 'примерная локация: описание, погрешность ±150 м',
+    metroNearest: [{
+      name: 'Bemowo', lineName: 'M2', walkingMinutes: 0, distance: '',
+      walkingMinutesRange: { min: 11, max: 16 }, distanceMetersRange: { min: 850, max: 1150 }, approximate: true,
+    }],
+    centralStation: { distanceText: '~5,0 км', durationMinRange: { min: 25, max: 35 } },
+  });
+  const card = formatRentalCard(mkListing(), mkParsed(), score, 'ABC234');
+  assert.match(card, /Bemowo \(M2\) ~850 м–1,2 км · ~11–16 мин/);
+  assert.match(card, /примерная локация/);
+});
+
+test('line 4 carries contract type and kaucja', () => {
+  const card = formatRentalCard(
+    mkListing(),
+    mkParsed({ contractType: 'najem_okazjonalny', deposit: 4500 }),
+    null,
+    'ABC234',
+  );
+  assert.match(card, /Umowa: najem okazjonalny/);
+  assert.match(card, /Kaucja: /);
+});
+
+test('the listing link is the last line', () => {
+  const card = formatRentalCard(mkListing(), mkParsed({ descriptionSummary: 'ładne mieszkanie' }), null, 'ABC234');
+  assert.equal(card.split('\n').at(-1), 'http://example.com/x');
 });
 
 test('over-budget card is trimmed under the caption budget, essentials kept', () => {
@@ -28,118 +102,15 @@ test('over-budget card is trimmed under the caption budget, essentials kept', ()
     restrictions: ['только студенты'.repeat(30)],
     contractType: 'najem_okazjonalny',
   });
-  // Assert the tighter budget the trim actually targets (CAPTION_LIMIT - 24, leaving room
-  // for the interactive "[ID] " prefix), and pass a long non-droppable fit line on top.
-  const card = formatRentalCard(mkListing({ phone: '123' }), big, null, 'z'.repeat(200));
-  assert.ok(captionLength(card) <= CAPTION_LIMIT - 24, `visible length ${captionLength(card)} > ${CAPTION_LIMIT - 24}`);
-  assert.match(card, /\/мес/);                 // price kept
-  assert.match(card, /example\.com/);          // url kept
-  assert.match(card, /Kaucja/);                // contract/deposit kept
-  assert.match(card, /🔥/);                    // the fit line survives the trim
-});
-
-test('fit reason line renders when provided', () => {
-  const card = formatRentalCard(mkListing(), mkParsed(), null, '82 · 2 офиса · оптика · метро 4м');
-  assert.match(card, /82 · 2 офиса · оптика · метро 4м/);
-});
-
-test('card location line renders cafe/restaurant icons', () => {
-  const score = mkScore([
-    { type: 'cafe', places: [{ name: 'C', walkingMinutes: 4, distance: '' }], nearest: { name: 'C', walkingMinutes: 4, distance: '' }, withinLimit: true },
-    { type: 'restaurant', places: [{ name: 'R', walkingMinutes: 6, distance: '' }], nearest: { name: 'R', walkingMinutes: 6, distance: '' }, withinLimit: false },
-  ]);
-  const card = formatRentalCard(mkListing({ district: 'Wola' }), mkParsed(), score);
-  assert.match(card, /☕/);
-  assert.match(card, /🍽/);
-});
-
-test('metro result always shows station name and measured distance', () => {
-  const score = mkScore([{
-    type: 'metro',
-    places: [{ name: 'Racławicka', lineName: 'M1', walkingMinutes: 7, distance: '500 m', distanceMeters: 500 }],
-    nearest: { name: 'Racławicka', lineName: 'M1', walkingMinutes: 7, distance: '500 m', distanceMeters: 500 },
-    withinLimit: true,
-  }]);
-  const card = formatRentalCard(mkListing(), mkParsed(), score);
-  assert.match(card, /Racławicka \(M1\)/);
-  assert.match(card, /500 m · 7 мин/);
-});
-
-test('approximate metro result shows distance range and warning evidence', () => {
-  const score = mkScore([{
-    type: 'metro',
-    places: [{
-      name: 'Bemowo', lineName: 'M2', walkingMinutes: 0, distance: '1 m',
-      walkingMinutesRange: { min: 11, max: 16 },
-      distanceMetersRange: { min: 850, max: 1150 },
-      approximate: true,
-    }],
-    nearest: {
-      name: 'Bemowo', lineName: 'M2', walkingMinutes: 0, distance: '1 m',
-      walkingMinutesRange: { min: 11, max: 16 },
-      distanceMetersRange: { min: 850, max: 1150 },
-      approximate: true,
-    },
-    withinLimit: false,
-    uncertain: false,
-  }], {
-    precision: 'approximate',
-    locationWarning: 'примерная локация: описание, оценка ±150 м',
-    locationEvidence: '1000 m od metra',
+  const score = mkScore([], {
+    metroNearest: [{ name: 'Politechnika', lineName: 'M1', walkingMinutes: 6, distance: '450 м', distanceMeters: 450 }],
+    centralStation: { distanceText: '4,2 км', durationMinRange: { min: 17, max: 21 } },
   });
-  const card = formatRentalCard(mkListing(), mkParsed(), score);
-  assert.match(card, /Bemowo \(M2\)/);
-  assert.match(card, /~850 м–1,2 км · ~11–16 мин/);
-  assert.match(card, /1000 m od metra/);
-});
-
-test('unknown metro distance still identifies the requested line', () => {
-  const score = mkScore([{
-    type: 'metro',
-    requestedLine: 'M1',
-    places: [],
-    nearest: null,
-    withinLimit: false,
-    uncertain: true,
-  }], {
-    precision: 'none',
-    locationUnknown: true,
-    locationWarning: 'местоположение не удалось определить',
-  });
-
-  const card = formatRentalCard(mkListing(), mkParsed(), score);
-  assert.match(card, /метро M1: станция\/расстояние неизвестны/);
-  assert.match(card, /местоположение не удалось определить/);
-});
-
-test('partial Maps evidence renders a warning, not a false metro failure mark', () => {
-  const score = mkScore([{
-    type: 'metro',
-    requestedLine: 'M1',
-    places: [{
-      name: 'Ratusz Arsenał',
-      lineName: 'M1',
-      walkingMinutes: 30,
-      distance: '2 km',
-      distanceMetersRange: { min: 1800, max: 2200 },
-      walkingMinutesRange: { min: 27, max: 33 },
-      approximate: true,
-    }],
-    nearest: {
-      name: 'Ratusz Arsenał',
-      lineName: 'M1',
-      walkingMinutes: 30,
-      distance: '2 km',
-      distanceMetersRange: { min: 1800, max: 2200 },
-      walkingMinutesRange: { min: 27, max: 33 },
-      approximate: true,
-    },
-    withinLimit: false,
-    uncertain: true,
-    error: true,
-  }]);
-
-  const card = formatRentalCard(mkListing(), mkParsed(), score);
-  assert.match(card, /Ratusz Arsenał \(M1\).*⚠️/);
-  assert.doesNotMatch(card, /Ratusz Arsenał \(M1\).*✗/);
+  const card = formatRentalCard(mkListing(), big, score, 'ABC234', 'z'.repeat(200));
+  assert.ok(captionLength(card) <= CAPTION_LIMIT - 8, `visible length ${captionLength(card)} > ${CAPTION_LIMIT - 8}`);
+  assert.match(card, /\[ABC234\]/);                       // id kept
+  assert.match(card, /Метро: Politechnika/);              // metro kept
+  assert.match(card, /Центральный вокзал/);               // central kept
+  assert.match(card, /Kaucja/);                           // contract/deposit kept
+  assert.equal(card.split('\n').at(-1), 'http://example.com/x'); // link stays last
 });
