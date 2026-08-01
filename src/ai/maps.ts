@@ -25,6 +25,10 @@ export interface AmenityPreference {
   maxMinutes: number;
   /** Optional transit line constraint. Currently supported for Warsaw metro (M1/M2). */
   line?: 'M1' | 'M2';
+  /** Optional explicit metro-station whitelist (real station names). When set, proximity is
+   *  measured to the nearest station on this list instead of a whole line. Names are validated
+   *  against the verified table; unknown names are dropped. */
+  stations?: string[];
 }
 
 export interface LocationEstimateContext {
@@ -483,9 +487,9 @@ function offlineMetroPlace(n: NearbyMetro, requestedLine?: WarsawMetroLine): Nea
   };
 }
 
-/** Metro AmenityResult computed offline from coordinates (line-filtered when pref.line set). */
+/** Metro AmenityResult computed offline: nearest station on the requested whitelist, else line, else any. */
 function offlineMetroAmenity(lat: number, lng: number, pref: AmenityPreference): AmenityResult {
-  const near = nearestMetroStations(lat, lng, { line: pref.line, limit: MAX_PLACES_PER_TYPE });
+  const near = nearestMetroStations(lat, lng, { line: pref.line, stations: pref.stations, limit: MAX_PLACES_PER_TYPE });
   const places = near.map((n) => offlineMetroPlace(n, pref.line));
   const nearest = places[0] ?? null;
   const withinLimit = nearest != null && nearest.walkingMinutes <= pref.maxMinutes;

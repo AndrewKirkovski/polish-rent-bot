@@ -5,6 +5,7 @@ import {
   WARSZAWA_CENTRALNA,
   METRO_SERVICE_RADIUS_M,
   nearestMetroStations,
+  resolveStationNames,
   warsawMetroLinesForStation,
   haversineMeters,
   walkMetersFromCrow,
@@ -64,6 +65,26 @@ test('haversine + walk model are sane', () => {
 test('Warszawa Centralna sits next to Centrum', () => {
   const d = haversineMeters(WARSZAWA_CENTRALNA.lat, WARSZAWA_CENTRALNA.lng, 52.23101, 21.01019);
   assert.ok(d < 1000, `Centralna↔Centrum ${d} m`);
+});
+
+test('resolveStationNames validates against the table, dedups, drops hallucinations', () => {
+  const r = resolveStationNames(['Politechnika', 'Centrum', 'Bemowo Ratusz', 'Politechnika', 'Nieistniejąca']);
+  assert.deepEqual(r.map((s) => s.name), ['Politechnika', 'Centrum']);
+});
+
+test('nearestMetroStations honors an explicit station whitelist', () => {
+  // Physically at Kabaty (south terminus), but the whitelist is central → a central station wins.
+  const near = nearestMetroStations(52.13208, 21.06507, { stations: ['Świętokrzyska', 'Centrum'], limit: 1 });
+  assert.ok(['Świętokrzyska', 'Centrum'].includes(near[0]!.station.name), near[0]?.station.name);
+  // A fully hallucinated whitelist yields nothing (never falls back to inventing a station).
+  assert.equal(nearestMetroStations(52.23, 21.01, { stations: ['Nowhere', 'Fake'] }).length, 0);
+});
+
+test('prompt METRO REFERENCE station names are all real (guards table/prompt drift)', () => {
+  const M1 = ['Kabaty', 'Natolin', 'Imielin', 'Stokłosy', 'Ursynów', 'Służew', 'Wilanowska', 'Wierzbno', 'Racławicka', 'Pole Mokotowskie', 'Politechnika', 'Centrum', 'Świętokrzyska', 'Ratusz Arsenał', 'Dworzec Gdański', 'Plac Wilsona', 'Marymont', 'Słodowiec', 'Stare Bielany', 'Wawrzyszew', 'Młociny'];
+  const M2 = ['Bemowo', 'Ulrychów', 'Księcia Janusza', 'Młynów', 'Płocka', 'Rondo Daszyńskiego', 'Rondo ONZ', 'Świętokrzyska', 'Nowy Świat-Uniwersytet', 'Centrum Nauki Kopernik', 'Stadion Narodowy', 'Dworzec Wileński', 'Szwedzka', 'Targówek Mieszkaniowy', 'Trocka', 'Zacisze', 'Kondratowicza', 'Bródno'];
+  assert.equal(resolveStationNames(M1).length, 21, 'all M1 reference names resolve');
+  assert.equal(resolveStationNames(M2).length, 18, 'all M2 reference names resolve');
 });
 
 test('service-area guard: any Warsaw point is in-area, other cities are out', () => {

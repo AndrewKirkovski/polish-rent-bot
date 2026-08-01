@@ -125,6 +125,24 @@ export function warsawMetroLinesForStation(name: string): WarsawMetroLine[] {
   return s ? [...s.lines] : [];
 }
 
+/**
+ * Resolve a list of station names to real stations from the verified table, dropping any name
+ * that isn't a real station (the anti-hallucination guard for AI-produced whitelists). Order and
+ * de-duplication follow the input.
+ */
+export function resolveStationNames(names: readonly string[]): MetroStation[] {
+  const out: MetroStation[] = [];
+  const seen = new Set<string>();
+  for (const name of names) {
+    const s = STATION_BY_KEY.get(normalizeStationName(name));
+    if (s && !seen.has(s.name)) {
+      seen.add(s.name);
+      out.push(s);
+    }
+  }
+  return out;
+}
+
 export interface NearbyMetro {
   station: MetroStation;
   crowMeters: number;
@@ -134,17 +152,21 @@ export interface NearbyMetro {
 
 /**
  * The nearest metro stations to a coordinate, sorted by straight-line distance.
- * Deterministic and offline — never invents a station. Pass `line` to restrict to M1/M2.
+ * Deterministic and offline — never invents a station. Restrict the candidate pool with
+ * `stations` (an explicit whitelist, validated against the table) or `line` (whole M1/M2).
  */
 export function nearestMetroStations(
   lat: number,
   lng: number,
-  opts: { line?: WarsawMetroLine; limit?: number } = {},
+  opts: { line?: WarsawMetroLine; stations?: readonly string[]; limit?: number } = {},
 ): NearbyMetro[] {
   const limit = opts.limit ?? 2;
-  const pool = opts.line
-    ? WARSAW_METRO_STATIONS.filter((s) => s.lines.includes(opts.line!))
-    : WARSAW_METRO_STATIONS;
+  const pool: readonly MetroStation[] =
+    opts.stations && opts.stations.length > 0
+      ? resolveStationNames(opts.stations)
+      : opts.line
+        ? WARSAW_METRO_STATIONS.filter((s) => s.lines.includes(opts.line!))
+        : WARSAW_METRO_STATIONS;
   return pool
     .map((station) => {
       const crow = haversineMeters(lat, lng, station.lat, station.lng);

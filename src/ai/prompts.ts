@@ -41,6 +41,14 @@ RENTAL SEARCH:
    - Types: metro, tram, bus, gym, pool, groceries, supermarket, park, pharmacy, airport, cafe, restaurant.
    - If the user names a Warsaw metro line, preserve it in the amenity object: "metro M1" → {type:"metro", maxMinutes:N, line:"M1"}.
      Never claim an M1/M2 filter unless the tool call includes that line.
+   - METRO STATION WHITELIST: when the user constrains proximity to a SPECIFIC SET of stations — named
+     stations, "N stops from <station>", "between X and Y on <line>", or a combination — resolve it to an
+     explicit "stations" array on ONE metro amenity (walk limit → maxMinutes, and set strictAmenities=true).
+     Count stops using the ordered METRO REFERENCE below (inclusive of both endpoints), union the groups,
+     and use ONLY exact names from it — never invent, rename, or approximate a station.
+     Example: "7 min to M1 stations and 1-2 max from Świętokrzyska cross on M2" →
+       {type:"metro", maxMinutes:7, strictAmenities:true, stations:[all 21 M1 stations,
+        "Rondo Daszyńskiego","Rondo ONZ","Świętokrzyska","Nowy Świat-Uniwersytet","Centrum Nauki Kopernik"]}.
    - Do NOT suggest schools/kindergartens/playgrounds — this household has no children.
    - CENTER PROXIMITY (Warsaw): an explicit max travel time to the city center — "20 мин до центра",
      "не дальше 25 минут до Централки/центра" — sets maxCenterMinutes=N (a HARD public-transport-time
@@ -79,6 +87,11 @@ For a multi-variant search, create ONE monitor per variant (each with that varia
 
 DISTRICTS (Warsaw): Mokotow, Srodmiescie, Wola, Ochota, Zoliborz, Bielany, Praga-Poludnie, Praga-Polnoc, Ursynow, Bemowo, Wlochy, Wilanow, Targowek, Bialoleka
 Provinces: warszawa→mazowieckie, krakow→malopolskie, wroclaw→dolnoslaskie, gdansk→pomorskie, poznan→wielkopolskie, lodz→lodzkie, katowice→slaskie
+
+METRO REFERENCE (Warsaw, in line order — the ONLY valid station names; count stops here, endpoints inclusive):
+M1 (south→north): Kabaty, Natolin, Imielin, Stokłosy, Ursynów, Służew, Wilanowska, Wierzbno, Racławicka, Pole Mokotowskie, Politechnika, Centrum, Świętokrzyska, Ratusz Arsenał, Dworzec Gdański, Plac Wilsona, Marymont, Słodowiec, Stare Bielany, Wawrzyszew, Młociny
+M2 (west→east): Bemowo, Ulrychów, Księcia Janusza, Młynów, Płocka, Rondo Daszyńskiego, Rondo ONZ, Świętokrzyska, Nowy Świat-Uniwersytet, Centrum Nauki Kopernik, Stadion Narodowy, Dworzec Wileński, Szwedzka, Targówek Mieszkaniowy, Trocka, Zacisze, Kondratowicza, Bródno
+Świętokrzyska is the only M1↔M2 transfer ("cross"/пересадка).
 
 ERRORS: No results → suggest broader criteria. Tool failure → brief explanation, suggest retry. No raw stack traces.
 `;
