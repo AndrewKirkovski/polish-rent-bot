@@ -12,7 +12,7 @@ import type { AmenityPreference } from '../ai/maps.js';
 import { computeRentalCost, exceedsBudgetFloor } from '../cost.js';
 import { searchRentalListings, resolveCityId } from '../search/rental-search.js';
 import { enrichRentalListing } from '../search/enrich-listing.js';
-import { checkAmenityGate, resolveStrictAmenities } from '../search/amenity-gate.js';
+import { checkAmenityGate, checkCenterGate, resolveStrictAmenities } from '../search/amenity-gate.js';
 import { notificationDedupKey } from '../search/listing-fingerprint.js';
 import { computeFitScore, preScore } from '../search/fit-score.js';
 import { genResultId } from '../utils/result-id.js';
@@ -33,6 +33,7 @@ interface RentalConfig {
   roomsTo?: number;
   areaFrom?: number;
   areaTo?: number;
+  maxCenterMinutes?: number;
   ownerType?: 'ALL' | 'PRIVATE' | 'AGENCY';
   limit?: number;
   amenities?: AmenityPreference[];
@@ -494,6 +495,14 @@ export function startScheduler(
                 if (!gate.pass) {
                   console.log(`[scheduler] Amenity reject "${workingListing.title}": ${gate.reason}`);
                   recordMonitorRejection(monitor.id, workingListing, 'amenity', gate.reason ?? 'далеко до удобств');
+                  markListingSeen(monitor.id, workingListing.platform, workingListing.platformId, workingListing.url, workingListing.title, workingListing.price);
+                  continue;
+                }
+
+                const centerGate = checkCenterGate(locationScore, config.maxCenterMinutes, locationScore?.precision);
+                if (!centerGate.pass) {
+                  console.log(`[scheduler] Center reject "${workingListing.title}": ${centerGate.reason}`);
+                  recordMonitorRejection(monitor.id, workingListing, 'amenity', centerGate.reason ?? 'далеко от центра');
                   markListingSeen(monitor.id, workingListing.platform, workingListing.platformId, workingListing.url, workingListing.title, workingListing.price);
                   continue;
                 }

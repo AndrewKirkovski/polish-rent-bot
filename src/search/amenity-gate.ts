@@ -118,3 +118,25 @@ export function checkAmenityGate(
 
   return { pass: true };
 }
+
+/**
+ * Hard filter on public-transport time to the city center (Warszawa Centralna). Mirrors the
+ * amenity gate's leniency: unknown/district-only locations and routing failures keep the listing
+ * (with the card's warning) rather than falsely rejecting. Rejects only when even the optimistic
+ * (min) transit time already exceeds the limit.
+ */
+export function checkCenterGate(
+  locationScore: LocationScore | null,
+  maxCenterMinutes: number | undefined,
+  precision: LocationPrecision | undefined,
+): AmenityGateResult {
+  if (maxCenterMinutes == null) return { pass: true };
+  if (!locationScore || precision === 'none' || precision === 'district') return { pass: true };
+  const central = locationScore.centralStation;
+  if (!central || !central.durationMinRange) return { pass: true }; // routing unknown → keep-with-flag
+  if (central.durationMinRange.min > maxCenterMinutes) {
+    const { min, max } = central.durationMinRange;
+    return { pass: false, reason: `центр (Warszawa Centralna): ~${min}–${max} мин > лимит ${maxCenterMinutes} мин` };
+  }
+  return { pass: true };
+}

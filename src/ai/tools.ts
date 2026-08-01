@@ -10,7 +10,7 @@ import type { AmenityPreference } from './maps.js';
 import { formatRichRentalNotification, formatRichItemNotification, splitMessage, captionLength } from '../bot/format.js';
 import { searchRentalListings, CITY_PROVINCE_MAP, resolveCityId } from '../search/rental-search.js';
 import { enrichRentalListing } from '../search/enrich-listing.js';
-import { checkAmenityGate, resolveStrictAmenities } from '../search/amenity-gate.js';
+import { checkAmenityGate, checkCenterGate, resolveStrictAmenities } from '../search/amenity-gate.js';
 import { computeFitScore, preScore } from '../search/fit-score.js';
 import { isSoftRejection, type RejectionCategory } from '../search/rejection.js';
 import {
@@ -170,6 +170,10 @@ export const TOOL_DEFINITIONS: Tool[] = [
           enum: ['transit', 'driving', 'walking', 'bicycling'],
           description: 'Commute transport mode (default: transit)',
         },
+        maxCenterMinutes: {
+          type: 'number',
+          description: 'HARD max public-transport minutes to the city center (Warszawa Centralna). Set from an explicit limit like "20 min to center" / "не дальше 25 минут до центра". Warsaw only.',
+        },
         maxResults: {
           type: 'number',
           description: 'Number of final results to show (default 5, max 10)',
@@ -263,6 +267,7 @@ export const TOOL_DEFINITIONS: Tool[] = [
         },
         workAddress: { type: 'string', description: 'Work/commute destination address' },
         commuteMode: { type: 'string', enum: ['transit', 'driving', 'walking', 'bicycling'] },
+        maxCenterMinutes: { type: 'number', description: 'HARD max public-transport minutes to Warszawa Centralna (city center). Warsaw only. Persisted in monitor config.' },
         contractPreference: { type: 'string', enum: ['najem_okazjonalny', 'any'] },
         rejectionCriteria: {
           type: 'string',
@@ -506,6 +511,7 @@ async function execFindRentals(
   const amenities = (input.amenities as AmenityPreference[] | undefined) ?? [];
   const workAddress = input.workAddress as string | undefined;
   const commuteMode = (input.commuteMode as string | undefined) ?? 'transit';
+  const maxCenterMinutes = input.maxCenterMinutes as number | undefined;
   const maxResults = Math.min(Math.max((input.maxResults as number) || 5, 1), 10);
   const contractPreference = input.contractPreference as string | undefined;
   const rejectionCriteria = input.rejectionCriteria as string | undefined;
@@ -768,6 +774,13 @@ async function execFindRentals(
         continue;
       }
 
+      const centerGate = checkCenterGate(locationScore, maxCenterMinutes, locationScore?.precision);
+      if (!centerGate.pass) {
+        // SOFT: too far from the city center (Warszawa Centralna) by public transport.
+        await emitReject(resultId, enrichedListing, 'amenity', centerGate.reason ?? 'слишком далеко от центра', true);
+        continue;
+      }
+
       // ---- STREAM: send card to user immediately (fit score + best-fit signals on the card) ----
       const fit = computeFitScore(enrichedListing, parsedData, locationScore);
       const fitReason = `${fit.score}${fit.reason ? ' · ' + fit.reason : ''}`;
@@ -972,7 +985,7 @@ async function execCreateMonitor(
   const configKeys = [
     'city', 'districts', 'province', 'priceFrom', 'priceTo',
     'roomsFrom', 'roomsTo', 'areaFrom', 'areaTo', 'ownerType',
-    'query', 'mandatoryKeywords', 'workAddress', 'commuteMode', 'amenities',
+    'query', 'mandatoryKeywords', 'workAddress', 'commuteMode', 'maxCenterMinutes', 'amenities',
     'contractPreference', 'platforms', 'rejectionCriteria', 'strictAmenities', 'limit',
   ];
   for (const key of configKeys) {
@@ -1104,6 +1117,12 @@ async function execListMonitors(
       const rf = config.roomsFrom as number;
       const rt = config.roomsTo as number | undefined;
       parts.push(`  Rooms: ${rt != null && rt !== rf ? `${rf}-${rt}` : rf}`);
+    }
+    if (config.areaFrom != null || config.areaTo != null) {
+      parts.push(`  Area: ${config.areaFrom ?? '?'}-${config.areaTo ?? '?'} m²`);
+    }
+    if (config.maxCenterMinutes != null) {
+      parts.push(`  Max to center (Warszawa Centralna): ${config.maxCenterMinutes} min`);
     }
     if (config.amenities) {
       const amens = config.amenities as AmenityPreference[];

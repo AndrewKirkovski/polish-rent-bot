@@ -1,8 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { checkAmenityGate } from '../src/search/amenity-gate.js';
+import { checkAmenityGate, checkCenterGate } from '../src/search/amenity-gate.js';
 import { mkScore } from './helpers.js';
 import type { LocationScore } from '../src/types.js';
+
+function withCentral(minutes: { min: number; max: number } | null): LocationScore {
+  return mkScore([], { centralStation: minutes ? { distanceText: '4 км', durationMinRange: minutes } : { distanceText: '~9 км', durationMinRange: null } });
+}
 
 function metro(min: number, within: boolean): LocationScore {
   return mkScore([{ type: 'metro', places: [{ name: 'M', walkingMinutes: min, distance: '' }], nearest: { name: 'M', walkingMinutes: min, distance: '' }, withinLimit: within }]);
@@ -29,6 +33,30 @@ test('no coords (precision none) → keep-with-flag, never dropped', () => {
 test('district centroid stays with a warning instead of being rejected', () => {
   const g = checkAmenityGate(metro(0, true), [{ type: 'metro', maxMinutes: 7, line: 'M1' }], 'district', true);
   assert.equal(g.pass, true);
+});
+
+test('center filter: no maxCenterMinutes → always pass', () => {
+  assert.equal(checkCenterGate(withCentral({ min: 40, max: 50 }), undefined, 'exact').pass, true);
+});
+
+test('center filter: within limit → pass', () => {
+  assert.equal(checkCenterGate(withCentral({ min: 17, max: 21 }), 25, 'exact').pass, true);
+});
+
+test('center filter: optimistic time over limit → reject with reason', () => {
+  const g = checkCenterGate(withCentral({ min: 30, max: 38 }), 25, 'exact');
+  assert.equal(g.pass, false);
+  assert.match(g.reason!, /центр/);
+  assert.match(g.reason!, /25/);
+});
+
+test('center filter: unknown/district location → keep-with-flag', () => {
+  assert.equal(checkCenterGate(withCentral({ min: 40, max: 50 }), 25, 'district').pass, true);
+  assert.equal(checkCenterGate(null, 25, 'none').pass, true);
+});
+
+test('center filter: routing failed (no time) → keep-with-flag, not a false reject', () => {
+  assert.equal(checkCenterGate(withCentral(null), 25, 'exact').pass, true);
 });
 
 test('non-walking amenity (groceries) is also enforced', () => {

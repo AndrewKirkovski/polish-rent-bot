@@ -42,6 +42,9 @@ RENTAL SEARCH:
    - If the user names a Warsaw metro line, preserve it in the amenity object: "metro M1" → {type:"metro", maxMinutes:N, line:"M1"}.
      Never claim an M1/M2 filter unless the tool call includes that line.
    - Do NOT suggest schools/kindergartens/playgrounds — this household has no children.
+   - CENTER PROXIMITY (Warsaw): an explicit max travel time to the city center — "20 мин до центра",
+     "не дальше 25 минут до Централки/центра" — sets maxCenterMinutes=N (a HARD public-transport-time
+     filter to Warszawa Centralna). Leave unset for a vague "ближе к центру" preference.
    - An explicit maximum ("7 min walk", "no more than 10 min") is a HARD constraint: set strictAmenities=true.
      Leave it false only for a non-binding preference ("metro nearby would be nice"). Hard listings where ANY
      requested amenity exceeds its limit are rejected (each type uses its own metric — walking for metro/tram/bus/

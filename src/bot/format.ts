@@ -215,7 +215,8 @@ export function formatRentalCard(
   // Assemble. Essentials (line 1-4 + link) never drop; the safety-trim sheds rest content
   // in order: summary → positives → red flags → details/restriction → fit.
   const assemble = (drop: { summary?: boolean; positives?: boolean; redFlags?: boolean; details?: boolean; fit?: boolean }): string => {
-    const parts: string[] = [headLine, metroLine, centralLine];
+    // Blank line after each of the first 3 lines (headline / metro / center) for readability.
+    const parts: string[] = [headLine, '', metroLine, '', centralLine, ''];
     if (payLineStr) parts.push(payLineStr);
     parts.push(titleLine);
     const dl = drop.details ? null : detailsLine(true);
