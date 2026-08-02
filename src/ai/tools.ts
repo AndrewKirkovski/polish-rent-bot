@@ -990,8 +990,7 @@ async function execCreateMonitor(
   ctx: UserContext,
 ): Promise<string> {
   const type = String(input.type ?? 'rental') as 'rental' | 'item';
-  const platformsInput = (input.platforms as string | undefined) ?? 'all';
-  const platform = platformsInput === 'all' ? 'all' : platformsInput;
+  const platform = (input.platforms as string | undefined) ?? 'all';
 
   // Build config from input, omitting undefined values
   const config: Record<string, unknown> = {};

@@ -287,11 +287,3 @@ export async function fetchAllPages(params: OlxSearchParams, maxPages = 25): Pro
   return allListings;
 }
 
-// Enrich listings with phone numbers (batched, with rate limiting)
-export async function enrichWithPhones(listings: Listing[], delayMs = 500): Promise<void> {
-  for (const listing of listings) {
-    const phone = await fetchOlxPhone(listing.platformId);
-    if (phone) listing.phone = phone;
-    await new Promise((r) => setTimeout(r, delayMs + Math.random() * delayMs));
-  }
-}

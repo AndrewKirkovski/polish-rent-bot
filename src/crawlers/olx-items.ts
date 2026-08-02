@@ -162,25 +162,5 @@ export async function fetchItemPhone(offerId: string): Promise<string | null> {
   }
 }
 
-export async function searchAllPages(params: ItemSearchParams, maxPages = 10): Promise<ItemListing[]> {
-  const all: ItemListing[] = [];
-  let offset = params.offset ?? 0;
-  const limit = params.limit ?? 40;
-
-  for (let page = 0; page < maxPages; page++) {
-    const result = await searchItems({ ...params, offset, limit });
-    all.push(...result.items);
-
-    console.log(`  OLX items page ${page + 1}: ${result.items.length} items (total: ${all.length}/${result.totalAvailable})`);
-
-    if (!result.hasNextPage || result.items.length === 0) break;
-    offset += limit;
-
-    await new Promise((r) => setTimeout(r, 1000 + Math.random() * 2000));
-  }
-
-  return all;
-}
-
 // Re-export city IDs from the rental crawler — same values
 export { OLX_CITIES } from './olx.js';

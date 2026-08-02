@@ -15,7 +15,6 @@ import { enrichRentalListing } from '../search/enrich-listing.js';
 import { checkAmenityGate, checkCenterGate, resolveStrictAmenities } from '../search/amenity-gate.js';
 import { notificationDedupKey } from '../search/listing-fingerprint.js';
 import { computeFitScore, preScore } from '../search/fit-score.js';
-import { genResultId } from '../utils/result-id.js';
 import { seedResultIdForFamily } from '../ai/tools.js';
 
 // ---------------------------------------------------------------------------

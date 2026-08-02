@@ -12,9 +12,7 @@
     "dashboard:dev": "pnpm --dir dashboard dev",
     "dashboard:build": "pnpm --dir dashboard build",
     "recon:olx-rooms": "tsx src/experiments/test-olx-rooms-districts.ts",
-    "recon:otodom": "tsx src/experiments/recon-otodom.ts",
-    "test:stealth": "tsx src/experiments/test-stealth.ts",
-    "test:login": "tsx src/experiments/test-login.ts"
+    "recon:otodom": "tsx src/experiments/recon-otodom.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.90.0",
