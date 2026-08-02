@@ -13,6 +13,7 @@
 
 import type { MonitorRejectionRow } from '../storage/db.js';
 import { REJECTION_LABEL, type RejectionCategory } from '../search/rejection.js';
+import { escapeHtml } from '../utils/html.js';
 
 /** Max links listed per soft category before collapsing the rest into "+N". */
 const SOFT_LINK_CAP = 5;
@@ -21,9 +22,7 @@ const SOFT_LINK_CAP = 5;
 const SOFT_ORDER: RejectionCategory[] = ['budget_max', 'budget_min', 'contract', 'amenity', 'criteria', 'error'];
 const HARD_ORDER: RejectionCategory[] = ['room_coliving', 'room_count', 'not_concrete', 'budget_floor'];
 
-function esc(s: string): string {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-}
+const esc = escapeHtml;
 
 function link(row: MonitorRejectionRow): string {
   const title = esc((row.title || 'объявление').slice(0, 40));

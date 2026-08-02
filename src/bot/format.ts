@@ -6,6 +6,7 @@ import sanitizeHtml from 'sanitize-html';
 import type { Listing, ParsedRentalData, ParsedItemData, LocationScore, NearbyPlace } from '../types.js';
 import type { ItemListing } from '../crawlers/olx-items.js';
 import { computeRentalCost } from '../cost.js';
+import { escapeHtml } from '../utils/html.js';
 
 /** Repair broken HTML from message splitting — close unclosed tags, strip orphan close tags */
 function sanitizeChunk(html: string): string {
@@ -22,13 +23,7 @@ function sanitizeChunk(html: string): string {
 // ---------------------------------------------------------------------------
 
 /** Escape HTML special chars in user/AI-generated text for Telegram HTML parse_mode */
-function esc(text: string | number | null | undefined): string {
-  if (text == null) return '';
-  return String(text)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
-}
+const esc = escapeHtml;
 
 function pln(amount: number | null | undefined): string {
   if (amount == null) return '\u2014';

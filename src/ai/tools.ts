@@ -8,6 +8,7 @@ import { parseRentalListing, parseItemListing, evaluateRejection, triageRentalLi
 import { createUnknownLocationScore, scoreLocation } from './maps.js';
 import type { AmenityPreference } from './maps.js';
 import { formatRichRentalNotification, formatRichItemNotification, splitMessage, captionLength } from '../bot/format.js';
+import { escapeHtml } from '../utils/html.js';
 import { searchRentalListings, CITY_PROVINCE_MAP, resolveCityId } from '../search/rental-search.js';
 import { enrichRentalListing } from '../search/enrich-listing.js';
 import { checkAmenityGate, checkCenterGate, resolveStrictAmenities } from '../search/amenity-gate.js';
@@ -107,9 +108,7 @@ type SendPhotosFn = (
 ) => Promise<void>;
 
 /** Escape HTML special chars for Telegram HTML parse_mode */
-function escHtml(s: string): string {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-}
+const escHtml = escapeHtml;
 
 // ---------------------------------------------------------------------------
 // Tool definitions (Claude API format) -- 6 deep pipeline tools
