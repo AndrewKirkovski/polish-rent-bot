@@ -40,5 +40,5 @@ test('within-limit amenities lift the score and the nearest is named in Russian'
   const withAmen = computeFitScore(mkListing(), mkParsed({ twoOfficeCapable: true }), score);
   const noAmen = computeFitScore(mkListing(), mkParsed({ twoOfficeCapable: true }), null);
   assert.ok(withAmen.score > noAmen.score);    // strict: proves the amenities weight actually contributes
-  assert.match(withAmen.reason, /кафе 4м/);     // shared AMENITY_LABELS, not English 'cafe'
+  assert.match(withAmen.reason, /кафе 4 мин/);  // shared AMENITY_LABELS (Russian), minutes labelled "мин"
 });

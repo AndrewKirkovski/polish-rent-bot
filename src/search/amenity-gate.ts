@@ -110,9 +110,14 @@ export function checkAmenityGate(
         const reason = metroRejectionReason(result, pref);
         if (reason) return { pass: false, reason };
       }
-      const mins = nearestMinutes(result);
+      // Show the range the gate actually judged (for an approximate anchor), not the point-search
+      // minutes — otherwise the message can read "9 мин (лимит 7)" for a listing kept for its range.
+      const n = result.nearest ?? result.places[0];
+      const mins = n?.walkingMinutesRange
+        ? `~${n.walkingMinutesRange.min}–${n.walkingMinutesRange.max}`
+        : String(nearestMinutes(result) ?? '?');
       const line = pref.type === 'metro' && pref.line ? ` ${pref.line}` : '';
-      return { pass: false, reason: `${amenityLabel(pref.type)}${line} ${mins ?? '?'} ${unit(pref.type)} (лимит ${pref.maxMinutes} мин)` };
+      return { pass: false, reason: `${amenityLabel(pref.type)}${line} ${mins} ${unit(pref.type)} (лимит ${pref.maxMinutes} мин)` };
     }
   }
 

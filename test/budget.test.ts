@@ -179,6 +179,16 @@ test('locationEvidenceSupportsAnchor accepts a Polish declension (wola/woli)', (
   assert.equal(locationEvidenceSupportsAnchor('metro Wola, Warszawa', 'przy stacji Woli'), true);
 });
 
+test('a malformed locationHint collapses to "none" instead of sinking the whole parse', () => {
+  // Haiku abbreviating the compound enum ("transit") or returning a bare string must not throw.
+  const a = ParsedRentalDataSchema.parse({ adminFee: 600, locationHint: { query: 'metro Bemowo', kind: 'transit' } });
+  assert.equal(a.locationHint.kind, 'none');
+  assert.equal(a.adminFee, 600);
+  const b = ParsedRentalDataSchema.parse({ adminFee: 600, locationHint: 'metro Bemowo' });
+  assert.equal(b.locationHint.kind, 'none');
+  assert.equal(b.adminFee, 600);
+});
+
 test('extractResultId reads codes from HTML captions', () => {
   assert.equal(extractResultId('<b>[GM7WX3]</b>\nrest'), 'GM7WX3');
   assert.equal(extractResultId('[GM7WX3] rest'), 'GM7WX3');

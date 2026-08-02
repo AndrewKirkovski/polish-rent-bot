@@ -65,11 +65,13 @@ export function computeFitScore(
   parts.push({ key: 'naturalLight', weight: w.naturalLight ?? 0, value: light });
 
   // --- Budget headroom (cheaper within band = better) ---
-  const total = computeRentalCost(listing, parsed).total;
+  const cost = computeRentalCost(listing, parsed);
   const { from, to } = profile.budgetTotalPln;
   let budget = 0.5;
-  if (total > 0 && to > from) {
-    budget = clamp01((to - total) / (to - from)); // at/under `from` → 1, at `to` → 0
+  // Only score the budget band when the base rent is known — a "zapytaj o cenę" flat (price=0) has
+  // an understated total and must stay neutral, not rank as maximally cheap.
+  if (cost.basePriceKnown && to > from) {
+    budget = clamp01((to - cost.total) / (to - from)); // at/under `from` → 1, at `to` → 0
   }
   parts.push({ key: 'budget', weight: w.budget ?? 0, value: budget });
 
@@ -98,8 +100,8 @@ export function computeFitScore(
     if (near) {
       const place = near.places[0]!;
       const minutes = place.walkingMinutesRange
-        ? `${place.walkingMinutesRange.min}-${place.walkingMinutesRange.max}м`
-        : `${place.walkingMinutes}м`;
+        ? `${place.walkingMinutesRange.min}-${place.walkingMinutesRange.max} мин`
+        : `${place.walkingMinutes} мин`;
       reasons.push(`${amenityLabel(near.type)} ${minutes}`);
     }
   }

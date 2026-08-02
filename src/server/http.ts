@@ -81,7 +81,7 @@ export interface HttpServerHandle {
 }
 
 export interface HttpServerOptions {
-  requestFullRescan?: () => FullRescanStatus;
+  requestFullRescan?: () => FullRescanStatus | null; // null when the scheduler is stopped
 }
 
 export function startHttpServer(
@@ -183,7 +183,9 @@ export function startHttpServer(
     }
 
     try {
-      return c.json(options.requestFullRescan(), 202);
+      const status = options.requestFullRescan();
+      if (!status) return c.json({ error: 'scheduler is stopped' }, 503);
+      return c.json(status, 202);
     } catch (err) {
       if (err instanceof FullRescanAlreadyActiveError) {
         return c.json({ error: err.message, status: getFullRescanStatus() }, 409);

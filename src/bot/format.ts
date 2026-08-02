@@ -56,7 +56,8 @@ function visibleText(html: string): string {
   return html
     .replace(/<tg-emoji[^>]*>([^<]*)<\/tg-emoji>/g, '$1') // keep the fallback emoji
     .replace(/<a\b[^>]*>([\s\S]*?)<\/a>/g, '$1')          // keep anchor text, drop href
-    .replace(/<[^>]+>/g, '');                              // strip remaining tags
+    .replace(/<[^>]+>/g, '')                              // strip remaining tags
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&'); // count entities as 1 char (& last)
 }
 
 export function captionLength(html: string): number {

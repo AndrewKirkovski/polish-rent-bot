@@ -197,8 +197,10 @@ export async function searchRentalListings(params: RentalSearchParams): Promise<
   const deduped = dedupeCrossPlatform(platformDeduped);
 
   deduped.sort((a, b) => {
-    const ta = new Date(a.createdAt || 0).getTime();
-    const tb = new Date(b.createdAt || 0).getTime();
+    // Date.parse yields NaN for an unparseable string; `|| 0` folds NaN AND '' to the epoch so the
+    // comparator never returns NaN (which would corrupt the sort order).
+    const ta = Date.parse(a.createdAt) || 0;
+    const tb = Date.parse(b.createdAt) || 0;
     return tb - ta;
   });
 

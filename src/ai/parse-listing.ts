@@ -585,7 +585,9 @@ export async function evaluateRejection(
   // Fold the listing content (price + description) into the cache key so a CHANGED listing — e.g. a
   // price drop from over-budget to in-budget — re-evaluates instead of returning the stale verdict.
   const contentSig = `${listing.price ?? ''}|${(listing.description ?? '').slice(0, 4000)}`;
-  const criteriaHash = hashText(`${rejectionCriteria}::${contentSig}`);
+  // Fold parse identity in too: a re-parse under a new model/version can change what the verdict
+  // should be, so it must not serve the old model's cached rejection.
+  const criteriaHash = hashText(`${RENTAL_PARSE_VERSION}::${PARSE_MODEL}::${rejectionCriteria}::${contentSig}`);
 
   // Check rejection cache
   const cached = getRejectionCache(listing.platform, listing.platformId, criteriaHash);
@@ -690,26 +692,31 @@ ${rejectionCriteria}`;
   if (rejJsonMatch) rejJsonStr = rejJsonMatch[0];
 
   let result: RejectionResult;
+  let cacheable = true;
   try {
     const raw = JSON.parse(rejJsonStr);
     result = RejectionResultSchema.parse(raw) as RejectionResult;
   } catch (parseErr) {
     console.error('[evaluateRejection] Failed to parse AI JSON:', rejJsonStr.slice(0, 200));
-    // Default to not rejected on parse failure
+    // A malformed/truncated response FAILS OPEN (rejected=false) — don't persist that as a
+    // permanent "passes" verdict, or a genuinely-rejectable flat is shown forever on a one-off blip.
     result = { rejected: false, rejectionReason: null };
+    cacheable = false;
   }
 
-  // Cache the rejection result
-  try {
-    saveRejectionCache(
-      listing.platform,
-      listing.platformId,
-      criteriaHash,
-      result.rejected,
-      result.rejectionReason,
-    );
-  } catch (dbErr) {
-    console.error('[evaluateRejection] Cache write failed:', dbErr);
+  // Cache the rejection result (only a genuine verdict, never a fail-open default).
+  if (cacheable) {
+    try {
+      saveRejectionCache(
+        listing.platform,
+        listing.platformId,
+        criteriaHash,
+        result.rejected,
+        result.rejectionReason,
+      );
+    } catch (dbErr) {
+      console.error('[evaluateRejection] Cache write failed:', dbErr);
+    }
   }
 
   return result;

@@ -2,7 +2,7 @@
 // and calls a notification callback for each unseen result.
 
 import { searchItems, fetchItemPhone } from '../crawlers/olx-items.js';
-import { getMonitors, isListingSeen, markListingSeen, cleanOldSeen, cleanOldCachedListings, cleanOldNotifiedFingerprints, cleanOldMonitorRejections, cleanOldTelegramMessageRefs, startMonitorRun, finishMonitorRun, cacheListing, getCachedListingByPlatform, isFingerprintNotified, markFingerprintNotified, recordMonitorRejection, getMonitorRejectionsSince, getAppState, setAppState, getFullRescanStatus, queueFullRescan, beginFullRescan, finishFullRescan, recoverInterruptedFullRescan, type FullRescanStatus, type MonitorRow } from '../storage/db.js';
+import { getMonitors, isListingSeen, markListingSeen, cleanOldSeen, cleanOldCachedListings, cleanOldNotifiedFingerprints, cleanOldMonitorRejections, cleanOldTelegramMessageRefs, startMonitorRun, finishMonitorRun, cacheListing, getCachedListingByPlatform, newUniqueResultId, isFingerprintNotified, markFingerprintNotified, recordMonitorRejection, getMonitorRejectionsSince, getAppState, setAppState, getFullRescanStatus, queueFullRescan, beginFullRescan, finishFullRescan, recoverInterruptedFullRescan, type FullRescanStatus, type MonitorRow } from '../storage/db.js';
 import { buildRejectionReport } from './rejection-report.js';
 import type { Listing, ParsedRentalData, ParsedItemData, LocationScore } from '../types.js';
 import type { ItemListing } from '../crawlers/olx-items.js';
@@ -240,7 +240,7 @@ export function shouldEmitMonitorNotification(fullRescan: boolean): boolean {
 
 export interface SchedulerHandle {
   stop: () => void;
-  requestFullRescan: () => FullRescanStatus;
+  requestFullRescan: () => FullRescanStatus | null; // null when the scheduler is stopped
 }
 
 export function startScheduler(
@@ -547,7 +547,7 @@ export function startScheduler(
 
               // Reuse a prior search/monitor result ID when present so one flat ↔ one code.
               const existingId = getCachedListingByPlatform(workingListing.platform, workingListing.platformId)?.resultId;
-              const resultId = existingId ?? genResultId();
+              const resultId = existingId ?? newUniqueResultId();
               try {
                 cacheListing({
                   platform: workingListing.platform,
@@ -658,6 +658,9 @@ export function startScheduler(
       console.log('[scheduler] Stopped');
     },
     requestFullRescan: () => {
+      // Don't queue on a stopped scheduler — the persisted 'queued' state would silently fire on the
+      // next process boot with nobody having asked for it.
+      if (stopped) return getFullRescanStatus();
       const status = queueFullRescan();
       if (timer !== null) {
         clearTimeout(timer);

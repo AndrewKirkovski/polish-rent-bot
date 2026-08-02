@@ -304,7 +304,15 @@ export async function geocodeAddress(address: string): Promise<GeocodedLocation 
   if (isCacheValid(cached)) return unwrapCache<GeocodedLocation>(cached!);
 
   const url = `${MAPS_BASE}/geocode/json?address=${encodeURIComponent(address)}&key=${API_KEY}&language=pl`;
-  const res = await fetchJson<GeocodeResponse>(url);
+  let res: GeocodeResponse;
+  try {
+    res = await fetchJson<GeocodeResponse>(url);
+  } catch (err) {
+    // Honor the Promise<...|null> contract for transport errors too, so a single failed fetch in
+    // the fusion's gatherLocationCandidates degrades to "no candidate" instead of aborting enrichment.
+    console.error(`[maps] Geocode fetch failed for "${address}":`, err instanceof Error ? err.message : err);
+    return null;
+  }
 
   if (res.status !== 'OK' || res.results.length === 0) {
     console.error(`[maps] Geocode failed for "${address}": ${res.status} — ${res.error_message ?? 'no details'}`);

@@ -204,11 +204,18 @@ function parseOtodomSearchItem(item: any): Listing | null {
       : item.agency?.type === 'AGENCY' ? 'agency'
       : item.agency?.type === 'DEVELOPER' ? 'developer' : null,
     agencyName: item.agency?.name ?? null,
-    photos: (item.images ?? []).map((img: any) => img.large ?? img.medium ?? ''),
+    photos: (item.images ?? []).map((img: any) => img.large ?? img.medium ?? '').filter((u: string) => u.length > 0),
     createdAt: item.createdAtFirst ?? item.dateCreated ?? '',
     scrapedAt: new Date().toISOString(),
   };
 }
+
+/** parseFloat/parseInt that yields null (not NaN) for missing/non-numeric values. */
+const numOrNull = (v: unknown): number | null => {
+  if (v == null) return null;
+  const n = parseFloat(String(v));
+  return Number.isFinite(n) ? n : null;
+};
 
 export function parseOtodomDetailAd(ad: any): Listing | null {
   if (!ad?.id) return null;
@@ -234,14 +241,14 @@ export function parseOtodomDetailAd(ad: any): Listing | null {
     description: ad.description ?? '',
     // Coerce the target.* fallback like every sibling below — that block stores strings,
     // and an unparsed string in Listing.price string-concatenates in computeRentalCost.
-    price: ad.price?.value ?? (target.Price != null ? parseFloat(String(target.Price)) || 0 : 0),
+    price: ad.price?.value ?? numOrNull(target.Price) ?? 0,
     currency: ad.price?.currency ?? 'PLN',
-    rent: target.Rent ? parseFloat(String(target.Rent)) : null,
-    deposit: target.Deposit ? parseFloat(String(target.Deposit)) : null,
-    area: target.Area ? parseFloat(String(target.Area)) : null,
-    rooms: target.Rooms_num?.[0] ? parseInt(target.Rooms_num[0], 10) : null,
+    rent: numOrNull(target.Rent),
+    deposit: numOrNull(target.Deposit),
+    area: numOrNull(target.Area),
+    rooms: numOrNull(target.Rooms_num?.[0]),
     floor: parseOtodomDetailFloor(target.Floor_no?.[0]),
-    buildingFloor: target.Building_floors_num ? parseInt(String(target.Building_floors_num), 10) : null,
+    buildingFloor: numOrNull(target.Building_floors_num),
     buildingType: target.Building_type?.[0] ?? null,
     heating: target.Heating?.[0] ?? null,
     furniture: target.Equipment_types ? true : null,
@@ -266,7 +273,7 @@ export function parseOtodomDetailAd(ad: any): Listing | null {
       : (ad.advertiserType === 'PRIVATE' || ad.owner?.type === 'PRIVATE') ? 'private'
       : (ad.advertiserType === 'AGENCY' || ad.agency) ? 'agency' : null,
     agencyName: ad.agency?.name ?? null,
-    photos: (ad.images ?? []).map((img: any) => img.large ?? img.medium ?? img.small ?? ''),
+    photos: (ad.images ?? []).map((img: any) => img.large ?? img.medium ?? img.small ?? '').filter((u: string) => u.length > 0),
     createdAt: ad.createdAt ?? '',
     scrapedAt: new Date().toISOString(),
   };

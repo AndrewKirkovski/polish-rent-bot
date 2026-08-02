@@ -24,6 +24,7 @@ import {
   cacheListing,
   getCachedListingByResultId,
   getCachedListingByPlatform,
+  newUniqueResultId,
   getParsedListing,
   getAuthorizedTelegramIds,
 } from '../storage/db.js';
@@ -604,7 +605,7 @@ async function execFindRentals(
     // Reserve a result ID for this candidate up-front so even rejection paths
     // (and the catch-all error handler below) can reference it. Reuse the listing's existing cached
     // id (as the monitor does) so re-searching the same flat keeps its old [ID] resolvable.
-    const resultId = getCachedListingByPlatform(listing.platform, listing.platformId)?.resultId ?? genId();
+    const resultId = getCachedListingByPlatform(listing.platform, listing.platformId)?.resultId ?? newUniqueResultId();
 
     // Pre-parse budget short-circuit: base rent alone already over budget → the true total
     // can only be higher, so skip the expensive enrich + AI parse (see exceedsBudgetFloor).
@@ -901,8 +902,8 @@ async function execFindItems(
   for (let i = 0; i < candidates.length && shown.length < maxResults; i++) {
     const item = candidates[i];
 
-    // Reserve a result ID up-front so even rejection paths can reference it.
-    const resultId = genId();
+    // Reserve a result ID up-front; reuse the item's cached id so re-searches keep [ID]s resolvable.
+    const resultId = getCachedListingByPlatform(item.platform, item.platformId)?.resultId ?? newUniqueResultId();
 
     try {
       // Fetch phone if not available

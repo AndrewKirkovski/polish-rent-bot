@@ -3,6 +3,7 @@ import { mkdirSync, existsSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { Listing } from '../types.js';
 import type { ItemListing } from '../crawlers/olx-items.js';
+import { genResultId } from '../utils/result-id.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -1759,6 +1760,16 @@ export function getCachedListingByResultId(resultId: string): CachedListingRecor
     LIMIT 1
   `).get(resultId) as { kind: string; listing_json: string; result_id: string | null; cached_at: string } | undefined;
   return row ? decodeCached(row) : null;
+}
+
+/** A result id that isn't already assigned to a cached listing (6 chars ⇒ collisions do occur at
+ *  scale; check before use rather than silently resolving a duplicate to the newest row). */
+export function newUniqueResultId(): string {
+  for (let i = 0; i < 8; i++) {
+    const id = genResultId();
+    if (!getCachedListingByResultId(id)) return id;
+  }
+  return genResultId(); // 8 collisions in a row is astronomically unlikely; accept it over looping
 }
 
 export function getCachedListingByPlatform(platform: string, platformId: string): CachedListingRecord | null {

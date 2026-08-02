@@ -6,6 +6,7 @@ import { z } from 'zod';
 // A tolerant nullable number: a wrong-typed value (e.g. Haiku returning "6000 zł" or "~200")
 // falls back to null instead of throwing and discarding the ENTIRE parse of the listing.
 const nnum = z.number().nullable().default(null).catch(null);
+const DEFAULT_LOCATION_HINT = { query: null, kind: 'none' as const, anchorDistanceMeters: null, uncertaintyMeters: null, evidence: null };
 
 // ---------------------------------------------------------------------------
 // Rental listing schema — matches ParsedRentalData interface
@@ -19,19 +20,15 @@ export const ParsedRentalDataSchema = z.looseObject({
   depositNote: z.string().nullable().default(null),
   adminFee: nnum,
   addressHint: z.string().nullable().default(null),
+  // A malformed hint (e.g. kind:"transit" instead of "transit_stop", or locationHint as a bare
+  // string) must collapse to "none" — handled downstream — NOT throw away the whole listing parse.
   locationHint: z.object({
-    query: z.string().nullable().default(null),
-    kind: z.enum(['address', 'intersection', 'building', 'estate', 'transit_stop', 'landmark', 'neighborhood', 'none']).default('none'),
+    query: z.string().nullable().default(null).catch(null),
+    kind: z.enum(['address', 'intersection', 'building', 'estate', 'transit_stop', 'landmark', 'neighborhood', 'none']).catch('none').default('none'),
     anchorDistanceMeters: z.number().min(0).max(50_000).nullable().default(null).catch(null),
     uncertaintyMeters: z.number().min(0).max(20_000).nullable().default(null).catch(null),
-    evidence: z.string().nullable().default(null),
-  }).default({
-    query: null,
-    kind: 'none',
-    anchorDistanceMeters: null,
-    uncertaintyMeters: null,
-    evidence: null,
-  }),
+    evidence: z.string().nullable().default(null).catch(null),
+  }).default(DEFAULT_LOCATION_HINT).catch(DEFAULT_LOCATION_HINT),
   isConcreteApartment: z.boolean().nullable().default(true),
   estimatedMedia: z.object({
     water: nnum,

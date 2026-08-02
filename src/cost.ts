@@ -36,11 +36,13 @@ export function exceedsBudgetFloor(listing: Pick<Listing, 'price'>, priceTo: num
 }
 
 export function computeRentalCost(
-  listing: Pick<Listing, 'price' | 'rent'>,
+  listing: Pick<Listing, 'price' | 'rent'> & { currency?: string },
   parsed: ParsedRentalData | null | undefined,
 ): RentalCost {
   const najem = listing.price ?? 0;
-  const basePriceKnown = najem > 0;
+  // Only a PLN base rent is a verifiable budget figure; a non-PLN listing (rare, e.g. EUR) must not
+  // be summed/ranked as if the number were PLN — treat it like an unknown price.
+  const basePriceKnown = najem > 0 && (listing.currency ?? 'PLN') === 'PLN';
   const czynsz = parsed?.adminFee ?? listing.rent ?? 0;
 
   const mediaParts: Array<{ label: string; value: number }> = [];

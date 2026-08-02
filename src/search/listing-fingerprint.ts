@@ -67,7 +67,8 @@ function bucketsClose(a: number, b: number, tolerance: number): boolean {
 export function fingerprintsMatch(a: ListingFingerprint, b: ListingFingerprint): boolean {
   if (a.city !== b.city) return false;
   if (a.rooms != null && b.rooms != null && a.rooms !== b.rooms) return false;
-  if ((a.rooms == null) !== (b.rooms == null)) return false;
+  // An UNKNOWN room count must not force-split a genuine cross-post (same lenient philosophy as the
+  // area gate below); differing KNOWN counts are already rejected above.
   // areaBucket 0 means "area unknown". Only apply the area gate when BOTH areas are known —
   // otherwise two different area-less flats auto-pass it and can be merged as false duplicates.
   const areaKnown = a.areaBucket > 0 && b.areaBucket > 0;
