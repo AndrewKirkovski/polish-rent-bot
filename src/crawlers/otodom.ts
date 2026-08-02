@@ -291,7 +291,10 @@ export async function searchOtodom(params: OtodomSearchParams): Promise<CrawlRes
     console.log(`  Otodom: navigating to ${url.slice(0, 100)}...`);
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30_000 });
     await dismissCookieConsent(page);
-    await page.waitForTimeout(1000); // let hydration finish
+    // The data we read is the SSR __NEXT_DATA__ payload — present at domcontentloaded, not a
+    // hydration product. Wait for that element (returns immediately in the normal case) instead of a
+    // blind 1s that's paid sequentially under the browser mutex on every page.
+    await page.waitForSelector('#__NEXT_DATA__', { state: 'attached', timeout: 5000 }).catch(() => {});
 
     const nextData = await extractNextData(page);
     if (!nextData) {
@@ -330,7 +333,8 @@ export async function fetchOtodomDetail(listingUrl: string): Promise<Listing | n
     try {
       await page.goto(listingUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 });
       await dismissCookieConsent(page);
-      await page.waitForTimeout(1000);
+      // SSR payload is present at domcontentloaded — wait on it, not a blind 1s (see searchOtodom).
+      await page.waitForSelector('#__NEXT_DATA__', { state: 'attached', timeout: 5000 }).catch(() => {});
 
       const nextData = await extractNextData(page);
       const ad = nextData?.props?.pageProps?.ad;

@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import { getDb, cleanOldCachedListings, cleanExpiredMapsCache, cleanOldNotifiedFingerprints, cleanOldMonitorRejections, cleanOldTelegramMessageRefs, cleanOldParsedListings, cleanOldRejectionCache } from './storage/db.js';
+import { initMapsCacheMaintenance } from './ai/maps.js';
 import { startBot, broadcastEnrichedNotification, broadcastText } from './bot/telegram.js';
 import { startScheduler } from './scheduler/monitor.js';
 import { closeBrowser } from './crawlers/otodom.js';
@@ -45,6 +46,7 @@ try {
   const prunedMsgRefs = cleanOldTelegramMessageRefs(30);
   const prunedParses = cleanOldParsedListings(90);
   const prunedRejCache = cleanOldRejectionCache(30);
+  initMapsCacheMaintenance(); // purge error-flagged nearby caches (no longer a maps.ts import side effect)
   if (prunedListings || prunedMaps || prunedNotified || prunedRejections || prunedMsgRefs || prunedParses || prunedRejCache) {
     console.log(`[startup] pruned ${prunedListings} cached listings, ${prunedMaps} maps entries, ${prunedNotified} notified fingerprints, ${prunedRejections} monitor rejections, ${prunedMsgRefs} telegram message refs, ${prunedParses} parses, ${prunedRejCache} rejection-cache entries`);
   }

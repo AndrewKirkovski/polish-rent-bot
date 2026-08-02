@@ -282,16 +282,19 @@ interface DirectionsResponse {
 }
 
 // ---------------------------------------------------------------------------
-// Startup: clear stale error-cached data
+// Startup: clear stale error-cached data. Called explicitly from main so that merely importing
+// maps.ts (e.g. in a test or a tool) has no DB side effect.
 // ---------------------------------------------------------------------------
 
-try {
-  const cleared = clearEmptyMapsCache();
-  if (cleared > 0) {
-    console.log(`[maps] Cleared ${cleared} stale empty-result cache entries`);
+export function initMapsCacheMaintenance(): void {
+  try {
+    const cleared = clearEmptyMapsCache();
+    if (cleared > 0) {
+      console.log(`[maps] Cleared ${cleared} stale error-cached entries`);
+    }
+  } catch (err) {
+    console.warn('[maps] Startup cache cleanup failed (DB may not be ready):', err instanceof Error ? err.message : err);
   }
-} catch (err) {
-  console.warn('[maps] Startup cache cleanup failed (DB may not be ready):', err instanceof Error ? err.message : err);
 }
 
 // ---------------------------------------------------------------------------
