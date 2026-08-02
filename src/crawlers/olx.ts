@@ -217,6 +217,9 @@ function parseOlxOffer(raw: any): Listing {
     region: raw.location?.region?.name ?? '',
     lat: raw.map?.lat ?? null,
     lng: raw.map?.lon ?? null,
+    // OLX self-declares pin precision: show_detailed=true is the seller's building pin,
+    // false is a deliberately fuzzed area centroid. Thread it through for the location fusion.
+    coordsPrecise: raw.map?.show_detailed === true,
     phone: null, // fetched separately
     contactName: raw.contact?.name ?? raw.user?.name ?? null,
     advertiserType: raw.user?.is_business ? 'agency' : 'private',

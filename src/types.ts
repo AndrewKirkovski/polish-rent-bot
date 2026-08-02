@@ -40,6 +40,10 @@ export interface Listing {
   region: string;
   lat: number | null;
   lng: number | null;
+  /** OLX only: true when the platform map pin is the seller-placed building pin
+   *  (map.show_detailed=true), false when it's a fuzzed area centroid; null/undefined
+   *  for platforms without the signal (e.g. Otodom). */
+  coordsPrecise?: boolean | null;
 
   // Contact
   phone: string | null;

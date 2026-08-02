@@ -10,7 +10,7 @@
 import type { Listing, LocationPrecision, ParsedRentalData } from '../types.js';
 import { geocodeAddress, buildAddressFromListing, warsawMetroLinesForStation } from './maps.js';
 import type { GeocodedLocation } from './maps.js';
-import { findMetroStation } from '../geo/metro.js';
+import { findMetroStation, haversineMeters } from '../geo/metro.js';
 import { fetchOtodomDetail } from '../crawlers/otodom.js';
 
 export interface EnrichedLocation {
@@ -85,6 +85,170 @@ export function isUsableDescriptionLocationHint(
   return !claimsWarsawMetro || warsawMetroLinesForStation(stationQuery).length > 0;
 }
 
+// ---------------------------------------------------------------------------
+// Multi-source fusion — combine every available signal into the tightest honest point.
+// ---------------------------------------------------------------------------
+
+const AGREE_K = 1.5;             // two candidates "agree" when within AGREE_K*(σ_a + σ_b)
+const STATION_FOOTPRINT_M = 150; // a metro "point" really spans its entrances
+
+type HintKind = Exclude<ParsedRentalData['locationHint']['kind'], 'none'>;
+const HINT_KIND_DEFAULT_UNC: Record<HintKind, number> = {
+  address: 100, intersection: 175, building: 250, estate: 800, transit_stop: 400, landmark: 650, neighborhood: 1800,
+};
+const HINT_KIND_LABEL: Record<HintKind, string> = {
+  address: 'адрес', intersection: 'перекрёсток', building: 'здание', estate: 'жилой массив',
+  transit_stop: 'остановка', landmark: 'ориентир', neighborhood: 'район',
+};
+
+interface LocCandidate {
+  lat: number; lng: number;
+  sigma: number;           // ~1σ uncertainty radius, metres
+  reliability: number;     // prior trust 0..1
+  precisionFloor: LocationPrecision;
+  source: string;
+  evidence: string | null;
+}
+interface MetroConstraint {
+  station: { name: string; lat: number; lng: number };
+  distance: number;        // apartment is ~this far from the station (anchorDistanceMeters)
+  margin: number;          // ± tolerance incl. station footprint
+  evidence: string | null;
+}
+
+const clampMeters = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
+
+/** Collect every candidate point (platform pin, geocoded street, geocoded description anchor) plus
+ *  an optional metro annulus. A transit_stop naming a known station is a CONSTRAINT, not a point. */
+async function gatherLocationCandidates(
+  listing: Listing,
+  parsed?: Pick<ParsedRentalData, 'addressHint' | 'locationHint'> | null,
+): Promise<{ candidates: LocCandidate[]; constraint: MetroConstraint | null; unverifiedEvidence: string | null }> {
+  const candidates: LocCandidate[] = [];
+  let constraint: MetroConstraint | null = null;
+  let unverifiedEvidence: string | null = null;
+
+  // Platform map pin. OLX self-declares precision via show_detailed (coordsPrecise): a precise
+  // seller pin is building-accurate; a fuzzed one is only a neighborhood centroid. (Otodom pins
+  // are returned as exact earlier; anything here with coordsPrecise unset is treated as fuzzy.)
+  if (listing.lat != null && listing.lng != null) {
+    candidates.push(listing.coordsPrecise
+      ? { lat: listing.lat, lng: listing.lng, sigma: 120, reliability: 0.85, precisionFloor: 'street', source: 'точная метка с площадки', evidence: null }
+      : { lat: listing.lat, lng: listing.lng, sigma: 1800, reliability: 0.4, precisionFloor: 'district', source: 'метка района с площадки', evidence: null });
+  }
+
+  // Street: platform street (Otodom) preferred, else the AI addressHint. A route-grade match is
+  // kept as a coarse (~600 m) anchor rather than discarded — still better than a district centroid.
+  const streetQuery = listing.street
+    ? buildAddressFromListing({ street: listing.street, district: listing.district, city: listing.city })
+    : parsed?.addressHint ? `${parsed.addressHint}, ${listing.city}, Polska` : null;
+  if (streetQuery) {
+    const geo = await geocodeAddress(streetQuery);
+    if (geo) {
+      const q = classifyGeocodePrecision(geo);
+      candidates.push({
+        lat: geo.lat, lng: geo.lng, sigma: q.uncertaintyMeters,
+        reliability: listing.street ? 0.75 : 0.7, precisionFloor: q.precision,
+        source: listing.street ? 'улица из объявления' : 'адрес из описания',
+        evidence: listing.street ?? parsed?.addressHint ?? null,
+      });
+    } else {
+      unverifiedEvidence ??= parsed?.addressHint ?? null;
+    }
+  }
+
+  // AI description anchor. A transit_stop naming a known station → radial constraint (below);
+  // any other geocodable anchor → a point candidate.
+  const hint = parsed?.locationHint;
+  if (hint && isUsableDescriptionLocationHint(hint, listing.city, listing.district)) {
+    const station = hint.kind === 'transit_stop'
+      ? findMetroStation(hint.query.split(',')[0]?.trim() ?? hint.query)
+      : null;
+    if (station) {
+      constraint = {
+        station,
+        distance: clampMeters(hint.anchorDistanceMeters ?? 0, 0, 50_000),
+        margin: clampMeters(Math.max(STATION_FOOTPRINT_M, hint.uncertaintyMeters ?? 400), STATION_FOOTPRINT_M, 20_000),
+        evidence: hint.evidence,
+      };
+    } else {
+      const geo = await geocodeAddress(`${hint.query}, ${listing.city}, Polska`);
+      if (geo) {
+        const q = classifyGeocodePrecision(geo);
+        const pointLike = hint.kind === 'address' || hint.kind === 'intersection';
+        // A stated distance to a non-station anchor (a landmark N m away) widens it into an annulus;
+        // fold that distance into sigma so it stays a usable — if coarse — point candidate.
+        const anchorDist = clampMeters(hint.anchorDistanceMeters ?? 0, 0, 50_000);
+        const baseUnc = Math.max(hint.uncertaintyMeters ?? HINT_KIND_DEFAULT_UNC[hint.kind], pointLike ? q.uncertaintyMeters : geocodeAreaUncertainty(geo));
+        candidates.push({
+          lat: geo.lat, lng: geo.lng,
+          sigma: clampMeters(Math.max(baseUnc, anchorDist), 50, 20_000),
+          reliability: pointLike ? 0.65 : 0.5,
+          precisionFloor: pointLike ? q.precision : 'approximate',
+          source: `ориентир из описания (${HINT_KIND_LABEL[hint.kind]})`,
+          evidence: hint.evidence,
+        });
+      } else {
+        unverifiedEvidence ??= hint.evidence ?? hint.query;
+      }
+    }
+  } else if (hint?.query || hint?.evidence) {
+    unverifiedEvidence ??= hint.evidence ?? hint.query;
+  }
+
+  return { candidates, constraint, unverifiedEvidence };
+}
+
+/** Fuse agreeing candidates (inverse-variance weighted) and apply the metro annulus constraint. */
+function fuseLocationCandidates(candidates: LocCandidate[], constraint: MetroConstraint | null): EnrichedLocation {
+  const primary = [...candidates].sort((a, b) => b.reliability / b.sigma - a.reliability / a.sigma)[0]!;
+  const cluster = candidates.filter((c) =>
+    c === primary || haversineMeters(primary.lat, primary.lng, c.lat, c.lng) <= AGREE_K * (primary.sigma + c.sigma));
+
+  const lat0 = primary.lat, lng0 = primary.lng;
+  const cosLat = Math.cos((lat0 * Math.PI) / 180);
+  let sw = 0, sx = 0, sy = 0, invVar = 0;
+  for (const c of cluster) {
+    const w = c.reliability / (c.sigma * c.sigma);
+    sx += w * (c.lng - lng0) * cosLat * 111_320;
+    sy += w * (c.lat - lat0) * 110_540;
+    sw += w;
+    invVar += 1 / (c.sigma * c.sigma);
+  }
+  let lat = lat0 + sy / sw / 110_540;
+  let lng = lng0 + sx / sw / (cosLat * 111_320);
+  let sigma = Math.sqrt(1 / invVar);
+  let note = '';
+
+  // Metro station as a radial CONSTRAINT: does the fused point sit ~claimed-distance from it?
+  if (constraint) {
+    const d = haversineMeters(lat, lng, constraint.station.lat, constraint.station.lng);
+    if (Math.abs(d - constraint.distance) <= constraint.margin + sigma + STATION_FOOTPRINT_M) {
+      sigma = Math.max(120, Math.min(sigma, constraint.margin + STATION_FOOTPRINT_M)); // corroborated → tighten
+      note = `; ~${Math.round(d)} м до ${constraint.station.name}`;
+    } else {
+      sigma = Math.max(sigma, Math.abs(d - constraint.distance)); // sources disagree → widen + flag
+      note = `; расхождение с ${constraint.station.name}`;
+    }
+  }
+
+  // Honest precision follows the final uncertainty (an Otodom-exact candidate stays exact).
+  let precision: LocationPrecision;
+  if (cluster.some((c) => c.precisionFloor === 'exact')) precision = 'exact';
+  else if (sigma <= 200) precision = 'street';
+  else if (sigma <= 800) precision = 'approximate';
+  else precision = 'district';
+
+  const evidence = cluster.map((c) => c.evidence).find((e) => e != null) ?? constraint?.evidence ?? null;
+  return {
+    lat, lng, precision,
+    anchorDistanceMeters: 0,
+    uncertaintyMeters: Math.round(sigma),
+    source: [...new Set(cluster.map((c) => c.source))].join(' + ') + note,
+    evidence,
+  };
+}
+
 export async function enrichListingLocation(
   listing: Listing,
   parsed?: Pick<ParsedRentalData, 'addressHint' | 'locationHint'> | null,
@@ -121,128 +285,27 @@ export async function enrichListingLocation(
     return { lat: listing.lat, lng: listing.lng, precision: 'exact', anchorDistanceMeters: 0, uncertaintyMeters: 0, source: 'координаты Otodom', evidence: null };
   }
 
-  // 3. Geocode a precise platform street. Platform district is useful only for a
-  // platform-owned address; it can be wrong on OLX and must not contaminate an AI hint.
-  if (listing.street) {
-    const geo = await geocodeAddress(buildAddressFromListing({ street: listing.street, district: listing.district, city: listing.city }));
-    if (geo) {
-      const quality = classifyGeocodePrecision(geo);
-      return {
-        lat: geo.lat,
-        lng: geo.lng,
-        precision: quality.precision,
-        anchorDistanceMeters: 0,
-        uncertaintyMeters: quality.uncertaintyMeters,
-        source: 'улица из объявления',
-        evidence: listing.street,
-      };
-    }
+  // 3. Fuse every available signal (platform pin + geocoded street + description anchor) into the
+  // tightest honest point. A named metro station acts as a radial CONSTRAINT that confirms/tightens
+  // the point rather than replacing it — so a precise OLX pin + street + "70 m from Metro X" collapse
+  // to the building, not the station centroid.
+  const { candidates, constraint, unverifiedEvidence: unverifiedDescriptionEvidence } =
+    await gatherLocationCandidates(listing, parsed);
+  if (candidates.length > 0) {
+    return fuseLocationCandidates(candidates, constraint);
   }
 
-  // 4. Use the AI's structured, evidence-bearing description anchor. This may be a named building,
-  // intersection, stop, or landmark; its uncertainty radius prevents false exactness.
-  const hint = parsed?.locationHint;
-  let unverifiedDescriptionEvidence: string | null = null;
-  if (hint && isUsableDescriptionLocationHint(hint, listing.city, listing.district)) {
-    // A transit_stop anchor naming a KNOWN Warsaw metro station: use the verified station
-    // coordinates and the AI's own (tight) uncertainty. Geocoding "metro X" via Google often
-    // returns a fuzzy ~1.5 km area, which would inflate a precise "70 m from Metro X" into an
-    // approximate location that then slips strict metro/center filters.
-    const station = hint.kind === 'transit_stop'
-      ? findMetroStation(hint.query.split(',')[0]?.trim() ?? hint.query)
-      : null;
-    if (station) {
-      return {
-        lat: station.lat,
-        lng: station.lng,
-        precision: 'approximate',
-        anchorDistanceMeters: Math.max(0, Math.min(50_000, hint.anchorDistanceMeters ?? 0)),
-        // Floor at the station footprint (~entrances span), but do NOT inflate to a Google area.
-        uncertaintyMeters: Math.max(150, Math.min(20_000, hint.uncertaintyMeters ?? 400)),
-        source: 'ориентир из описания (остановка)',
-        evidence: hint.evidence,
-      };
-    }
-    const geo = await geocodeAddress(`${hint.query}, ${listing.city}, Polska`);
-    if (geo) {
-      const defaults: Record<Exclude<ParsedRentalData['locationHint']['kind'], 'none'>, number> = {
-        address: 100,
-        intersection: 175,
-        building: 250,
-        estate: 800,
-        transit_stop: 400,
-        landmark: 650,
-        neighborhood: 1800,
-      };
-      const geocodeQuality = classifyGeocodePrecision(geo);
-      const pointLikeHint = hint.kind === 'address' || hint.kind === 'intersection';
-      return {
-        lat: geo.lat,
-        lng: geo.lng,
-        precision: pointLikeHint ? geocodeQuality.precision : 'approximate',
-        anchorDistanceMeters: Math.max(0, Math.min(50_000, hint.anchorDistanceMeters ?? 0)),
-        uncertaintyMeters: Math.max(
-          50,
-          Math.min(
-            20_000,
-            Math.max(
-              hint.uncertaintyMeters ?? defaults[hint.kind],
-              pointLikeHint ? geocodeQuality.uncertaintyMeters : geocodeAreaUncertainty(geo),
-            ),
-          ),
-        ),
-        source: `ориентир из описания (${{
-          address: 'адрес',
-          intersection: 'перекрёсток',
-          building: 'здание',
-          estate: 'жилой массив',
-          transit_stop: 'остановка',
-          landmark: 'ориентир',
-          neighborhood: 'район',
-        }[hint.kind]})`,
-        evidence: hint.evidence,
-      };
-    }
-    unverifiedDescriptionEvidence = hint.evidence ?? hint.query;
-  } else if (hint?.query || hint?.evidence) {
-    unverifiedDescriptionEvidence = hint.evidence ?? hint.query;
-  }
-
-  // 5. Legacy fallback: an exact address/intersection extracted from the description.
-  // It must not override a successfully geocoded structured location hint.
-  if (parsed?.addressHint) {
-    const geo = await geocodeAddress(`${parsed.addressHint}, ${listing.city}, Polska`);
-    if (geo) {
-      const quality = classifyGeocodePrecision(geo);
-      // addressHint promises an exact address/intersection. A route/area/partial
-      // Google match violates that contract and must fall through to district data.
-      if (quality.precision === 'street') {
-        return {
-          lat: geo.lat,
-          lng: geo.lng,
-          precision: quality.precision,
-          anchorDistanceMeters: 0,
-          uncertaintyMeters: quality.uncertaintyMeters,
-          source: 'адрес из описания',
-          evidence: parsed.addressHint,
-        };
-      }
-    }
-    unverifiedDescriptionEvidence ??= parsed.addressHint;
-  }
-
-  // 6. OLX coordinates exist but are district-center (fuzzy).
-  if (listing.lat != null && listing.lng != null) {
+  // 4. No point candidate, but a "N m from Metro X" claim still localizes the flat to a ring near the
+  // station — keep the annulus (point = station, anchorDistanceMeters = the claimed distance).
+  if (constraint) {
     return {
-      lat: listing.lat,
-      lng: listing.lng,
-      precision: 'district',
-      anchorDistanceMeters: 0,
-      uncertaintyMeters: 2000,
-      source: unverifiedDescriptionEvidence
-        ? 'метка района с площадки; ориентир из описания не подтверждён'
-        : 'метка района с площадки',
-      evidence: unverifiedDescriptionEvidence,
+      lat: constraint.station.lat,
+      lng: constraint.station.lng,
+      precision: 'approximate',
+      anchorDistanceMeters: constraint.distance,
+      uncertaintyMeters: constraint.margin,
+      source: `ориентир из описания (остановка) ~${constraint.distance} м до ${constraint.station.name}`,
+      evidence: constraint.evidence,
     };
   }
 

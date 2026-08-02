@@ -50,24 +50,33 @@ test('invented station name does not resolve to a metro line', () => {
   assert.deepEqual(warsawMetroLinesForStation('Bemowo Ratusz'), []);
 });
 
-test('transit_stop hint for a known station uses verified coords + tight uncertainty (not a fuzzy geocode)', async () => {
-  // "70 m from Metro Młynów" must stay precise so a strict metro/center filter can act on it,
-  // instead of being inflated to Google's ~1.5 km area for "metro Młynów".
-  const listing = {
-    platform: 'olx', platformId: '1', url: 'x', slug: 's', title: 't', description: '',
-    price: 5800, currency: 'PLN', rent: 1000, area: 82, rooms: 4,
-    city: 'Warszawa', district: 'Wola', street: null, region: 'Mazowieckie',
-    lat: 52.2385, lng: 20.9594, photos: [], createdAt: '', scrapedAt: '',
-  } as unknown as Listing;
-  const parsed = {
-    addressHint: null,
-    locationHint: { query: 'metro Młynów, Warszawa', kind: 'transit_stop', anchorDistanceMeters: 70, uncertaintyMeters: 20, evidence: '70 m od metra Młynów' },
-  } as unknown as ParsedRentalData;
-  const e = await enrichListingLocation(listing, parsed);
-  assert.equal(e.precision, 'approximate');
-  assert.ok(Math.abs(e.lat! - 52.23766) < 0.002 && Math.abs(e.lng! - 20.9601) < 0.002, `Młynów coords, got ${e.lat},${e.lng}`);
-  assert.equal(e.uncertaintyMeters, 150); // floored/tight, NOT inflated to 1500
-  assert.equal(e.anchorDistanceMeters, 70);
+const mlynowParsed = () => ({
+  addressHint: null,
+  locationHint: { query: 'metro Młynów, Warszawa', kind: 'transit_stop', anchorDistanceMeters: 70, uncertaintyMeters: 20, evidence: '70 m od metra Młynów' },
+}) as unknown as ParsedRentalData;
+const olxListing = (over: Partial<Listing>) => ({
+  platform: 'olx', platformId: '1', url: 'x', slug: 's', title: 't', description: '',
+  price: 5800, currency: 'PLN', rent: 1000, area: 82, rooms: 4,
+  city: 'Warszawa', district: 'Wola', street: null, region: 'Mazowieckie',
+  lat: 52.23850518, lng: 20.95938461, photos: [], createdAt: '', scrapedAt: '', ...over,
+}) as unknown as Listing;
+
+test('location fusion: a precise OLX pin cross-checked by a metro anchor → the building at street precision', async () => {
+  // The pin is the seller's building pin (show_detailed=true); the "70 m from Metro Młynów" claim
+  // must CONFIRM it (≈106 m measured), not replace it with the station centroid or inflate it.
+  const e = await enrichListingLocation(olxListing({ coordsPrecise: true }), mlynowParsed());
+  assert.equal(e.precision, 'street');
+  assert.equal(e.anchorDistanceMeters, 0); // a real point, not a station annulus
+  assert.ok(Math.abs(e.lat! - 52.23850518) < 3e-4 && Math.abs(e.lng! - 20.95938461) < 3e-4, `at the pin, got ${e.lat},${e.lng}`);
+  assert.ok(e.uncertaintyMeters <= 200, `tight, got ${e.uncertaintyMeters}`);
+});
+
+test('location fusion: a fuzzy OLX pin is kept at the pin (not snapped to the station centroid)', async () => {
+  const e = await enrichListingLocation(olxListing({ coordsPrecise: false }), mlynowParsed());
+  assert.equal(e.anchorDistanceMeters, 0);
+  // Stays at the pin (52.2385…), NOT the Młynów station centroid (52.23766, 20.9601).
+  assert.ok(Math.abs(e.lat! - 52.23850518) < 3e-4, `at the pin, got ${e.lat}`);
+  assert.ok(e.uncertaintyMeters <= 400, `metro-confirmed → tightened, got ${e.uncertaintyMeters}`);
 });
 
 test('metroNearestWithUncertainty keeps the truly-nearest station first when anchor offset > uncertainty', () => {
