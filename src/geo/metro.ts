@@ -125,6 +125,11 @@ export function warsawMetroLinesForStation(name: string): WarsawMetroLine[] {
   return s ? [...s.lines] : [];
 }
 
+/** The verified station matching a name (handles "metro X"/"M1 X" prefixes), or null. */
+export function findMetroStation(name: string): MetroStation | null {
+  return STATION_BY_KEY.get(normalizeStationName(name)) ?? null;
+}
+
 /**
  * Resolve a list of station names to real stations from the verified table, dropping any name
  * that isn't a real station (the anti-hallucination guard for AI-produced whitelists). Order and

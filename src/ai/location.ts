@@ -10,6 +10,7 @@
 import type { Listing, LocationPrecision, ParsedRentalData } from '../types.js';
 import { geocodeAddress, buildAddressFromListing, warsawMetroLinesForStation } from './maps.js';
 import type { GeocodedLocation } from './maps.js';
+import { findMetroStation } from '../geo/metro.js';
 import { fetchOtodomDetail } from '../crawlers/otodom.js';
 
 export interface EnrichedLocation {
@@ -143,6 +144,25 @@ export async function enrichListingLocation(
   const hint = parsed?.locationHint;
   let unverifiedDescriptionEvidence: string | null = null;
   if (hint && isUsableDescriptionLocationHint(hint, listing.city, listing.district)) {
+    // A transit_stop anchor naming a KNOWN Warsaw metro station: use the verified station
+    // coordinates and the AI's own (tight) uncertainty. Geocoding "metro X" via Google often
+    // returns a fuzzy ~1.5 km area, which would inflate a precise "70 m from Metro X" into an
+    // approximate location that then slips strict metro/center filters.
+    const station = hint.kind === 'transit_stop'
+      ? findMetroStation(hint.query.split(',')[0]?.trim() ?? hint.query)
+      : null;
+    if (station) {
+      return {
+        lat: station.lat,
+        lng: station.lng,
+        precision: 'approximate',
+        anchorDistanceMeters: Math.max(0, Math.min(50_000, hint.anchorDistanceMeters ?? 0)),
+        // Floor at the station footprint (~entrances span), but do NOT inflate to a Google area.
+        uncertaintyMeters: Math.max(150, Math.min(20_000, hint.uncertaintyMeters ?? 400)),
+        source: 'ориентир из описания (остановка)',
+        evidence: hint.evidence,
+      };
+    }
     const geo = await geocodeAddress(`${hint.query}, ${listing.city}, Polska`);
     if (geo) {
       const defaults: Record<Exclude<ParsedRentalData['locationHint']['kind'], 'none'>, number> = {
