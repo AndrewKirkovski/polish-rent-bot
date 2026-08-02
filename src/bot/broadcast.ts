@@ -17,24 +17,33 @@ function sleep(ms: number): Promise<void> {
 
 export async function broadcastToFamily(
   sendToOne: (chatId: number) => Promise<void>,
+  opts: { retries?: number } = {},
 ): Promise<{ delivered: number; failed: number[] }> {
   const ids = getAuthorizedTelegramIds();
-  const failed: number[] = [];
   let delivered = 0;
+  // Retry recipients that failed — a transient Telegram 429/timeout on one member must not
+  // permanently drop that member's alert (the scheduler marks it notified household-wide).
+  let pending = [...ids];
+  const retries = opts.retries ?? 1;
 
-  for (let i = 0; i < ids.length; i++) {
-    const chatId = ids[i]!;
-    try {
-      await sendToOne(chatId);
-      delivered++;
-    } catch (err) {
-      console.error(`[broadcast] Failed for chat ${chatId}:`, err instanceof Error ? err.message : err);
-      failed.push(chatId);
+  for (let attempt = 0; attempt <= retries && pending.length > 0; attempt++) {
+    if (attempt > 0) await sleep(1000 * attempt); // backoff before retrying transient failures
+    const stillFailed: number[] = [];
+    for (let i = 0; i < pending.length; i++) {
+      const chatId = pending[i]!;
+      try {
+        await sendToOne(chatId);
+        delivered++;
+      } catch (err) {
+        console.error(`[broadcast] Failed for chat ${chatId} (attempt ${attempt + 1}):`, err instanceof Error ? err.message : err);
+        stillFailed.push(chatId);
+      }
+      if (i < pending.length - 1) await sleep(BROADCAST_STAGGER_MS);
     }
-    if (i < ids.length - 1) await sleep(BROADCAST_STAGGER_MS);
+    pending = stillFailed;
   }
 
-  return { delivered, failed };
+  return { delivered, failed: pending };
 }
 
 /** Throw only if NOBODY received the message — used by scheduler to decide whether to

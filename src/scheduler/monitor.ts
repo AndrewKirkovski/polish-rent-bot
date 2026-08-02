@@ -275,12 +275,21 @@ export function startScheduler(
     let rescanAttempted = 0;
     let rescanProcessingErrors = 0;
     let rescanTotalFound = 0;
+    let rescanBeginFailed = false;
 
     try {
       fullRescan = getFullRescanStatus()?.state === 'queued';
       if (fullRescan) {
-        const status = beginFullRescan();
-        console.log(`[scheduler] Full rescan ${status.id} started for ${status.activeMonitors} active monitor(s); notifications suppressed`);
+        try {
+          const status = beginFullRescan();
+          console.log(`[scheduler] Full rescan ${status.id} started for ${status.activeMonitors} active monitor(s); notifications suppressed`);
+        } catch (beginErr) {
+          // Don't let a failing beginFullRescan() (SQLITE_BUSY, disk full, …) hot-loop the cycle at
+          // 0 ms: skip the rescan this cycle and fall back to the normal interval (retried next tick).
+          console.error('[scheduler] Full rescan failed to begin; skipping this cycle:', beginErr instanceof Error ? beginErr.message : beginErr);
+          fullRescan = false;
+          rescanBeginFailed = true;
+        }
       }
 
       const results = await runAllMonitors({ ignoreSeen: fullRescan });
@@ -406,7 +415,29 @@ export function startScheduler(
               const config = monitorConfig;
               if (monitor.type === 'rental' && (config.priceTo != null || config.priceFrom != null)) {
                 const l = workingListing as Listing;
-                const estimatedTotal = computeRentalCost(l, parsedData as ParsedRentalData | null).total;
+                const cost = computeRentalCost(l, parsedData as ParsedRentalData | null);
+                // A base rent already over the cap is a certain reject regardless of parse state.
+                if (config.priceTo != null && cost.najem > config.priceTo) {
+                  console.log(`[scheduler] Budget reject "${l.title}": najem ${cost.najem} > ${config.priceTo}`);
+                  recordMonitorRejection(monitor.id, l, 'budget_max', `аренда ${cost.najem} zł > ${config.priceTo} zł`);
+                  markListingSeen(monitor.id, l.platform, l.platformId, l.url, l.title, l.price);
+                  continue;
+                }
+                // Parse failed (transient AI/API error) → czynsz/media unknown, total unverifiable.
+                // DEFER: don't deliver a possibly-over-budget flat, and don't mark seen, so it is
+                // re-attempted next cycle instead of silently passing on the base rent alone.
+                if (!parsedData) {
+                  console.log(`[scheduler] Defer (parse failed — budget unverifiable) "${l.title}"`);
+                  continue;
+                }
+                // "Zapytaj o cenę" (no base rent): czynsz+media is NOT the real cost — can't verify budget.
+                if (!cost.basePriceKnown) {
+                  console.log(`[scheduler] Budget reject "${l.title}": цена не указана`);
+                  recordMonitorRejection(monitor.id, l, 'budget_max', 'цена не указана — бюджет не проверить');
+                  markListingSeen(monitor.id, l.platform, l.platformId, l.url, l.title, l.price);
+                  continue;
+                }
+                const estimatedTotal = cost.total;
                 if (config.priceTo != null && estimatedTotal > config.priceTo) {
                   console.log(`[scheduler] Budget reject "${l.title}": ${estimatedTotal} > ${config.priceTo}`);
                   recordMonitorRejection(monitor.id, l, 'budget_max', `итог ~${estimatedTotal} zł > ${config.priceTo} zł`);
@@ -414,7 +445,7 @@ export function startScheduler(
                   continue;
                 }
                 // priceFrom = min TOTAL, enforced here (not by the platform base-rent filter).
-                if (config.priceFrom != null && estimatedTotal > 0 && estimatedTotal < config.priceFrom) {
+                if (config.priceFrom != null && estimatedTotal < config.priceFrom) {
                   console.log(`[scheduler] Below-min reject "${l.title}": ${estimatedTotal} < ${config.priceFrom}`);
                   recordMonitorRejection(monitor.id, l, 'budget_min', `итог ~${estimatedTotal} zł < ${config.priceFrom} zł`);
                   markListingSeen(monitor.id, l.platform, l.platformId, l.url, l.title, l.price);
@@ -607,8 +638,10 @@ export function startScheduler(
     } finally {
       running = false;
       if (!stopped) {
+        // Fast-follow a queued rescan only when begin succeeded this cycle; a failed begin falls back
+        // to the normal interval so a persistent begin error can't hot-loop the scheduler.
         const rescanQueued = getFullRescanStatus()?.state === 'queued';
-        timer = setTimeout(cycle, rescanQueued ? 0 : intervalMinutes * 60 * 1000);
+        timer = setTimeout(cycle, rescanQueued && !rescanBeginFailed ? 0 : intervalMinutes * 60 * 1000);
       }
     }
   }

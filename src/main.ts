@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { getDb, cleanOldCachedListings, cleanExpiredMapsCache, cleanOldNotifiedFingerprints, cleanOldMonitorRejections, cleanOldTelegramMessageRefs } from './storage/db.js';
+import { getDb, cleanOldCachedListings, cleanExpiredMapsCache, cleanOldNotifiedFingerprints, cleanOldMonitorRejections, cleanOldTelegramMessageRefs, cleanOldParsedListings, cleanOldRejectionCache } from './storage/db.js';
 import { startBot, broadcastEnrichedNotification, broadcastText } from './bot/telegram.js';
 import { startScheduler } from './scheduler/monitor.js';
 import { closeBrowser } from './crawlers/otodom.js';
@@ -43,8 +43,10 @@ try {
   const prunedNotified = cleanOldNotifiedFingerprints(30); // a flat re-listed >30d later is genuinely new
   const prunedRejections = cleanOldMonitorRejections(7);   // only consumed by the daily report
   const prunedMsgRefs = cleanOldTelegramMessageRefs(30);
-  if (prunedListings || prunedMaps || prunedNotified || prunedRejections || prunedMsgRefs) {
-    console.log(`[startup] pruned ${prunedListings} cached listings, ${prunedMaps} maps entries, ${prunedNotified} notified fingerprints, ${prunedRejections} monitor rejections, ${prunedMsgRefs} telegram message refs`);
+  const prunedParses = cleanOldParsedListings(90);
+  const prunedRejCache = cleanOldRejectionCache(30);
+  if (prunedListings || prunedMaps || prunedNotified || prunedRejections || prunedMsgRefs || prunedParses || prunedRejCache) {
+    console.log(`[startup] pruned ${prunedListings} cached listings, ${prunedMaps} maps entries, ${prunedNotified} notified fingerprints, ${prunedRejections} monitor rejections, ${prunedMsgRefs} telegram message refs, ${prunedParses} parses, ${prunedRejCache} rejection-cache entries`);
   }
 } catch (err) {
   console.error('[startup] cache prune failed:', err instanceof Error ? err.message : err);

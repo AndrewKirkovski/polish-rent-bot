@@ -13,6 +13,9 @@ export interface RentalCost {
   mediaParts: Array<{ label: string; value: number }>; // utilities paid on top of czynsz
   mediaSum: number; // sum of mediaParts
   total: number; // najem + czynsz + mediaSum
+  /** false when the base rent is missing / "zapytaj o cenę" (price<=0): `total` is then just
+   *  czynsz+media, NOT the real monthly cost, so it must not be treated as a budget figure. */
+  basePriceKnown: boolean;
 }
 
 // Display order for the utility breakdown.
@@ -37,6 +40,7 @@ export function computeRentalCost(
   parsed: ParsedRentalData | null | undefined,
 ): RentalCost {
   const najem = listing.price ?? 0;
+  const basePriceKnown = najem > 0;
   const czynsz = parsed?.adminFee ?? listing.rent ?? 0;
 
   const mediaParts: Array<{ label: string; value: number }> = [];
@@ -49,5 +53,5 @@ export function computeRentalCost(
   }
   const mediaSum = mediaParts.reduce((sum, p) => sum + p.value, 0);
 
-  return { najem, czynsz, mediaParts, mediaSum, total: najem + czynsz + mediaSum };
+  return { najem, czynsz, mediaParts, mediaSum, total: najem + czynsz + mediaSum, basePriceKnown };
 }

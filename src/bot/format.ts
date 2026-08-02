@@ -137,7 +137,9 @@ export function formatRentalCard(
   const headParts: string[] = [];
   if (listing.rooms != null) headParts.push(`${listing.rooms}к`);
   if (listing.area != null) headParts.push(`${listing.area}m²`);
-  headParts.push(zl(cost.total));
+  // When the base rent is unknown ("zapytaj o cenę") the total is only czynsz+media — not the real
+  // monthly cost — so don't present it as the price.
+  headParts.push(cost.basePriceKnown ? zl(cost.total) : 'цена по запросу');
   if (resultId) headParts.push(`[${resultId}]`);
   const headLine = `<b>${headParts.join(' · ')}</b>`;
 

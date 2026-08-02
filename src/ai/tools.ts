@@ -23,6 +23,7 @@ import {
   updateMonitorPlatform,
   cacheListing,
   getCachedListingByResultId,
+  getCachedListingByPlatform,
   getParsedListing,
   getAuthorizedTelegramIds,
 } from '../storage/db.js';
@@ -601,8 +602,9 @@ async function execFindRentals(
     if (accepted.length >= maxResults) break;
 
     // Reserve a result ID for this candidate up-front so even rejection paths
-    // (and the catch-all error handler below) can reference it.
-    const resultId = genId();
+    // (and the catch-all error handler below) can reference it. Reuse the listing's existing cached
+    // id (as the monitor does) so re-searching the same flat keeps its old [ID] resolvable.
+    const resultId = getCachedListingByPlatform(listing.platform, listing.platformId)?.resultId ?? genId();
 
     // Pre-parse budget short-circuit: base rent alone already over budget → the true total
     // can only be higher, so skip the expensive enrich + AI parse (see exceedsBudgetFloor).
@@ -722,6 +724,7 @@ async function execFindRentals(
         type: a.type,
         maxMinutes: a.maxMinutes,
         line: a.line,
+        stations: a.stations, // carry the metro-station whitelist into scoring/gating
       }));
 
       if (wantLocation) {
@@ -841,6 +844,7 @@ async function execFindItems(
   const query = String(input.query ?? '');
   const city = input.city ? String(input.city).toLowerCase().trim() : undefined;
   const cityId = city ? resolveCityId(city) : undefined;
+  const cityUnresolved = city != null && cityId === undefined; // city given but not in the map → nationwide
   const priceFrom = input.priceFrom as number | undefined;
   const priceTo = input.priceTo as number | undefined;
   const maxResults = Math.min(Math.max((input.maxResults as number) || 5, 1), 10);
@@ -878,7 +882,13 @@ async function execFindItems(
   ctx.lastSearchResults = candidates;
   seedSearchResultsForFamily(ctx, candidates);
 
-  const displayTotal = mandatoryKeywords.length > 0 ? filteredItems.length : result.totalAvailable;
+  // Report the platform population as the total; the first-page keyword-match count is NOT the total
+  // number of matching items (more likely sit beyond the fetched page).
+  const displayTotal = result.totalAvailable;
+  const keywordMatchNote = mandatoryKeywords.length > 0
+    ? ` (${filteredItems.length} of the first ${result.items.length} fetched match the keywords)`
+    : '';
+  const cityNote = cityUnresolved ? ` ⚠️ город "${city}" не распознан — искали по всей Польше.` : '';
   const searchId = genId();
   ctx.lastSearchId = searchId;
   // Don't clear resultMap — old IDs stay resolvable across searches
@@ -967,7 +977,7 @@ async function execFindItems(
     : '';
   const idList = shownIds.map((id, i) => `${id}: "${shown[i]?.title?.slice(0, 50) ?? '?'}"`).join(', ');
 
-  return `Search ${searchId}: showed ${shown.length} item(s). Result IDs: ${idList}. Total available: ${displayTotal}${mandatoryKeywords.length > 0 ? ` (filtered from ${result.totalAvailable} by mandatory keywords)` : ''}.${itemRejectionBreakdown}\n\nIMPORTANT: The user has ALREADY seen full details. When they reference a result by ID (e.g. "${shownIds[0] ?? 'ABC123'}"), use that ID. Do NOT repeat listing details. Just offer next steps.`;
+  return `Search ${searchId}: showed ${shown.length} item(s). Result IDs: ${idList}. Total available: ${displayTotal}${keywordMatchNote}.${cityNote}${itemRejectionBreakdown}\n\nIMPORTANT: The user has ALREADY seen full details. When they reference a result by ID (e.g. "${shownIds[0] ?? 'ABC123'}"), use that ID. Do NOT repeat listing details. Just offer next steps.`;
 }
 
 // ---------------------------------------------------------------------------

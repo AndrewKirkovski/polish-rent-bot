@@ -46,12 +46,22 @@ function locationWords(value: string): string[] {
     .filter((word) => word.length > 1 && !/^\d+$/.test(word) && !generic.has(word));
 }
 
+/** Two location words are "the same place" if identical or they share a prefix proportional to the
+ *  shorter word (min 4 chars). A fixed 4-char prefix both over-matched distinct places (Wilanowska
+ *  vs Wilanowie) and under-matched short Polish declensions (wola vs woli). */
+function locationWordsSimilar(a: string, b: string): boolean {
+  if (a === b) return true;
+  const minLen = Math.min(a.length, b.length);
+  if (minLen < 4) return false;
+  const need = Math.min(6, Math.ceil(minLen * 0.7));
+  return a.slice(0, need) === b.slice(0, need);
+}
+
 export function locationEvidenceSupportsAnchor(query: string, evidence: string): boolean {
   const anchorWords = locationWords(query);
   const evidenceWords = locationWords(evidence);
   if (anchorWords.length === 0 || evidenceWords.length === 0) return false;
-  const matched = anchorWords.filter((anchor) => evidenceWords.some((word) =>
-    word === anchor || (word.length >= 4 && anchor.length >= 4 && word.slice(0, 4) === anchor.slice(0, 4))));
+  const matched = anchorWords.filter((anchor) => evidenceWords.some((word) => locationWordsSimilar(word, anchor)));
   const required = anchorWords.length === 1 ? 1 : Math.ceil(anchorWords.length * 0.6);
   return matched.length >= required;
 }
@@ -143,6 +153,7 @@ export function rentalParseCacheKey(
   const desc = (listing.description || '').slice(0, 8000);
   const parts = [
     version,
+    `model:${PARSE_MODEL}`, // a model swap must re-parse, not serve the old model's cached output
     `title:${listing.title}`,
     desc,
     `price:${listing.price}`,
@@ -181,6 +192,7 @@ export function itemParseCacheKey(
     .join(',');
   const parts = [
     version,
+    `model:${PARSE_MODEL}`,
     `title:${item.title}`,
     desc,
     `price:${item.price}`,
@@ -565,12 +577,15 @@ Set rejected=true ONLY if the listing clearly violates a criterion.
 If the listing passes or info is unclear, set rejected=false and rejectionReason=null.`;
 
 export async function evaluateRejection(
-  listing: { platform: string; platformId: string; title: string },
+  listing: { platform: string; platformId: string; title: string; price?: number | null; description?: string | null },
   universalParse: ParsedRentalData | ParsedItemData,
   rejectionCriteria: string,
   ctx: AiCallCtx = {},
 ): Promise<RejectionResult> {
-  const criteriaHash = hashText(rejectionCriteria);
+  // Fold the listing content (price + description) into the cache key so a CHANGED listing — e.g. a
+  // price drop from over-budget to in-budget — re-evaluates instead of returning the stale verdict.
+  const contentSig = `${listing.price ?? ''}|${(listing.description ?? '').slice(0, 4000)}`;
+  const criteriaHash = hashText(`${rejectionCriteria}::${contentSig}`);
 
   // Check rejection cache
   const cached = getRejectionCache(listing.platform, listing.platformId, criteriaHash);

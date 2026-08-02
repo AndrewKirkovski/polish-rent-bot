@@ -68,11 +68,16 @@ export function fingerprintsMatch(a: ListingFingerprint, b: ListingFingerprint):
   if (a.city !== b.city) return false;
   if (a.rooms != null && b.rooms != null && a.rooms !== b.rooms) return false;
   if ((a.rooms == null) !== (b.rooms == null)) return false;
-  if (!bucketsClose(a.areaBucket, b.areaBucket, 5)) return false;
+  // areaBucket 0 means "area unknown". Only apply the area gate when BOTH areas are known —
+  // otherwise two different area-less flats auto-pass it and can be merged as false duplicates.
+  const areaKnown = a.areaBucket > 0 && b.areaBucket > 0;
+  if (areaKnown && !bucketsClose(a.areaBucket, b.areaBucket, 5)) return false;
   if (!bucketsClose(a.priceBucket, b.priceBucket, 50)) return false;
 
   if (a.streetKey && b.streetKey && a.streetKey === b.streetKey) return true;
-  return jaccard(a.titleKey, b.titleKey) >= 0.6;
+  // With a known area corroborating, a 0.6 title match is enough; with area unknown, demand a much
+  // stronger title match so generic "2 pokoje Mokotów" titles don't collapse distinct flats.
+  return jaccard(a.titleKey, b.titleKey) >= (areaKnown ? 0.6 : 0.85);
 }
 
 function listingQuality(listing: Listing): number {

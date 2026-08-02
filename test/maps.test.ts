@@ -79,6 +79,19 @@ test('location fusion: a fuzzy OLX pin is kept at the pin (not snapped to the st
   assert.ok(e.uncertaintyMeters <= 400, `metro-confirmed → tightened, got ${e.uncertaintyMeters}`);
 });
 
+test('location fusion: a pin far from the claimed station is flagged as a conflict, not falsely tightened', async () => {
+  // Pin is near Młynów, but the hint claims "at metro Politechnika" (~4 km away): the constraint must
+  // NOT corroborate/tighten — the point stays coarse and the disagreement is surfaced.
+  const parsed = {
+    addressHint: null,
+    locationHint: { query: 'metro Politechnika, Warszawa', kind: 'transit_stop', anchorDistanceMeters: 0, uncertaintyMeters: 20, evidence: 'przy metrze Politechnika' },
+  } as unknown as ParsedRentalData;
+  const e = await enrichListingLocation(olxListing({ coordsPrecise: false }), parsed);
+  assert.equal(e.precision, 'district');
+  assert.ok(e.uncertaintyMeters >= 1000, `not falsely tightened, got ${e.uncertaintyMeters}`);
+  assert.match(e.source, /расхожден/);
+});
+
 test('metroNearestWithUncertainty keeps the truly-nearest station first when anchor offset > uncertainty', () => {
   // At Politechnika: nearest is Politechnika (0 m), second is Pole Mokotowskie (~1.6 km walk).
   // With anchorDistanceMeters(1500) > uncertaintyMeters(600) the derived range-min inverts

@@ -297,7 +297,12 @@ function makeBroadcastSendFn(bot: TelegramBot): SendFn {
     // If no explicit parse_mode override, transform Claude's Markdown to HTML (once, not per recipient)
     const finalText = (!rest || !('parse_mode' in rest)) ? mdToHtml(text) : text;
     const sendOpts = { parse_mode: 'HTML', ...rest } as TelegramBot.SendMessageOptions;
-    await broadcastToFamily((id) => safeSend(bot, id, finalText, sendOpts, resultId));
+    // Telegram hard-limits a message at 4096 chars; a long agent reply would otherwise be rejected
+    // and silently swallowed by safeSend. Split it into chunks.
+    const chunks = splitMessage(finalText);
+    await broadcastToFamily(async (id) => {
+      for (const chunk of chunks) await safeSend(bot, id, chunk, sendOpts, resultId);
+    });
   };
 }
 
@@ -357,7 +362,7 @@ export function startBot(): TelegramBot {
   const echoFn = makeEchoFn(bot);
 
   // --- /start ---
-  bot.onText(/\/start/, async (msg: Msg) => {
+  bot.onText(/^\/start(?:@\w+)?\b/, async (msg: Msg) => {
     try {
       if (!(await ensureAuth(msg))) return;
       const text = [
@@ -379,7 +384,7 @@ export function startBot(): TelegramBot {
   });
 
   // --- /help ---
-  bot.onText(/\/help/, async (msg: Msg) => {
+  bot.onText(/^\/help(?:@\w+)?\b/, async (msg: Msg) => {
     try {
       if (!(await ensureAuth(msg))) return;
       const text = [

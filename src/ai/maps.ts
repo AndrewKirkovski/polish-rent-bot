@@ -542,9 +542,13 @@ export async function centralStationEstimate(
 ): Promise<CentralStationEstimate> {
   try {
     const c = await calculateCommute(lat, lng, WARSZAWA_CENTRALNA.address, 'transit', getNextMondayWarsawTs(11));
-    const min = c.durationMinutes;
+    const base = c.durationMinutes;
+    // For an uncertain location the true door-to-door time straddles `base`: widen the range BOTH
+    // ways so the min is genuinely optimistic. checkCenterGate rejects only when even the optimistic
+    // min exceeds the limit, so a symmetric range keeps borderline approximate flats (with a ⚠️).
     const extra = approximate ? Math.ceil(uncertaintyMeters / WALK_METERS_PER_MINUTE) : 0;
-    const max = Math.max(min + 1, Math.ceil(min * 1.25) + extra);
+    const min = Math.max(1, base - extra);
+    const max = Math.max(min + 1, Math.ceil(base * 1.25) + extra);
     return { distanceText: ruDistanceText(c.distance), durationMinRange: { min, max } };
   } catch (err) {
     console.error('[maps] Centralna estimate failed:', err instanceof Error ? err.message : err);
@@ -967,6 +971,9 @@ export function applyLocationUncertainty(
       .map((place) => place.walkingMinutesRange)
       .filter((range): range is { min: number; max: number } => range != null);
     if (places.length === 0) {
+      // This branch only runs for an APPROXIMATE/anchored location, where the true position could
+      // sit closer to a place than the point search reached — so an empty result is UNKNOWN (0.5),
+      // not a confirmed absence. (A confirmed exact-location empty scores 0 in the non-anchored path.)
       return { ...amenity, places, nearest: null, withinLimit: false, uncertain: true };
     }
     if (!pref || ranges.length === 0) {

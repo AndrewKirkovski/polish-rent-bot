@@ -161,6 +161,24 @@ test('computeRentalCost includes estimatedMedia.other lump', () => {
   assert.ok(c.mediaParts.some((p) => p.label === 'media' && p.value === 400));
 });
 
+test('computeRentalCost flags a missing base price and does not present czynsz+media as the cost', () => {
+  const c = computeRentalCost({ price: 0, rent: 500 }, mkParsed({ adminFee: 600, estimatedMedia: { water: null, electricity: 200, gas: null, internet: null, heating: null, other: null } }));
+  assert.equal(c.basePriceKnown, false);
+  assert.equal(c.najem, 0);
+  assert.equal(c.total, 800); // 0 + 600 + 200 — NOT a real monthly total
+});
+
+test('rental schema tolerates a unit-suffixed numeric instead of discarding the whole parse', () => {
+  const p = ParsedRentalDataSchema.parse({ deposit: '6000 zł', adminFee: 600, estimatedMedia: { electricity: '~200' } });
+  assert.equal(p.deposit, null);                    // bad field → null, not a thrown parse
+  assert.equal(p.adminFee, 600);                    // sibling fields survive
+  assert.equal(p.estimatedMedia.electricity, null);
+});
+
+test('locationEvidenceSupportsAnchor accepts a Polish declension (wola/woli)', () => {
+  assert.equal(locationEvidenceSupportsAnchor('metro Wola, Warszawa', 'przy stacji Woli'), true);
+});
+
 test('extractResultId reads codes from HTML captions', () => {
   assert.equal(extractResultId('<b>[GM7WX3]</b>\nrest'), 'GM7WX3');
   assert.equal(extractResultId('[GM7WX3] rest'), 'GM7WX3');

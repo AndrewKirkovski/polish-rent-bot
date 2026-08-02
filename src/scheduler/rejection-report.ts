@@ -33,6 +33,17 @@ function link(row: MonitorRejectionRow): string {
 export function buildRejectionReport(rows: MonitorRejectionRow[]): string | null {
   if (rows.length === 0) return null;
 
+  // One physical flat can be rejected by several overlapping monitors in the same window; count it
+  // once (first rejection wins) so the "отклонено N" header and per-category lists don't inflate.
+  const seenListing = new Set<string>();
+  rows = rows.filter((r) => {
+    const key = `${r.platform}:${r.platform_id}`;
+    if (seenListing.has(key)) return false;
+    seenListing.add(key);
+    return true;
+  });
+  if (rows.length === 0) return null;
+
   const byCat = new Map<string, MonitorRejectionRow[]>();
   for (const r of rows) {
     const arr = byCat.get(r.category);

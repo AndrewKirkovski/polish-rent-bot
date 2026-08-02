@@ -260,9 +260,11 @@ export function parseOtodomDetailAd(ad: any): Listing | null {
     lng: ad.location?.coordinates?.longitude ?? null,
     phone: ad.contactDetails?.phone ?? null,
     contactName: ad.owner?.name ?? null,
-    advertiserType: (ad.advertiserType === 'AGENCY' || ad.agency) ? 'agency'
-      : ad.advertiserType === 'DEVELOPER' ? 'developer'
-      : (ad.advertiserType === 'PRIVATE' || ad.owner?.type === 'PRIVATE') ? 'private' : null,
+    // Check the explicit advertiserType FIRST; the truthy `ad.agency` object must be the LAST
+    // resort, else a DEVELOPER/PRIVATE listing that carries an agency object is mislabeled 'agency'.
+    advertiserType: ad.advertiserType === 'DEVELOPER' ? 'developer'
+      : (ad.advertiserType === 'PRIVATE' || ad.owner?.type === 'PRIVATE') ? 'private'
+      : (ad.advertiserType === 'AGENCY' || ad.agency) ? 'agency' : null,
     agencyName: ad.agency?.name ?? null,
     photos: (ad.images ?? []).map((img: any) => img.large ?? img.medium ?? img.small ?? ''),
     createdAt: ad.createdAt ?? '',

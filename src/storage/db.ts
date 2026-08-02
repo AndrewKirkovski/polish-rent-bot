@@ -785,14 +785,15 @@ export function cleanExpiredMapsCache(maxAgeDays = 7): number {
   return result.changes;
 }
 
-/** Delete cache entries where the stored result has empty places (error-cached data). */
+/** Purge ONLY error-flagged nearby results. A genuine "nothing within radius" is an empty places
+ *  array too, but it's a valid, cacheable negative — deleting every empty-places entry on boot
+ *  wiped those and forced a needless re-fetch each start. Key on the explicit error flag instead. */
 export function clearEmptyMapsCache(): number {
   const db = getDb();
-  // Matches cached AmenityResult objects where places array is empty: "places":[]
   const result = db.prepare(`
     DELETE FROM maps_cache
     WHERE cache_key LIKE 'nearby%'
-      AND result LIKE '%"places":[]%'
+      AND result LIKE '%"error":true%'
   `).run();
   return result.changes;
 }
@@ -833,6 +834,16 @@ export function saveRejectionCache(
       rejection_reason = excluded.rejection_reason,
       cached_at = datetime('now')
   `).run(platform, platformId, criteriaHash, rejected ? 1 : 0, rejectionReason);
+}
+
+/** Age-prune the AI parse cache (a stale listing that reappears is simply re-parsed). */
+export function cleanOldParsedListings(days = 90): number {
+  return getDb().prepare(`DELETE FROM parsed_listings WHERE parsed_at < datetime('now', ?)`).run(`-${days} days`).changes;
+}
+
+/** Age-prune the rejection-eval cache so it doesn't grow without bound. */
+export function cleanOldRejectionCache(days = 30): number {
+  return getDb().prepare(`DELETE FROM rejection_cache WHERE cached_at < datetime('now', ?)`).run(`-${days} days`).changes;
 }
 
 // ---------------------------------------------------------------------------

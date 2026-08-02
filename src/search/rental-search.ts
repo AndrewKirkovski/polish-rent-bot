@@ -28,7 +28,9 @@ export const CITY_PROVINCE_MAP: Record<string, string> = {
 };
 
 export function resolveCityId(name: string): number | undefined {
-  return CITY_ID_MAP[name.toLowerCase().trim()];
+  // Fold diacritics so "Kraków"/"Gdańsk" resolve to the ASCII keys (krakow/gdansk); otherwise the
+  // lookup silently misses and the search falls back to all of Poland.
+  return CITY_ID_MAP[stripDiacritics(name)];
 }
 
 /** Map roomsFrom/roomsTo to OLX API room counts (1–4). */
@@ -68,7 +70,7 @@ export interface RentalSearchParams {
 export async function searchRentalListings(params: RentalSearchParams): Promise<Listing[]> {
   const city = params.city.toLowerCase().trim();
   const districts = params.districts ?? [];
-  const province = params.province ?? CITY_PROVINCE_MAP[city];
+  const province = params.province ?? CITY_PROVINCE_MAP[stripDiacritics(city)];
   const platforms = params.platforms ?? 'all';
   const doOlx = platforms === 'olx' || platforms === 'all';
   const doOtodom = platforms === 'otodom' || platforms === 'all';
@@ -142,6 +144,12 @@ export async function searchRentalListings(params: RentalSearchParams): Promise<
   if (failed.length > 0) {
     console.error('[rental-search] Some searches failed:', failed.map((r) => (r as PromiseRejectedResult).reason));
   }
+  // Distinguish a genuine empty result from a total backend outage: if NOTHING was fetched
+  // successfully and at least one fetch errored, surface it so the caller can say "search failed,
+  // retry" instead of the misleading "no results — broaden your search".
+  if (searchResults.length - failed.length === 0 && failed.length > 0) {
+    throw new Error(`rental search failed: all ${failed.length} backend fetch(es) errored`);
+  }
 
   if (params.roomsFrom != null) {
     filtered = filtered.filter((l) => l.rooms == null || l.rooms >= params.roomsFrom!);
@@ -167,7 +175,10 @@ export async function searchRentalListings(params: RentalSearchParams): Promise<
   if (districts.length > 0) {
     const normalizedDistricts = districts.map(stripDiacritics);
     filtered = filtered.filter((l) => {
-      if (!l.district) return false;
+      // Results are already district-scoped server-side (OLX district_id / Otodom locations), and
+      // most Otodom + some OLX items carry a null district label. Match the null-passthrough
+      // convention of the sibling filters above; only drop a listing whose KNOWN district differs.
+      if (!l.district) return true;
       const nd = stripDiacritics(l.district);
       return normalizedDistricts.some((d) => nd.includes(d) || d.includes(nd));
     });

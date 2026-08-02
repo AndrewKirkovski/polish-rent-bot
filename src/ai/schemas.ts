@@ -3,6 +3,10 @@
 
 import { z } from 'zod';
 
+// A tolerant nullable number: a wrong-typed value (e.g. Haiku returning "6000 zł" or "~200")
+// falls back to null instead of throwing and discarding the ENTIRE parse of the listing.
+const nnum = z.number().nullable().default(null).catch(null);
+
 // ---------------------------------------------------------------------------
 // Rental listing schema — matches ParsedRentalData interface
 // ---------------------------------------------------------------------------
@@ -11,15 +15,15 @@ import { z } from 'zod';
 // The smaller output also stops the old ~30-field schema truncating at max_tokens.
 export const ParsedRentalDataSchema = z.looseObject({
   // --- cost / pipeline-critical ---
-  deposit: z.number().nullable().default(null),
+  deposit: nnum,
   depositNote: z.string().nullable().default(null),
-  adminFee: z.number().nullable().default(null),
+  adminFee: nnum,
   addressHint: z.string().nullable().default(null),
   locationHint: z.object({
     query: z.string().nullable().default(null),
     kind: z.enum(['address', 'intersection', 'building', 'estate', 'transit_stop', 'landmark', 'neighborhood', 'none']).default('none'),
-    anchorDistanceMeters: z.number().min(0).max(50_000).nullable().default(null),
-    uncertaintyMeters: z.number().min(0).max(20_000).nullable().default(null),
+    anchorDistanceMeters: z.number().min(0).max(50_000).nullable().default(null).catch(null),
+    uncertaintyMeters: z.number().min(0).max(20_000).nullable().default(null).catch(null),
     evidence: z.string().nullable().default(null),
   }).default({
     query: null,
@@ -30,12 +34,12 @@ export const ParsedRentalDataSchema = z.looseObject({
   }),
   isConcreteApartment: z.boolean().nullable().default(true),
   estimatedMedia: z.object({
-    water: z.number().nullable().default(null),
-    electricity: z.number().nullable().default(null),
-    gas: z.number().nullable().default(null),
-    internet: z.number().nullable().default(null),
-    heating: z.number().nullable().default(null),
-    other: z.number().nullable().default(null),
+    water: nnum,
+    electricity: nnum,
+    gas: nnum,
+    internet: nnum,
+    heating: nnum,
+    other: nnum,
   }).default({
     water: null,
     electricity: null,
@@ -51,7 +55,7 @@ export const ParsedRentalDataSchema = z.looseObject({
   balcony: z.boolean().nullable().default(null),
   parkingIncluded: z.boolean().nullable().default(null),
   // --- work-from-home fit (the signals this household ranks on) ---
-  separateRooms: z.number().nullable().default(null),
+  separateRooms: nnum,
   layoutType: z.enum(['rozkladowy', 'przechodni', 'open']).nullable().default(null),
   twoOfficeCapable: z.boolean().nullable().default(null),
   quiet: z.enum(['quiet', 'mixed', 'noisy']).nullable().default(null),
@@ -95,5 +99,5 @@ export const RejectionResultSchema = z.object({
 
 export const RentalTriageSchema = z.object({
   apartment: z.boolean().default(true),   // false = single room / coliving / not one flat
-  rooms: z.number().nullable().default(null),
+  rooms: nnum,
 });

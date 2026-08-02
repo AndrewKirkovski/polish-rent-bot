@@ -215,19 +215,33 @@ function fuseLocationCandidates(candidates: LocCandidate[], constraint: MetroCon
     sw += w;
     invVar += 1 / (c.sigma * c.sigma);
   }
-  let lat = lat0 + sy / sw / 110_540;
-  let lng = lng0 + sx / sw / (cosLat * 111_320);
+  const lat = lat0 + sy / sw / 110_540;
+  const lng = lng0 + sx / sw / (cosLat * 111_320);
   let sigma = Math.sqrt(1 / invVar);
+  // Inverse-variance combine assumes the inputs agree; if the cluster is actually spread out
+  // (two "precise" points 360 m apart), don't report tighter than that spread. Inflate by the
+  // weighted RMS distance of members from the fused point.
+  if (cluster.length > 1) {
+    let sse = 0;
+    for (const c of cluster) {
+      const dm = haversineMeters(lat, lng, c.lat, c.lng);
+      sse += (c.reliability / (c.sigma * c.sigma)) * dm * dm;
+    }
+    sigma = Math.max(sigma, Math.sqrt(sse / sw));
+  }
   let note = '';
 
-  // Metro station as a radial CONSTRAINT: does the fused point sit ~claimed-distance from it?
+  // Metro station as a radial CONSTRAINT: does the fused point genuinely sit on the claimed annulus?
   if (constraint) {
     const d = haversineMeters(lat, lng, constraint.station.lat, constraint.station.lng);
-    if (Math.abs(d - constraint.distance) <= constraint.margin + sigma + STATION_FOOTPRINT_M) {
-      sigma = Math.max(120, Math.min(sigma, constraint.margin + STATION_FOOTPRINT_M)); // corroborated → tighten
+    const discrepancy = Math.abs(d - constraint.distance);
+    // Corroborate only when the point is really near the annulus — the point's own sigma must NOT
+    // buy agreement — and never tighten below the actual positional discrepancy.
+    if (discrepancy <= constraint.margin + STATION_FOOTPRINT_M) {
+      sigma = clampMeters(Math.max(discrepancy, Math.min(sigma, constraint.margin + STATION_FOOTPRINT_M)), 120, sigma);
       note = `; ~${Math.round(d)} м до ${constraint.station.name}`;
     } else {
-      sigma = Math.max(sigma, Math.abs(d - constraint.distance)); // sources disagree → widen + flag
+      sigma = Math.max(sigma, discrepancy); // sources disagree → widen + flag
       note = `; расхождение с ${constraint.station.name}`;
     }
   }
