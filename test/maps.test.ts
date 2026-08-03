@@ -92,6 +92,19 @@ test('location fusion: a pin far from the claimed station is flagged as a confli
   assert.match(e.source, /расхожден/);
 });
 
+test('applyLocationUncertainty honors the groceries transit fallback at an approximate location', () => {
+  // Walk 19 min (over the 10-min limit) but 7 min by bus — the point gate passed via transit; after
+  // uncertainty widening the WALKING range is still over limit, so this must stay within-limit by transit
+  // (not hard-reject a supermarket that's a short bus ride away).
+  const place = { name: 'Biedronka', walkingMinutes: 19, transitMinutes: 7, distanceMeters: 1425, distance: '1.4 км' };
+  const amenities = [{ type: 'groceries', places: [place], nearest: place, withinLimit: true }] as unknown as Parameters<typeof applyLocationUncertainty>[0];
+  const prefs = [{ type: 'groceries', maxMinutes: 10 }] as unknown as Parameters<typeof applyLocationUncertainty>[1];
+  const [g] = applyLocationUncertainty(amenities, prefs, 300, 0);
+  assert.equal(g.withinLimit, true, 'transit fallback should keep it within limit');
+  // Sanity: the walking range really is over the limit, so the pass is due to transit, not walking.
+  assert.ok((g.nearest?.walkingMinutesRange?.min ?? 0) > 10, `walking range should exceed limit, got ${JSON.stringify(g.nearest?.walkingMinutesRange)}`);
+});
+
 const cand = (over: Partial<LocCandidate>): LocCandidate => ({ lat: 52.2385, lng: 20.9594, sigma: 120, reliability: 0.85, precisionFloor: 'street', source: 'pin', evidence: null, ...over });
 
 test('fuseLocationCandidates: single candidate is returned unchanged', () => {

@@ -6,7 +6,7 @@ import sanitizeHtml from 'sanitize-html';
 import type { Listing, ParsedRentalData, ParsedItemData, LocationScore, NearbyPlace } from '../types.js';
 import type { ItemListing } from '../crawlers/olx-items.js';
 import { computeRentalCost } from '../cost.js';
-import { escapeHtml, TELEGRAM_SANITIZE } from '../utils/html.js';
+import { escapeHtml, TELEGRAM_SANITIZE, decodeBasicEntities } from '../utils/html.js';
 
 /** Repair broken HTML from message splitting — close unclosed tags, strip orphan close tags */
 function sanitizeChunk(html: string): string {
@@ -43,11 +43,12 @@ function metricRangeDistance(meters: number, bound: 'lower' | 'upper'): string {
  *  but a custom emoji counts as its fallback character(s). Used to decide whether a
  *  card fits the 1024-char photo-caption budget and to drive the safety-trim. */
 function visibleText(html: string): string {
-  return html
-    .replace(/<tg-emoji[^>]*>([^<]*)<\/tg-emoji>/g, '$1') // keep the fallback emoji
-    .replace(/<a\b[^>]*>([\s\S]*?)<\/a>/g, '$1')          // keep anchor text, drop href
-    .replace(/<[^>]+>/g, '')                              // strip remaining tags
-    .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&'); // count entities as 1 char (& last)
+  return decodeBasicEntities(
+    html
+      .replace(/<tg-emoji[^>]*>([^<]*)<\/tg-emoji>/g, '$1') // keep the fallback emoji
+      .replace(/<a\b[^>]*>([\s\S]*?)<\/a>/g, '$1')          // keep anchor text, drop href
+      .replace(/<[^>]+>/g, ''),                             // strip remaining tags
+  ); // count entities as 1 visible char
 }
 
 export function captionLength(html: string): number {

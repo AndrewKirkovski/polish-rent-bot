@@ -9,6 +9,13 @@ export function escapeHtml(text: string | number | null | undefined): string {
     .replace(/>/g, '&gt;');
 }
 
+/** Inverse of escapeHtml for the three basic entities — decode &lt;/&gt;/&amp; back to </>/&.
+ *  Ampersand LAST so an escaped "&amp;lt;" doesn't get double-decoded. Used when rendering
+ *  already-escaped text as PLAIN (no parse_mode), where Telegram won't decode entities itself. */
+export function decodeBasicEntities(text: string): string {
+  return text.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+}
+
 /** sanitize-html options that keep only Telegram-supported tags (was duplicated in format + telegram). */
 export const TELEGRAM_SANITIZE = {
   allowedTags: ['b', 'strong', 'i', 'em', 'u', 'ins', 's', 'strike', 'del',

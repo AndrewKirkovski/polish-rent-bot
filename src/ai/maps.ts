@@ -509,8 +509,12 @@ function offlineMetroAmenity(lat: number, lng: number, pref: AmenityPreference):
   }
   const places = near.map((n) => offlineMetroPlace(n, pref.line));
   const nearest = places[0] ?? null;
-  const withinLimit = nearest != null && nearest.walkingMinutes <= pref.maxMinutes;
-  return { type: 'metro', requestedLine: pref.line, places, nearest, withinLimit };
+  // Out of the Warsaw metro service area (a non-Warsaw listing carrying a metro pref): the nearest
+  // "Warsaw" station is 100+ km away. Treat metro as UNKNOWN (keep-with-flag) rather than a confident
+  // hard reject naming a station ~250 km away — mirrors the inMetroArea suppression in scoreLocation.
+  const outOfArea = near.length > 0 && near[0].crowMeters > METRO_SERVICE_RADIUS_M;
+  const withinLimit = !outOfArea && nearest != null && nearest.walkingMinutes <= pref.maxMinutes;
+  return { type: 'metro', requestedLine: pref.line, places, nearest, withinLimit, uncertain: outOfArea || undefined };
 }
 
 /** Expand one place's point distance into a ± range using the anchor uncertainty. Order-preserving:
@@ -1000,14 +1004,23 @@ export function applyLocationUncertainty(
     if (!pref || ranges.length === 0) {
       return { ...amenity, places, nearest: places[0] ?? null };
     }
-    const withinLimit = ranges.some((range) => range.max <= pref.maxMinutes);
+    // Transit fallback (groceries): a place reachable by transit within the limit is within-limit
+    // regardless of the widened WALKING range — mirrors computeWithinLimit on the point-based path.
+    // Without this, uncertainty expansion would falsely hard-reject a supermarket that is far on foot
+    // but a short bus ride away (transit time doesn't grow with the walking-range widening).
+    const tc = getTransportConfig(amenity.type);
+    const transitPlace = tc.transitFallback
+      ? places.find((place) => place.transitMinutes != null && place.transitMinutes <= pref.maxMinutes) ?? null
+      : null;
+    const withinLimit = ranges.some((range) => range.max <= pref.maxMinutes) || transitPlace != null;
     const uncertain = amenity.error === true
       || (!withinLimit && anchorTooBroadForStrictVerdict)
       || (!withinLimit && ranges.some((range) => range.min <= pref.maxMinutes));
     const representative = withinLimit
-      ? places
+      ? (places
           .filter((place) => (place.walkingMinutesRange?.max ?? Infinity) <= pref.maxMinutes)
           .sort((a, b) => (a.walkingMinutesRange?.max ?? Infinity) - (b.walkingMinutesRange?.max ?? Infinity))[0]
+          ?? transitPlace ?? places[0])
       : uncertain
         ? places
             .filter((place) => (place.walkingMinutesRange?.min ?? Infinity) <= pref.maxMinutes)

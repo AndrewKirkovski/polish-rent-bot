@@ -61,6 +61,10 @@ export function assertBroadcastOk(result: { delivered: number; failed: number[] 
 
 export function wrapBroadcastPhotos(baseSend: BroadcastPhotosFn): BroadcastPhotosFn {
   return async (_chatId, urls, caption, meta) => {
-    await broadcastToFamily((id) => baseSend(id, urls, caption, meta));
+    const result = await broadcastToFamily((id) => baseSend(id, urls, caption, meta));
+    // Surface a TOTAL failure (nobody received the photo — e.g. expired CDN URLs or a caption
+    // Telegram rejects) so the caller's try/catch text fallback is reachable; otherwise
+    // sendRentalCard/sendItemCard would return having sent nothing. Partial delivery is fine.
+    assertBroadcastOk(result, 'Card photos');
   };
 }

@@ -632,10 +632,12 @@ export function beginFullRescan(
       DELETE FROM seen_listings
       WHERE monitor_id IN (SELECT id FROM monitors WHERE active = 1)
     `).run().changes;
-    const monitorRejections = db.prepare(`
-      DELETE FROM monitor_rejections
-      WHERE monitor_id IN (SELECT id FROM monitors WHERE active = 1)
-    `).run().changes;
+    // Intentionally do NOT delete monitor_rejections: it is the daily-digest log, not analysis
+    // state the rescan needs cleared. Wiping it would drop rejections accumulated since the last
+    // digest (permanently, for flats since delisted) and let the rescan's full re-evaluation
+    // dominate the next digest. The digest dedups by platform:platform_id and cleanOldMonitorRejections
+    // bounds the table by age, so leaving it intact is both correct and safe.
+    const monitorRejections = 0;
 
     return saveFullRescanStatus({
       ...queued,

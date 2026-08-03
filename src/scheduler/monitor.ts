@@ -2,7 +2,7 @@
 // and calls a notification callback for each unseen result.
 
 import { searchItems, fetchItemPhone } from '../crawlers/olx-items.js';
-import { getMonitors, isListingSeen, markListingSeen, cleanOldSeen, cleanOldCachedListings, cleanOldNotifiedFingerprints, cleanOldMonitorRejections, cleanOldTelegramMessageRefs, startMonitorRun, finishMonitorRun, cacheListing, getCachedListingByPlatform, newUniqueResultId, isFingerprintNotified, markFingerprintNotified, recordMonitorRejection, getMonitorRejectionsSince, getAppState, setAppState, getFullRescanStatus, queueFullRescan, beginFullRescan, finishFullRescan, recoverInterruptedFullRescan, type FullRescanStatus, type MonitorRow } from '../storage/db.js';
+import { getMonitors, isListingSeen, markListingSeen, cleanOldSeen, cleanOldCachedListings, cleanOldNotifiedFingerprints, cleanOldMonitorRejections, cleanOldTelegramMessageRefs, cleanOldParsedListings, cleanOldRejectionCache, cleanExpiredMapsCache, startMonitorRun, finishMonitorRun, cacheListing, getCachedListingByPlatform, newUniqueResultId, isFingerprintNotified, markFingerprintNotified, recordMonitorRejection, getMonitorRejectionsSince, getAppState, setAppState, getFullRescanStatus, queueFullRescan, beginFullRescan, finishFullRescan, recoverInterruptedFullRescan, type FullRescanStatus, type MonitorRow } from '../storage/db.js';
 import { buildRejectionReport } from './rejection-report.js';
 import type { Listing, ParsedRentalData, ParsedItemData, LocationScore } from '../types.js';
 import type { ItemListing } from '../crawlers/olx-items.js';
@@ -262,6 +262,7 @@ export function startScheduler(
   // but stays live on page 1 would otherwise re-run triage+enrich+parse EVERY cycle forever. Count
   // consecutive defers per (monitor, listing); after MAX_PARSE_DEFERS give up so it exits the loop.
   const MAX_PARSE_DEFERS = 3;
+  const MAX_DEFER_ENTRIES = 5000; // bound the map (below): a listing that defers then vanishes never self-clears
   const parseDeferCounts = new Map<string, number>();
 
   recoverInterruptedFullRescan();
@@ -283,6 +284,11 @@ export function startScheduler(
     let rescanBeginFailed = false;
 
     try {
+      // A status stuck in 'running' at cycle entry is orphaned: cycles are serialized behind the
+      // `running` flag, so no rescan is actually executing here. Requeue it (a no-op otherwise) so a
+      // rescan that got stuck 'running' — e.g. a finishFullRescan DB write that threw inside the
+      // error handler — self-heals on the next cycle instead of blocking rescans until a restart.
+      recoverInterruptedFullRescan();
       fullRescan = getFullRescanStatus()?.state === 'queued';
       if (fullRescan) {
         try {
@@ -405,14 +411,23 @@ export function startScheduler(
 
               try {
                 // Best-effort early cache without ID — recall for rejected listings is low value.
-                // Delivered alerts overwrite with a real resultId below.
-                cacheListing({
-                  platform: workingListing.platform,
-                  platformId: workingListing.platformId,
-                  kind: monitor.type === 'rental' ? 'rental' : 'item',
-                  resultId: getCachedListingByPlatform(workingListing.platform, workingListing.platformId)?.resultId ?? null,
-                  listing: workingListing,
-                });
+                // Delivered alerts overwrite with a real resultId below. Guard against DOWNGRADING a
+                // richer row: if a prior search already cached this flat WITH geocoded coords and this
+                // pre-enrichment listing has none, skip the write so show_listing can still recompute
+                // the metro/Centralna block from the persisted coords (cacheListing overwrites
+                // listing_json unconditionally on conflict).
+                const prior = getCachedListingByPlatform(workingListing.platform, workingListing.platformId);
+                const priorHasCoords = monitor.type === 'rental' && (prior?.listing as Listing | undefined)?.lat != null;
+                const thisHasCoords = monitor.type === 'rental' && (workingListing as Listing).lat != null;
+                if (!(priorHasCoords && !thisHasCoords)) {
+                  cacheListing({
+                    platform: workingListing.platform,
+                    platformId: workingListing.platformId,
+                    kind: monitor.type === 'rental' ? 'rental' : 'item',
+                    resultId: prior?.resultId ?? null,
+                    listing: workingListing,
+                  });
+                }
               } catch (cacheErr) {
                 console.error('[scheduler] cacheListing failed:', cacheErr instanceof Error ? cacheErr.message : cacheErr);
               }
@@ -444,6 +459,14 @@ export function startScheduler(
                     continue;
                   }
                   parseDeferCounts.set(deferKey, deferrals);
+                  // Bound memory: a listing that defers once then drops off page 1 (sold/removed) never
+                  // reaches give-up or a successful parse, so its entry would linger for the process
+                  // lifetime. Evict oldest-first (Map insertion order) when over the cap.
+                  while (parseDeferCounts.size > MAX_DEFER_ENTRIES) {
+                    const oldest = parseDeferCounts.keys().next().value;
+                    if (oldest === undefined) break;
+                    parseDeferCounts.delete(oldest);
+                  }
                   console.log(`[scheduler] Defer (parse failed — budget unverifiable, ${deferrals}/${MAX_PARSE_DEFERS}) "${l.title}"`);
                   continue;
                 }
@@ -628,6 +651,12 @@ export function startScheduler(
       cleanOldNotifiedFingerprints(30);
       cleanOldMonitorRejections(7); // consumed by the daily report; keep a small buffer
       cleanOldTelegramMessageRefs(30);
+      // These three grow one row per distinct listing/criteria/geo-query and were previously pruned
+      // ONLY at boot — on a box that runs weeks between deploys they accumulate unbounded. Prune them
+      // on the same periodic sweep as their higher-churn siblings (same day counts as main.ts).
+      cleanOldParsedListings(90);
+      cleanOldRejectionCache(30);
+      cleanExpiredMapsCache();
 
       // Once-per-day aggregated rejection digest (monitors are silent per-listing).
       if (reportFn && !fullRescan) {

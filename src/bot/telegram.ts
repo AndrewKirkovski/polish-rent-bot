@@ -68,7 +68,7 @@ async function ensureAuth(msg: Msg): Promise<boolean> {
 
 import { marked } from 'marked';
 import sanitizeHtml from 'sanitize-html';
-import { TELEGRAM_SANITIZE } from '../utils/html.js';
+import { TELEGRAM_SANITIZE, decodeBasicEntities } from '../utils/html.js';
 
 // Configure marked for inline-only output (no <p> wrappers for single paragraphs)
 marked.setOptions({ breaks: true, gfm: true });
@@ -173,13 +173,15 @@ export async function broadcastText(text: string): Promise<void> {
   const bot = getBot();
   // Split to stay under Telegram's 4096-char limit (mirrors the card path). A busy-day digest can
   // exceed 4096; unsplit it would 400 "message too long" every cycle all day and never deliver.
+  // Broadcast each chunk as its OWN family fan-out so broadcastToFamily's per-recipient retry
+  // re-sends only the failed chunk, never a chunk a recipient already received.
   const chunks = splitMessage(text);
-  const result = await broadcastToFamily(async (id) => {
-    for (const chunk of chunks) {
+  for (const chunk of chunks) {
+    const result = await broadcastToFamily(async (id) => {
       await mustSend(bot, id, chunk, { parse_mode: 'HTML', disable_web_page_preview: true });
-    }
-  });
-  assertBroadcastOk(result, 'Daily rejection report');
+    });
+    assertBroadcastOk(result, 'Daily rejection report');
+  }
 }
 
 export async function sendEnrichedNotification(
@@ -252,9 +254,11 @@ type SendPhotosFn = (
 function stripHtml(html: string): string {
   // First: convert tg-emoji to their fallback emoji text before stripping
   const withFallbackEmoji = html.replace(/<tg-emoji[^>]*>([^<]*)<\/tg-emoji>/g, '$1');
-  // Then: strip ALL remaining tags using sanitize-html (handles malformed/unclosed tags correctly)
-  return sanitizeHtml(withFallbackEmoji, { allowedTags: [], allowedAttributes: {} })
-    .replace(/\n{3,}/g, '\n\n').trim();
+  // Then: strip ALL remaining tags using sanitize-html (handles malformed/unclosed tags correctly).
+  // sanitize-html RE-ENCODES text-node &/</> as entities, so decode them back — this string is sent
+  // with NO parse_mode (Telegram won't decode), otherwise the user sees literal "&amp;"/"&lt;".
+  const stripped = sanitizeHtml(withFallbackEmoji, { allowedTags: [], allowedAttributes: {} });
+  return decodeBasicEntities(stripped).replace(/\n{3,}/g, '\n\n').trim();
 }
 
 // Safe sendMessage wrapper — catches errors, retries with stripped HTML on parse failures

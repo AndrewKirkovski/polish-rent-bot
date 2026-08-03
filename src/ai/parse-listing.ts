@@ -23,6 +23,9 @@ const PARSE_MODEL = process.env.PARSE_MODEL || 'claude-haiku-4-5';
 // old-schema rows miss instead of returning objects without the new fields.
 export const RENTAL_PARSE_VERSION = 'wfh-v6-location-evidence-validation';
 export const ITEM_PARSE_VERSION = 'v2';
+// Folded into the rejection cache key; bump on any REJECTION_PROMPT change so already-cached
+// verdicts computed under the old rejection rules are re-evaluated instead of served stale.
+export const REJECTION_PROMPT_VERSION = 'rej-v1';
 
 function hashText(text: string): string {
   return createHash('sha256').update(text, 'utf-8').digest('hex');
@@ -666,7 +669,7 @@ export async function evaluateRejection(
   // parse type so an ITEM_PARSE_VERSION bump invalidates item verdicts and a RENTAL_PARSE_VERSION
   // bump rental verdicts — not the wrong half.
   const parseVersion = 'estimatedMedia' in universalParse ? RENTAL_PARSE_VERSION : ITEM_PARSE_VERSION;
-  const criteriaHash = hashText(`${parseVersion}::${PARSE_MODEL}::${rejectionCriteria}::${summaryParts.join('\n')}`);
+  const criteriaHash = hashText(`${REJECTION_PROMPT_VERSION}::${parseVersion}::${PARSE_MODEL}::${rejectionCriteria}::${summaryParts.join('\n')}`);
   const cached = getRejectionCache(listing.platform, listing.platformId, criteriaHash);
   if (cached) {
     recordLocalCacheHit({ feature: 'rejection_eval', ...ctx }, PARSE_MODEL);
@@ -704,6 +707,11 @@ ${rejectionCriteria}`;
   try {
     const raw = JSON.parse(rejJsonStr);
     result = RejectionResultSchema.parse(raw) as RejectionResult;
+    // RejectionResultSchema.rejected has `.catch(false)` for parse robustness, which silently
+    // coerces a wrong-typed value (e.g. "yes", 1) to false. That coercion is itself a FAIL-OPEN
+    // guess — treat it exactly like a JSON-parse failure: use it for this call but do NOT persist
+    // it as a permanent "passes" verdict.
+    if (typeof raw?.rejected !== 'boolean') cacheable = false;
   } catch (parseErr) {
     console.error('[evaluateRejection] Failed to parse AI JSON:', rejJsonStr.slice(0, 200));
     // A malformed/truncated response FAILS OPEN (rejected=false) — don't persist that as a

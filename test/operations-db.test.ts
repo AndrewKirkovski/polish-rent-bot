@@ -116,11 +116,17 @@ test('full rescan queues safely, clears active analysis state, and preserves not
       rejectionCache: 1,
       mapsCache: 1,
       seenListings: 1,
-      monitorRejections: 1,
+      monitorRejections: 0, // rescan no longer wipes the daily-digest log (bounded by cleanOldMonitorRejections)
     });
     assert.equal(
       (db.prepare('SELECT COUNT(*) AS count FROM seen_listings WHERE monitor_id = 2').get() as { count: number }).count,
       1,
+    );
+    // monitor_rejections is the daily-digest log, not analysis state — the rescan must PRESERVE it so
+    // rejections accumulated since the last digest (incl. flats since delisted) aren't lost.
+    assert.equal(
+      (db.prepare('SELECT COUNT(*) AS count FROM monitor_rejections').get() as { count: number }).count,
+      2,
     );
     assert.equal(
       (db.prepare('SELECT COUNT(*) AS count FROM notified_fingerprints').get() as { count: number }).count,

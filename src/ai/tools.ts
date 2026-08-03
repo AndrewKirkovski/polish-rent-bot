@@ -1004,12 +1004,32 @@ async function execFindItems(
 // 3. create_monitor
 // ---------------------------------------------------------------------------
 
+/** Normalize a free-form platforms value to the SEARCH-valid set ('olx'|'otodom'|'all'), the only
+ *  values searchRentalListings acts on (doOlx/doOtodom key off them exactly). Accepts common intents
+ *  ('both'/'olx,otodom'/an array → 'all'); returns null for anything unusable (e.g. 'allegro',
+ *  'multi', a partial mix) so callers can ignore it instead of persisting a search-breaking config. */
+function normalizeSearchPlatforms(value: unknown): 'olx' | 'otodom' | 'all' | null {
+  const parts = (Array.isArray(value) ? value : String(value ?? '').split(/[,+/\s]+/))
+    .map((p) => String(p).toLowerCase().trim())
+    .filter(Boolean);
+  if (parts.length === 0) return null;
+  if (parts.includes('all') || parts.includes('both')) return 'all';
+  const hasOlx = parts.includes('olx');
+  const hasOtodom = parts.includes('otodom');
+  if (hasOlx && hasOtodom) return 'all';
+  if (hasOlx && parts.length === 1) return 'olx';
+  if (hasOtodom && parts.length === 1) return 'otodom';
+  return null; // unknown platform (allegro/multi/…) or ambiguous mix → drop, don't break the search
+}
+
 async function execCreateMonitor(
   input: Record<string, unknown>,
   ctx: UserContext,
 ): Promise<string> {
   const type = String(input.type ?? 'rental') as 'rental' | 'item';
-  const platform = (input.platforms as string | undefined) ?? 'all';
+  // Normalize to the search-valid set so a stray platforms value can't silently break the search
+  // (doOlx/doOtodom key off exactly 'olx'/'otodom'/'all'); default to 'all' when absent/unusable.
+  const platform = normalizeSearchPlatforms(input.platforms) ?? 'all';
 
   // Build config from input, omitting undefined values
   const config: Record<string, unknown> = {};
@@ -1030,6 +1050,10 @@ async function execCreateMonitor(
     const prov = CITY_PROVINCE_MAP[String(config.city).toLowerCase().trim()];
     if (prov) config.province = prov;
   }
+
+  // Keep config.platforms (drives the search) aligned with the validated column value so they
+  // can't diverge and no unusable value reaches searchRentalListings.
+  if ('platforms' in config) config.platforms = platform;
 
   const monitorId = addMonitor(
     ctx.userId,
@@ -1078,6 +1102,22 @@ async function execUpdateMonitor(
   const existingConfig = JSON.parse(monitor.config) as Record<string, unknown>;
   const newConfig = { ...existingConfig, ...updates };
 
+  // Validate/normalize platforms: config.platforms DRIVES the rental search (doOlx/doOtodom =
+  // platforms==='olx'/'otodom'/'all'), so any other value ('olx,otodom', 'both', 'multi', an array…)
+  // makes both false and the monitor silently finds nothing. Normalize common intents; ignore an
+  // unusable value (keep the prior working one) rather than persist a search-breaking config.
+  let platformsForColumn: string | null = null;
+  if ('platforms' in updates) {
+    const norm = normalizeSearchPlatforms(updates.platforms);
+    if (norm) { newConfig.platforms = norm; platformsForColumn = norm; }
+    else newConfig.platforms = existingConfig.platforms;
+  }
+
+  // City changed without explicit new districts → drop stale OLD-city district slugs. A cross-city
+  // district malforms the Otodom location path (0 results) and gets post-filtered out of OLX,
+  // silently breaking both platforms. (Mirrors the province re-resolution below.)
+  if (updates.city && updates.districts == null) delete newConfig.districts;
+
   // If the city changed without an explicit province, re-resolve it (mirror create). A stale
   // province from the old city malforms the Otodom URL and silently breaks that platform.
   if (updates.city && updates.province == null) {
@@ -1088,12 +1128,9 @@ async function execUpdateMonitor(
 
   updateMonitorConfig(monitorId, newConfig);
 
-  // Keep the monitors.platform column in sync with a platforms change — list_monitors and the
-  // dashboard render that column, so leaving it stale shows a label that contradicts the search.
-  const VALID_PLATFORMS = ['olx', 'otodom', 'all', 'allegro', 'multi'];
-  if (typeof updates.platforms === 'string' && VALID_PLATFORMS.includes(updates.platforms)) {
-    updateMonitorPlatform(monitorId, updates.platforms);
-  }
+  // Keep the monitors.platform column in sync with the VALIDATED value so list_monitors / the
+  // dashboard can never show a platform label that contradicts what the search actually uses.
+  if (platformsForColumn) updateMonitorPlatform(monitorId, platformsForColumn);
 
   return `Monitor #${monitorId} updated.\nNew config: ${JSON.stringify(newConfig, null, 2)}`;
 }
@@ -1237,7 +1274,9 @@ async function execShowListing(
 
   const found = lookupCachedListing(resultId, ctx);
   if (!found) {
-    try { await sendFn(ctx.chatId, `No cached listing for [<b>${resultId}</b>]. It may be from a previous session or a typo.`, { parse_mode: 'HTML' }); } catch (e) { console.error('[tools] send failed:', e instanceof Error ? e.message : e); }
+    // resultId is LLM/user-supplied — escape it before HTML interpolation, or a stray </>/& 400s
+    // Telegram ("can't parse entities") and the user silently gets no reply.
+    try { await sendFn(ctx.chatId, `No cached listing for [<b>${escHtml(resultId)}</b>]. It may be from a previous session or a typo.`, { parse_mode: 'HTML' }); } catch (e) { console.error('[tools] send failed:', e instanceof Error ? e.message : e); }
     return `No cached listing for "${resultId}". Told the user.`;
   }
 
@@ -1252,10 +1291,14 @@ async function execShowListing(
     const rental = listing as Listing;
     // Recompute the location block (nearest metro + Warszawa Centralna) from the persisted coords so
     // the re-shown card keeps the most decision-relevant lines it had originally, instead of dropping
-    // them to "⚠️ unknown". Only exact/street coords are ever persisted (find_rentals), so no
-    // uncertainty context is needed; metroNearest + centralStation are amenity-pref-independent.
+    // them to "⚠️ unknown". BUT only for TRUSTWORTHY coords: an OLX district-center pin
+    // (coordsPrecise=false) is cached un-enriched, and re-scoring it with no uncertainty context
+    // would render a tight, confident metro/Centralna block that misrepresents a ~1.8 km centroid as
+    // building-accurate. Rescore only for a precise OLX pin or an Otodom (detail-page) listing; for a
+    // fuzzy pin leave the card's honest "⚠️ unknown" rather than fabricate precision.
     let locationScore: LocationScore | null = null;
-    if (rental.lat != null && rental.lng != null) {
+    const coordsTrustworthy = rental.coordsPrecise === true || rental.platform === 'otodom';
+    if (rental.lat != null && rental.lng != null && coordsTrustworthy) {
       try {
         locationScore = await scoreLocation(rental.lat, rental.lng, []);
       } catch (e) {
