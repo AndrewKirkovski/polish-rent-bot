@@ -176,11 +176,22 @@ export async function broadcastText(text: string): Promise<void> {
   // Broadcast each chunk as its OWN family fan-out so broadcastToFamily's per-recipient retry
   // re-sends only the failed chunk, never a chunk a recipient already received.
   const chunks = splitMessage(text);
-  for (const chunk of chunks) {
+  let baseline: number[] | null = null; // recipients who got chunk 1 — they must get every chunk
+  for (let i = 0; i < chunks.length; i++) {
     const result = await broadcastToFamily(async (id) => {
-      await mustSend(bot, id, chunk, { parse_mode: 'HTML', disable_web_page_preview: true });
+      await mustSend(bot, id, chunks[i]!, { parse_mode: 'HTML', disable_web_page_preview: true });
     });
-    assertBroadcastOk(result, 'Daily rejection report');
+    assertBroadcastOk(result, 'Daily rejection report'); // throws only if NOBODY got this chunk
+    if (i === 0) {
+      baseline = result.deliveredIds;
+    } else if (baseline && result.failed.some((id) => baseline!.includes(id))) {
+      // A recipient who received chunk 1 failed a LATER chunk (through both retries) → they'd be left
+      // with a permanently truncated digest. Throw so the daily marker doesn't advance and the FULL
+      // digest is retried next cycle (an acceptable chunk-1 duplicate beats a permanent half-report).
+      // A persistently-unreachable member fails chunk 1 too, so they're not in the baseline and don't
+      // block the digest for everyone else.
+      throw new Error('Daily rejection report: a recipient received only part of the split digest; retrying next cycle');
+    }
   }
 }
 

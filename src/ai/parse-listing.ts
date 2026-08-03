@@ -597,8 +597,11 @@ export async function evaluateRejection(
   if (l.district) summaryParts.push(`District: ${l.district}`);
   if (l.city) summaryParts.push(`City: ${l.city}`);
   if (l.advertiserType) summaryParts.push(`Advertiser: ${l.advertiserType}`);
-  if (l.price != null) summaryParts.push(`Rent price: ${l.price} PLN`);
-  if (l.rent != null) summaryParts.push(`Czynsz admin: ${l.rent} PLN`);
+  // Use the listing's real currency, not a hardcoded 'PLN' — otherwise a non-PLN (e.g. EUR) flat is
+  // handed to the rejection LLM as a fabricated PLN figure and can slip a free-text budget criterion.
+  const cur = typeof l.currency === 'string' ? l.currency : 'PLN';
+  if (l.price != null) summaryParts.push(`Rent price: ${l.price} ${cur}`);
+  if (l.rent != null) summaryParts.push(`Czynsz admin: ${l.rent} ${cur}`);
 
   // AI-parsed fields
   // Total monthly cost is computed in code (rentals only) — the LLM's own total is unreliable.

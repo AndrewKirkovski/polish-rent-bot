@@ -94,14 +94,24 @@ export async function searchRentalListings(params: RentalSearchParams): Promise<
     // A room request that maps to NO OLX bucket (e.g. 5+, OLX caps at 4) yields []. Skipping
     // OLX avoids fetching every room (empty === undefined downstream) and relying on the
     // post-filter; Otodom supports exact 5/6 counts, so it still covers those searches.
-    if (params.roomsFrom != null && roomCounts != null && roomCounts.length === 0) {
+    // Rooms mapped to no OLX bucket (roomsFrom>=5 — OLX caps its room filter at 4). Otodom supports
+    // exact 5/6 counts, so when Otodom will also run we skip OLX and let Otodom cover it. But in
+    // OLX-ONLY mode skipping would queue NOTHING and return [] silently (the all-failed guard can't
+    // fire on 0 promises) — OLX DOES carry 5+ flats, they just can't be enum-filtered — so fetch OLX
+    // UNFILTERED and let the room post-filter below enforce the count.
+    const roomsOutOfOlxRange = params.roomsFrom != null && roomCounts != null && roomCounts.length === 0;
+    if (roomsOutOfOlxRange && doOtodom) {
       console.warn(`[rental-search] rooms ${params.roomsFrom}-${roomsTo} out of OLX range (1-4) — skipping OLX, using Otodom only`);
     } else {
+      if (roomsOutOfOlxRange) {
+        console.warn(`[rental-search] rooms ${params.roomsFrom}-${roomsTo} out of OLX range (1-4); OLX-only — fetching unfiltered and post-filtering by room count`);
+      }
       searchPromises.push(
         searchOlxRentals({
           cityId,
           districtIds: districtIds?.length ? districtIds : undefined,
-          roomCounts,
+          // Out of OLX's bucket range → fetch every room count and let the post-filter enforce it.
+          roomCounts: roomsOutOfOlxRange ? undefined : roomCounts,
           // Only priceTo (a najem<=maxTotal necessary bound). priceFrom filters base rent,
           // which would wrongly drop low-najem/high-czynsz flats — enforced post-parse instead.
           priceTo: params.priceTo,

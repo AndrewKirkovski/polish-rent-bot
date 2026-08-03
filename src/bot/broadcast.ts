@@ -18,7 +18,7 @@ function sleep(ms: number): Promise<void> {
 export async function broadcastToFamily(
   sendToOne: (chatId: number) => Promise<void>,
   opts: { retries?: number } = {},
-): Promise<{ delivered: number; failed: number[] }> {
+): Promise<{ delivered: number; failed: number[]; deliveredIds: number[] }> {
   const ids = getAuthorizedTelegramIds();
   let delivered = 0;
   // Retry recipients that failed — a transient Telegram 429/timeout on one member must not
@@ -43,7 +43,7 @@ export async function broadcastToFamily(
     pending = stillFailed;
   }
 
-  return { delivered, failed: pending };
+  return { delivered, failed: pending, deliveredIds: ids.filter((id) => !pending.includes(id)) };
 }
 
 /** Throw only if NOBODY received the message — used by scheduler to decide whether to

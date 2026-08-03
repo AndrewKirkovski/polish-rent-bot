@@ -1013,9 +1013,17 @@ export function applyLocationUncertainty(
       ? places.find((place) => place.transitMinutes != null && place.transitMinutes <= pref.maxMinutes) ?? null
       : null;
     const withinLimit = ranges.some((range) => range.max <= pref.maxMinutes) || transitPlace != null;
-    const uncertain = amenity.error === true
-      || (!withinLimit && anchorTooBroadForStrictVerdict)
-      || (!withinLimit && ranges.some((range) => range.min <= pref.maxMinutes));
+    // `uncertain` must be MUTUALLY EXCLUSIVE with `withinLimit` — the amenities score counts them as
+    // separate buckets (within=1, uncertain=0.5), so an amenity in both double-counts (>1.0). Gate the
+    // whole expression on !withinLimit. Also fold in an ALREADY-SET amenity.uncertain (e.g. an
+    // out-of-service-area metro flagged by offlineMetroAmenity) so it survives this recompute as
+    // keep-with-flag instead of collapsing to a false hard reject.
+    const uncertain = !withinLimit && (
+      amenity.error === true
+      || amenity.uncertain === true
+      || anchorTooBroadForStrictVerdict
+      || ranges.some((range) => range.min <= pref.maxMinutes)
+    );
     const representative = withinLimit
       ? (places
           .filter((place) => (place.walkingMinutesRange?.max ?? Infinity) <= pref.maxMinutes)
@@ -1111,8 +1119,9 @@ export async function scoreLocation(
 
   const total = amenityPrefs.length;
   const met = amenities.filter(a => a.withinLimit).length;
-  const uncertain = amenities.filter(a => a.uncertain).length;
-  const overallScore = total === 0 ? 100 : Math.round(((met + uncertain * 0.5) / total) * 100);
+  // Exclude within-limit from the uncertain bucket so they can't double-count; clamp to 100.
+  const uncertain = amenities.filter(a => a.uncertain && !a.withinLimit).length;
+  const overallScore = total === 0 ? 100 : Math.min(100, Math.round(((met + uncertain * 0.5) / total) * 100));
 
   const uncertaintyText = estimate && estimate.uncertaintyMeters >= 1000
     ? `${(estimate.uncertaintyMeters / 1000).toLocaleString('ru-RU', { maximumFractionDigits: 1 })} км`

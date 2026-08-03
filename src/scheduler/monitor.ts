@@ -392,6 +392,13 @@ export function startScheduler(
               }
 
               let parsedData: ParsedRentalData | import('../types.js').ParsedItemData | null = null;
+              // Distinguish a DETERMINISTIC parse failure (the model responded but its output was
+              // unparseable / a content refusal — will recur every cycle) from a TRANSIENT one
+              // (API/network/timeout/rate-limit/overload, e.g. a provider outage). Only deterministic
+              // failures may count toward the budget-block give-up; a transient failure must keep
+              // re-attempting, or a multi-cycle outage would mark the whole live market seen and
+              // silently drop every in-budget match once the API recovers.
+              let parseFailedDeterministically = false;
               try {
                 if (monitor.type === 'rental') {
                   parsedData = await parseRentalListing(workingListing as Listing, { monitorId: monitor.id, userId: monitor.user_id });
@@ -400,6 +407,8 @@ export function startScheduler(
                 }
               } catch (parseErr) {
                 console.error('[scheduler] AI parse failed:', parseErr);
+                const msg = parseErr instanceof Error ? parseErr.message : String(parseErr);
+                parseFailedDeterministically = /invalid JSON|No text in Claude/i.test(msg);
               }
 
               if (monitor.type === 'rental' && (parsedData as ParsedRentalData | null)?.isConcreteApartment === false) {
@@ -443,13 +452,20 @@ export function startScheduler(
                   markListingSeen(monitor.id, l.platform, l.platformId, l.url, l.title, l.price);
                   continue;
                 }
-                // Parse failed (transient AI/API error) → czynsz/media unknown, total unverifiable.
-                // DEFER: don't deliver a possibly-over-budget flat, and don't mark seen, so it is
-                // re-attempted next cycle instead of silently passing on the base rent alone — but
-                // cap the retries so a listing that FAILS DETERMINISTICALLY (content-policy refusal,
-                // reliably-invalid JSON) can't re-run triage+enrich+parse every cycle indefinitely.
+                // Parse failed → czynsz/media unknown, total unverifiable. DEFER: don't deliver a
+                // possibly-over-budget flat, and don't mark seen, so it is re-attempted next cycle
+                // instead of silently passing on the base rent alone.
                 const deferKey = `${monitor.id}:${l.platform}:${l.platformId}`;
                 if (!parsedData) {
+                  // A TRANSIENT failure (API outage/rate-limit/timeout) must NOT count toward give-up:
+                  // defer indefinitely so the listing is re-delivered once the provider recovers,
+                  // rather than being marked seen and lost for the whole market during the outage.
+                  if (!parseFailedDeterministically) {
+                    console.log(`[scheduler] Defer (transient parse failure — not counting) "${l.title}"`);
+                    continue;
+                  }
+                  // Only a DETERMINISTIC failure (content-policy refusal, reliably-invalid JSON) is
+                  // capped, so it can't re-run triage+enrich+parse every cycle indefinitely.
                   const deferrals = (parseDeferCounts.get(deferKey) ?? 0) + 1;
                   if (deferrals >= MAX_PARSE_DEFERS) {
                     console.log(`[scheduler] Give up (parse failed ${deferrals}x — budget unverifiable) "${l.title}"`);
@@ -531,6 +547,9 @@ export function startScheduler(
                     if (enriched.precision === 'exact' || enriched.precision === 'street') {
                       (workingListing as Listing).lat = enriched.lat;
                       (workingListing as Listing).lng = enriched.lng;
+                      // Address-grade coords → mark trustworthy so show_listing re-scores them even
+                      // for an OLX row whose original fuzzy pin left coordsPrecise=false.
+                      (workingListing as Listing).coordsPrecise = true;
                     }
                     locationScore = await scoreLocation(
                       enriched.lat,
@@ -588,8 +607,21 @@ export function startScheduler(
               }
 
               // Reuse a prior search/monitor result ID when present so one flat ↔ one code.
-              const existingId = getCachedListingByPlatform(workingListing.platform, workingListing.platformId)?.resultId;
-              const resultId = existingId ?? newUniqueResultId();
+              const prior = getCachedListingByPlatform(workingListing.platform, workingListing.platformId);
+              const resultId = prior?.resultId ?? newUniqueResultId();
+              // Coord-merge, not downgrade: if this pass geocoded only approximate coords (lat left
+              // null) but a prior row already holds trustworthy ones, carry them forward so this
+              // delivery write can't strip coords show_listing needs for the metro/Centralna block
+              // (cacheListing overwrites listing_json unconditionally on conflict).
+              if (monitor.type === 'rental') {
+                const priorL = prior?.listing as Listing | undefined;
+                const wl = workingListing as Listing;
+                if (wl.lat == null && priorL?.lat != null) {
+                  wl.lat = priorL.lat;
+                  wl.lng = priorL.lng;
+                  wl.coordsPrecise = priorL.coordsPrecise;
+                }
+              }
               try {
                 cacheListing({
                   platform: workingListing.platform,

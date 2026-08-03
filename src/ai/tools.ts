@@ -755,6 +755,10 @@ async function execFindRentals(
             if (enriched.precision === 'exact' || enriched.precision === 'street') {
               enrichedListing.lat = enriched.lat;
               enrichedListing.lng = enriched.lng;
+              // Mark the persisted coords trustworthy: these are address-grade (geocoded street /
+              // fused precise), so show_listing must re-score them even for an OLX row whose original
+              // platform pin was fuzzy (coordsPrecise reflects only the now-discarded pin).
+              enrichedListing.coordsPrecise = true;
               try {
                 cacheListing({ platform: enrichedListing.platform, platformId: enrichedListing.platformId, kind: 'rental', resultId, listing: enrichedListing });
               } catch (e) { console.warn('[find_rentals] re-cache after enrich failed:', e instanceof Error ? e.message : e); }
@@ -1194,7 +1198,7 @@ async function execListMonitors(
     }
     if (config.amenities) {
       const amens = config.amenities as AmenityPreference[];
-      parts.push(`  Amenities: ${amens.map((a) => `${a.type}${a.line ? ` ${a.line}` : ''} (${a.maxMinutes}min)`).join(', ')}`);
+      parts.push(`  Amenities: ${amens.map((a) => `${a.type}${a.line ? ` ${a.line}` : ''}${a.stations?.length ? ` [${a.stations.join('/')}]` : ''} (${a.maxMinutes}min)`).join(', ')}`);
     }
     if (config.workAddress) parts.push(`  Commute to: ${config.workAddress}`);
     if (config.contractPreference) parts.push(`  Contract: ${config.contractPreference}`);

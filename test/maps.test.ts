@@ -105,6 +105,29 @@ test('applyLocationUncertainty honors the groceries transit fallback at an appro
   assert.ok((g.nearest?.walkingMinutesRange?.min ?? 0) > 10, `walking range should exceed limit, got ${JSON.stringify(g.nearest?.walkingMinutesRange)}`);
 });
 
+test('applyLocationUncertainty preserves an already-set uncertain flag (out-of-service-area metro)', () => {
+  // offlineMetroAmenity flags an out-of-area metro uncertain:true / withinLimit:false (a non-Warsaw
+  // listing whose nearest "Warsaw" station is ~250 km away). The uncertainty recompute must KEEP
+  // uncertain (→ keep-with-flag), not collapse it to a false hard reject against that far station.
+  const farStation = { name: 'Młociny', walkingMinutes: 3200, distanceMeters: 250000, distance: '250 км' };
+  const amenities = [{ type: 'metro', requestedLine: undefined, places: [farStation], nearest: farStation, withinLimit: false, uncertain: true }] as unknown as Parameters<typeof applyLocationUncertainty>[0];
+  const prefs = [{ type: 'metro', maxMinutes: 7 }] as unknown as Parameters<typeof applyLocationUncertainty>[1];
+  const [m] = applyLocationUncertainty(amenities, prefs, 120, 0);
+  assert.equal(m.uncertain, true, 'out-of-area metro uncertainty must survive the recompute');
+  assert.equal(m.withinLimit, false);
+});
+
+test('applyLocationUncertainty keeps withinLimit and uncertain mutually exclusive (no double-count)', () => {
+  // A groceries place reachable by transit (withinLimit via fallback) that ALSO carries a measurement
+  // error must not be counted as BOTH within (1.0) and uncertain (0.5) — that inflates the amenities score.
+  const place = { name: 'Biedronka', walkingMinutes: 25, transitMinutes: 6, distanceMeters: 1900, distance: '1.9 км' };
+  const amenities = [{ type: 'groceries', places: [place], nearest: place, withinLimit: false, error: true, uncertain: true }] as unknown as Parameters<typeof applyLocationUncertainty>[0];
+  const prefs = [{ type: 'groceries', maxMinutes: 10 }] as unknown as Parameters<typeof applyLocationUncertainty>[1];
+  const [g] = applyLocationUncertainty(amenities, prefs, 300, 0);
+  assert.equal(g.withinLimit, true, 'transit fallback → within limit');
+  assert.equal(g.uncertain, false, 'must not also be uncertain when within limit');
+});
+
 const cand = (over: Partial<LocCandidate>): LocCandidate => ({ lat: 52.2385, lng: 20.9594, sigma: 120, reliability: 0.85, precisionFloor: 'street', source: 'pin', evidence: null, ...over });
 
 test('fuseLocationCandidates: single candidate is returned unchanged', () => {

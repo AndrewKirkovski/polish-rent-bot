@@ -22,10 +22,11 @@ export function preScore(listing: Listing, profile: HouseholdProfile = HOUSEHOLD
   let s = 0;
   const base = listing.price + (listing.rent ?? 0);
   const { from, to } = profile.budgetTotalPln;
-  // Only pre-rank on budget when the base rent is a real PLN figure — a non-PLN listing's foreign
-  // price must not be scored as if it were PLN (mirrors computeRentalCost's basePriceKnown guard),
-  // otherwise e.g. a 1500-EUR flat gets a maximally-cheap pre-rank and steals an early enrichment slot.
-  if (to > from && base > 0 && (listing.currency ?? 'PLN') === 'PLN') s += 0.5 * clamp01((to - base) / (to - from));
+  // Only pre-rank on budget when the base RENT is a real PLN figure — mirror computeRentalCost's
+  // basePriceKnown, which gates on listing.price>0 (NOT price+rent). Otherwise a "zapytaj o cenę"
+  // Otodom flat (price=0 with a separate czynsz) passes base>0 and gets a maximally-cheap pre-rank,
+  // stealing an early enrichment slot before being soft-rejected at the basePriceKnown budget gate.
+  if (to > from && listing.price > 0 && (listing.currency ?? 'PLN') === 'PLN') s += 0.5 * clamp01((to - base) / (to - from));
   if (listing.hasElevator === true) s += 0.05;
   return s;
 }
@@ -81,8 +82,11 @@ export function computeFitScore(
   // --- Amenities (fraction of requested within limit) ---
   if (locationScore && !locationScore.locationUnknown && locationScore.amenities.length > 0) {
     const within = locationScore.amenities.filter((a) => a.withinLimit).length;
-    const uncertain = locationScore.amenities.filter((a) => a.uncertain).length;
-    parts.push({ key: 'amenities', weight: w.amenities ?? 0, value: (within + uncertain * 0.5) / locationScore.amenities.length });
+    // Exclude within-limit amenities from the uncertain count so the two buckets can't double-count
+    // (applyLocationUncertainty already keeps them exclusive; this is defence-in-depth). clamp01 caps
+    // the term at 1.0 regardless.
+    const uncertain = locationScore.amenities.filter((a) => a.uncertain && !a.withinLimit).length;
+    parts.push({ key: 'amenities', weight: w.amenities ?? 0, value: clamp01((within + uncertain * 0.5) / locationScore.amenities.length) });
   }
 
   // --- Elevator ---
