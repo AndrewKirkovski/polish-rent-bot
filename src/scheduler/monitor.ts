@@ -258,6 +258,12 @@ export function startScheduler(
   let running = false;
   let timer: ReturnType<typeof setTimeout> | null = null;
 
+  // Bounded retry for the budget-block parse-fail DEFER (below): a rental whose parse keeps failing
+  // but stays live on page 1 would otherwise re-run triage+enrich+parse EVERY cycle forever. Count
+  // consecutive defers per (monitor, listing); after MAX_PARSE_DEFERS give up so it exits the loop.
+  const MAX_PARSE_DEFERS = 3;
+  const parseDeferCounts = new Map<string, number>();
+
   recoverInterruptedFullRescan();
 
   async function cycle(): Promise<void> {
@@ -424,11 +430,25 @@ export function startScheduler(
                 }
                 // Parse failed (transient AI/API error) → czynsz/media unknown, total unverifiable.
                 // DEFER: don't deliver a possibly-over-budget flat, and don't mark seen, so it is
-                // re-attempted next cycle instead of silently passing on the base rent alone.
+                // re-attempted next cycle instead of silently passing on the base rent alone — but
+                // cap the retries so a listing that FAILS DETERMINISTICALLY (content-policy refusal,
+                // reliably-invalid JSON) can't re-run triage+enrich+parse every cycle indefinitely.
+                const deferKey = `${monitor.id}:${l.platform}:${l.platformId}`;
                 if (!parsedData) {
-                  console.log(`[scheduler] Defer (parse failed — budget unverifiable) "${l.title}"`);
+                  const deferrals = (parseDeferCounts.get(deferKey) ?? 0) + 1;
+                  if (deferrals >= MAX_PARSE_DEFERS) {
+                    console.log(`[scheduler] Give up (parse failed ${deferrals}x — budget unverifiable) "${l.title}"`);
+                    parseDeferCounts.delete(deferKey);
+                    recordMonitorRejection(monitor.id, l, 'error', 'не удалось разобрать объявление — бюджет не проверить');
+                    markListingSeen(monitor.id, l.platform, l.platformId, l.url, l.title, l.price);
+                    continue;
+                  }
+                  parseDeferCounts.set(deferKey, deferrals);
+                  console.log(`[scheduler] Defer (parse failed — budget unverifiable, ${deferrals}/${MAX_PARSE_DEFERS}) "${l.title}"`);
                   continue;
                 }
+                // Parse succeeded — clear any prior defer count so a later transient failure gets a fresh budget.
+                parseDeferCounts.delete(deferKey);
                 // "Zapytaj o cenę" (no base rent): czynsz+media is NOT the real cost — can't verify budget.
                 if (!cost.basePriceKnown) {
                   console.log(`[scheduler] Budget reject "${l.title}": цена не указана`);
@@ -658,8 +678,10 @@ export function startScheduler(
     },
     requestFullRescan: () => {
       // Don't queue on a stopped scheduler — the persisted 'queued' state would silently fire on the
-      // next process boot with nobody having asked for it.
-      if (stopped) return getFullRescanStatus();
+      // next process boot with nobody having asked for it. Return null (not the persisted status,
+      // which is non-null once any rescan has ever run) so the HTTP handler reports 503 "stopped"
+      // instead of a misleading 202 Accepted with a stale 'completed' body.
+      if (stopped) return null;
       const status = queueFullRescan();
       if (timer !== null) {
         clearTimeout(timer);

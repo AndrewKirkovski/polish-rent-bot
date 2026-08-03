@@ -237,9 +237,12 @@ export function fuseLocationCandidates(candidates: LocCandidate[], constraint: M
     const d = haversineMeters(lat, lng, constraint.station.lat, constraint.station.lng);
     const discrepancy = Math.abs(d - constraint.distance);
     // Corroborate only when the point is really near the annulus — the point's own sigma must NOT
-    // buy agreement — and never tighten below the actual positional discrepancy.
+    // buy agreement — and never tighten below the actual positional discrepancy. Corroboration can
+    // only hold-or-tighten, never inflate: the 120 m "don't over-trust a metro hint" floor is
+    // capped at the incoming sigma (Math.min(120, sigma)), so a point already tighter than 120 m
+    // from independent evidence (precise pin + rooftop street) is preserved, not widened back to 120.
     if (discrepancy <= constraint.margin + STATION_FOOTPRINT_M) {
-      sigma = clampMeters(Math.max(discrepancy, Math.min(sigma, constraint.margin + STATION_FOOTPRINT_M)), 120, sigma);
+      sigma = clampMeters(Math.max(discrepancy, Math.min(sigma, constraint.margin + STATION_FOOTPRINT_M)), Math.min(120, sigma), sigma);
       note = `; ~${Math.round(d)} м до ${constraint.station.name}`;
     } else {
       sigma = Math.max(sigma, discrepancy); // sources disagree → widen + flag

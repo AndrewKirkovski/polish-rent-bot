@@ -102,6 +102,7 @@ export async function searchOlxRentals(params: {
   const maxPages = params.maxPages ?? 1;
   const seen = new Set<string>();
   const all: Listing[] = [];
+  let anySuccess = false; // did ANY page fetch return without throwing? (empty-but-ok still counts)
 
   for (const districtId of districtList) {
     for (const rooms of roomList) {
@@ -119,6 +120,7 @@ export async function searchOlxRentals(params: {
               limit,
               offset,
             });
+            anySuccess = true;
             for (const l of result.listings) {
               const key = `${l.platform}:${l.platformId}`;
               if (!seen.has(key)) {
@@ -144,6 +146,13 @@ export async function searchOlxRentals(params: {
       }
       await new Promise((r) => setTimeout(r, 250 + Math.random() * 250));
     }
+  }
+
+  // If EVERY query errored (not merely returned empty), reject so the caller's outage guard can
+  // distinguish a total OLX outage ("search failed, retry") from a genuine empty result. A single
+  // successful-but-empty fetch sets anySuccess and this resolves normally with [].
+  if (!anySuccess) {
+    throw new Error('OLX search failed: all queries errored');
   }
 
   return all;

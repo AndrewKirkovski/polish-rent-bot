@@ -189,6 +189,38 @@ test('a malformed locationHint collapses to "none" instead of sinking the whole 
   assert.equal(b.adminFee, 600);
 });
 
+test('a bad top-level enum / boolean / array value collapses instead of discarding the whole parse', () => {
+  // A single out-of-vocabulary value from Haiku (wrong enum, "tak" for a boolean, a string for an
+  // array) must fall back to its safe default — NOT throw and lose the entire listing analysis.
+  const p = ParsedRentalDataSchema.parse({
+    adminFee: 600,
+    contractType: 'standard',   // not in the enum
+    furnished: 'yes',           // not in the enum
+    quiet: 'silent',            // not in the enum
+    internetType: '5G',         // not in the enum
+    balcony: 'tak',             // not a boolean
+    parkingIncluded: 'nie',     // not a boolean
+    redFlags: 'first floor',    // not an array
+  });
+  assert.equal(p.contractType, null);
+  assert.equal(p.furnished, null);
+  assert.equal(p.quiet, null);
+  assert.equal(p.internetType, null);
+  assert.equal(p.balcony, null);
+  assert.equal(p.parkingIncluded, null);
+  assert.deepEqual(p.redFlags, []);
+  assert.equal(p.adminFee, 600); // sibling fields survive
+});
+
+test('estimatedMedia given as null / a non-object collapses to defaults instead of sinking the parse', () => {
+  const a = ParsedRentalDataSchema.parse({ adminFee: 600, estimatedMedia: null });
+  assert.equal(a.estimatedMedia.electricity, null);
+  assert.equal(a.adminFee, 600);
+  const b = ParsedRentalDataSchema.parse({ adminFee: 600, estimatedMedia: 'media w cenie' });
+  assert.equal(b.estimatedMedia.water, null);
+  assert.equal(b.adminFee, 600);
+});
+
 test('extractResultId reads codes from HTML captions', () => {
   assert.equal(extractResultId('<b>[GM7WX3]</b>\nrest'), 'GM7WX3');
   assert.equal(extractResultId('[GM7WX3] rest'), 'GM7WX3');

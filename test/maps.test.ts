@@ -115,6 +115,20 @@ test('fuseLocationCandidates: a metro constraint on the annulus corroborates (ke
   assert.ok(e.uncertaintyMeters <= 200);
 });
 
+test('fuseLocationCandidates: a corroborating metro constraint does not INFLATE a sub-120 m fused point', () => {
+  // Two co-located candidates (precise pin σ=120 + rooftop street σ=50) fuse to ~46 m. A metro hint
+  // that AGREES must hold-or-tighten — never widen the best-evidenced point back up to the 120 m floor.
+  const pin = cand({ lat: 52.2385, lng: 20.9594, sigma: 120, reliability: 0.85, source: 'pin' });
+  const street = cand({ lat: 52.2385, lng: 20.9594, sigma: 50, reliability: 0.7, source: 'street' });
+  const preFuse = fuseLocationCandidates([pin, street], null);
+  assert.ok(preFuse.uncertaintyMeters < 120, `precondition: sub-120 fuse, got ${preFuse.uncertaintyMeters}`);
+  // Station ~104 m from the fused point, distance 100 → discrepancy ~4 m ≪ margin → corroborates.
+  const withMetro = fuseLocationCandidates([pin, street], { station: { name: 'Młynów', lat: 52.23766, lng: 20.9601 }, distance: 100, margin: 150, evidence: 'e' });
+  assert.match(withMetro.source, /Młynów/);
+  assert.ok(withMetro.uncertaintyMeters <= preFuse.uncertaintyMeters + 1, `corroboration inflated it: was ${preFuse.uncertaintyMeters}, got ${withMetro.uncertaintyMeters}`);
+  assert.ok(withMetro.uncertaintyMeters < 120, `must stay sub-120, got ${withMetro.uncertaintyMeters}`);
+});
+
 test('fuseLocationCandidates: a pin far from the claimed station is flagged as conflict, not tightened', () => {
   const fuzzy = cand({ sigma: 1800, reliability: 0.4, precisionFloor: 'district', source: 'pin' });
   const e = fuseLocationCandidates([fuzzy], { station: { name: 'Politechnika', lat: 52.21866, lng: 21.01530 }, distance: 0, margin: 400, evidence: 'e' });

@@ -3,10 +3,19 @@
 
 import { z } from 'zod';
 
-// A tolerant nullable number: a wrong-typed value (e.g. Haiku returning "6000 zł" or "~200")
-// falls back to null instead of throwing and discarding the ENTIRE parse of the listing.
+// Tolerant field builders: a single wrong-typed value from Haiku (e.g. "6000 zł" for a number,
+// "yes" for a boolean, "silent" for an enum, a bare string where an object is expected) must
+// collapse to a safe default instead of throwing and discarding the ENTIRE parse of the listing.
+// `.default(x)` only substitutes for `undefined`; `.catch(x)` is what absorbs a *present but
+// invalid* value — so every field below carries BOTH.
 const nnum = z.number().nullable().default(null).catch(null);
+const nstr = z.string().nullable().default(null).catch(null);
+const nbool = z.boolean().nullable().default(null).catch(null);
+const nenum = <T extends readonly [string, ...string[]]>(values: T) =>
+  z.enum(values).nullable().default(null).catch(null);
+const nstrarr = z.array(z.string()).default([]).catch([]);
 const DEFAULT_LOCATION_HINT = { query: null, kind: 'none' as const, anchorDistanceMeters: null, uncertaintyMeters: null, evidence: null };
+const DEFAULT_MEDIA = { water: null, electricity: null, gas: null, internet: null, heating: null, other: null };
 
 // ---------------------------------------------------------------------------
 // Rental listing schema — matches ParsedRentalData interface
@@ -17,9 +26,9 @@ const DEFAULT_LOCATION_HINT = { query: null, kind: 'none' as const, anchorDistan
 export const ParsedRentalDataSchema = z.looseObject({
   // --- cost / pipeline-critical ---
   deposit: nnum,
-  depositNote: z.string().nullable().default(null),
+  depositNote: nstr,
   adminFee: nnum,
-  addressHint: z.string().nullable().default(null),
+  addressHint: nstr,
   // A malformed hint (e.g. kind:"transit" instead of "transit_stop", or locationHint as a bare
   // string) must collapse to "none" — handled downstream — NOT throw away the whole listing parse.
   locationHint: z.object({
@@ -29,7 +38,7 @@ export const ParsedRentalDataSchema = z.looseObject({
     uncertaintyMeters: z.number().min(0).max(20_000).nullable().default(null).catch(null),
     evidence: z.string().nullable().default(null).catch(null),
   }).default(DEFAULT_LOCATION_HINT).catch(DEFAULT_LOCATION_HINT),
-  isConcreteApartment: z.boolean().nullable().default(true),
+  isConcreteApartment: z.boolean().nullable().default(true).catch(true),
   estimatedMedia: z.object({
     water: nnum,
     electricity: nnum,
@@ -37,32 +46,25 @@ export const ParsedRentalDataSchema = z.looseObject({
     internet: nnum,
     heating: nnum,
     other: nnum,
-  }).default({
-    water: null,
-    electricity: null,
-    gas: null,
-    internet: null,
-    heating: null,
-    other: null,
-  }),
-  contractType: z.enum(['najem_okazjonalny', 'najem_zwykly', 'najem_instytucjonalny']).nullable().default(null),
-  availableFrom: z.string().nullable().default(null),
-  minimumLease: z.string().nullable().default(null),
-  furnished: z.enum(['full', 'partial', 'none']).nullable().default(null),
-  balcony: z.boolean().nullable().default(null),
-  parkingIncluded: z.boolean().nullable().default(null),
+  }).default(DEFAULT_MEDIA).catch(DEFAULT_MEDIA),
+  contractType: nenum(['najem_okazjonalny', 'najem_zwykly', 'najem_instytucjonalny']),
+  availableFrom: nstr,
+  minimumLease: nstr,
+  furnished: nenum(['full', 'partial', 'none']),
+  balcony: nbool,
+  parkingIncluded: nbool,
   // --- work-from-home fit (the signals this household ranks on) ---
   separateRooms: nnum,
-  layoutType: z.enum(['rozkladowy', 'przechodni', 'open']).nullable().default(null),
-  twoOfficeCapable: z.boolean().nullable().default(null),
-  quiet: z.enum(['quiet', 'mixed', 'noisy']).nullable().default(null),
-  naturalLight: z.enum(['bright', 'average', 'dark']).nullable().default(null),
-  internetType: z.enum(['fiber', 'cable', 'unknown']).nullable().default(null),
+  layoutType: nenum(['rozkladowy', 'przechodni', 'open']),
+  twoOfficeCapable: nbool,
+  quiet: nenum(['quiet', 'mixed', 'noisy']),
+  naturalLight: nenum(['bright', 'average', 'dark']),
+  internetType: nenum(['fiber', 'cable', 'unknown']),
   // --- display ---
-  descriptionSummary: z.string().nullable().default(null),
-  redFlags: z.array(z.string()).default([]),
-  positives: z.array(z.string()).default([]),
-  restrictions: z.array(z.string()).default([]),
+  descriptionSummary: nstr,
+  redFlags: nstrarr,
+  positives: nstrarr,
+  restrictions: nstrarr,
 });
 
 // ---------------------------------------------------------------------------
@@ -70,15 +72,15 @@ export const ParsedRentalDataSchema = z.looseObject({
 // ---------------------------------------------------------------------------
 
 export const ParsedItemDataSchema = z.looseObject({
-  actualCondition: z.string().default('Unknown'),
-  whySelling: z.string().nullable().default(null),
-  defects: z.array(z.string()).default([]),
-  includedAccessories: z.array(z.string()).default([]),
-  priceAssessment: z.string().nullable().default(null),
-  descriptionSummary: z.string().nullable().default(null),
-  bestFor: z.string().nullable().default(null),
-  redFlags: z.array(z.string()).default([]),
-  additionalNotes: z.array(z.string()).default([]),
+  actualCondition: z.string().default('Unknown').catch('Unknown'),
+  whySelling: nstr,
+  defects: nstrarr,
+  includedAccessories: nstrarr,
+  priceAssessment: nstr,
+  descriptionSummary: nstr,
+  bestFor: nstr,
+  redFlags: nstrarr,
+  additionalNotes: nstrarr,
 });
 
 // ---------------------------------------------------------------------------
@@ -86,8 +88,8 @@ export const ParsedItemDataSchema = z.looseObject({
 // ---------------------------------------------------------------------------
 
 export const RejectionResultSchema = z.object({
-  rejected: z.boolean().default(false),
-  rejectionReason: z.string().nullable().default(null),
+  rejected: z.boolean().default(false).catch(false),
+  rejectionReason: nstr,
 });
 
 // ---------------------------------------------------------------------------
@@ -95,6 +97,6 @@ export const RejectionResultSchema = z.object({
 // ---------------------------------------------------------------------------
 
 export const RentalTriageSchema = z.object({
-  apartment: z.boolean().default(true),   // false = single room / coliving / not one flat
+  apartment: z.boolean().default(true).catch(true),   // false = single room / coliving / not one flat
   rooms: nnum,
 });

@@ -22,7 +22,10 @@ export function preScore(listing: Listing, profile: HouseholdProfile = HOUSEHOLD
   let s = 0;
   const base = listing.price + (listing.rent ?? 0);
   const { from, to } = profile.budgetTotalPln;
-  if (to > from && base > 0) s += 0.5 * clamp01((to - base) / (to - from));
+  // Only pre-rank on budget when the base rent is a real PLN figure — a non-PLN listing's foreign
+  // price must not be scored as if it were PLN (mirrors computeRentalCost's basePriceKnown guard),
+  // otherwise e.g. a 1500-EUR flat gets a maximally-cheap pre-rank and steals an early enrichment slot.
+  if (to > from && base > 0 && (listing.currency ?? 'PLN') === 'PLN') s += 0.5 * clamp01((to - base) / (to - from));
   if (listing.hasElevator === true) s += 0.05;
   return s;
 }

@@ -616,6 +616,12 @@ async function execFindRentals(
 
     actualAnalyzed++; // count only candidates that reach real analysis
 
+    // Track the best-cached form of this listing so the catch-all error handler below re-references
+    // the ENRICHED cache row (description/phone/geocoded coords) instead of clobbering it with the
+    // un-enriched candidate when a throw lands after enrichment (computeFitScore, sendRentalCard, …).
+    let cachedForm: Listing = listing;
+    let cachedFormPersisted = false;
+
     try {
       // Cheap AI triage BEFORE the expensive enrich + full parse: drop single-room /
       // coliving / non-apartment listings, and enforce the room count when the platform
@@ -639,6 +645,7 @@ async function execFindRentals(
       // Fetch detail page / phone for richer data
       console.log(`[find_rentals] ${i + 1}/${candidateCount}: ${listing.platform} "${listing.title.slice(0, 50)}"`);
       const enrichedListing = await enrichRentalListing(listing);
+      cachedForm = enrichedListing; // prefer the enriched form for any later (error-path) caching
 
       // Cache the enriched Listing immediately so show_listing / get_listing
       // can recall it later — including rejected ones.
@@ -650,6 +657,7 @@ async function execFindRentals(
           resultId,
           listing: enrichedListing,
         });
+        cachedFormPersisted = true;
       } catch (cacheErr) {
         console.error('[find_rentals] cacheListing failed:', cacheErr instanceof Error ? cacheErr.message : cacheErr);
       }
@@ -677,7 +685,17 @@ async function execFindRentals(
 
       // Budget filter — use the SAME code-computed total the card displays (cost.ts),
       // not the LLM's totalMonthlyCost, so the gate and the shown ИТОГО can never disagree.
-      const estimatedTotal = computeRentalCost(enrichedListing, parsedData).total;
+      const cost = computeRentalCost(enrichedListing, parsedData);
+      const estimatedTotal = cost.total;
+
+      // When the user set a budget but the base rent is unknown ("zapytaj o cenę", price=0) or
+      // non-PLN, cost.total is NOT a comparable PLN figure — comparing it would let an EUR flat slip
+      // under priceTo or produce a bogus understated budget_min reject. Mirror the monitor's
+      // basePriceKnown guard: surface it as a soft reject the user can override, never a fake pass.
+      if ((priceTo != null || priceFrom != null) && !cost.basePriceKnown) {
+        await emitReject(resultId, enrichedListing, 'budget_max', 'цена не указана или не в PLN — бюджет не проверить', true);
+        continue;
+      }
 
       if (priceTo != null && estimatedTotal > priceTo) {
         // SOFT: a bit over — surfaced so the user can decide whether to stretch.
@@ -795,8 +813,10 @@ async function execFindRentals(
     } catch (err) {
       console.error(`[find_rentals] Error processing ${listing.url}:`, err);
       // SOFT: an error is worth showing so the user knows the candidate wasn't silently lost.
-      // emitReject caches/seeds the (un-enriched) listing so the advertised [ID] still resolves.
-      await emitReject(resultId, listing, 'error', `ошибка обработки: ${err instanceof Error ? err.message : String(err)}`);
+      // Reference the best-cached form: if the enriched row was already persisted, pass
+      // alreadyCached=true so emitReject does NOT overwrite it with the un-enriched candidate;
+      // otherwise it caches whatever form we have so the advertised [ID] still resolves.
+      await emitReject(resultId, cachedForm, 'error', `ошибка обработки: ${err instanceof Error ? err.message : String(err)}`, cachedFormPersisted);
     }
   }
 
@@ -1230,7 +1250,19 @@ async function execShowListing(
 
   if (kind === 'rental') {
     const rental = listing as Listing;
-    await sendRentalCard(ctx.chatId, sendFn, sendPhotosFn, resultId, rental, parsedData as ParsedRentalData | null, null);
+    // Recompute the location block (nearest metro + Warszawa Centralna) from the persisted coords so
+    // the re-shown card keeps the most decision-relevant lines it had originally, instead of dropping
+    // them to "⚠️ unknown". Only exact/street coords are ever persisted (find_rentals), so no
+    // uncertainty context is needed; metroNearest + centralStation are amenity-pref-independent.
+    let locationScore: LocationScore | null = null;
+    if (rental.lat != null && rental.lng != null) {
+      try {
+        locationScore = await scoreLocation(rental.lat, rental.lng, []);
+      } catch (e) {
+        console.error('[show_listing] location rescore failed:', e instanceof Error ? e.message : e);
+      }
+    }
+    await sendRentalCard(ctx.chatId, sendFn, sendPhotosFn, resultId, rental, parsedData as ParsedRentalData | null, locationScore);
     const photoCount = rental.photos?.length ?? 0;
     return `Sent rental card [${resultId}] — "${rental.title.slice(0, 60)}" — ${photoCount} photo(s).`;
   } else {

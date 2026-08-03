@@ -171,8 +171,13 @@ export async function broadcastEnrichedNotification(
  *  wraps this in try/catch, so a throw never disturbs the monitor cycle. */
 export async function broadcastText(text: string): Promise<void> {
   const bot = getBot();
+  // Split to stay under Telegram's 4096-char limit (mirrors the card path). A busy-day digest can
+  // exceed 4096; unsplit it would 400 "message too long" every cycle all day and never deliver.
+  const chunks = splitMessage(text);
   const result = await broadcastToFamily(async (id) => {
-    await mustSend(bot, id, text, { parse_mode: 'HTML', disable_web_page_preview: true });
+    for (const chunk of chunks) {
+      await mustSend(bot, id, chunk, { parse_mode: 'HTML', disable_web_page_preview: true });
+    }
   });
   assertBroadcastOk(result, 'Daily rejection report');
 }

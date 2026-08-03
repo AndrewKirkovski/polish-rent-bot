@@ -163,7 +163,17 @@ export function formatRentalCard(
   else if (parsed?.deposit != null) payLine.push(`Kaucja: ${zl(parsed.deposit)}`);
   else payLine.push(`Kaucja: ${CE.warning} ?`);
   if (cost.czynsz > 0 || cost.mediaSum > 0) {
-    payLine.push(`${num(cost.najem)}+${num(cost.czynsz)}${cost.mediaSum > 0 ? `+~${num(cost.mediaSum)}` : ''}`);
+    if (cost.basePriceKnown) {
+      payLine.push(`${num(cost.najem)}+${num(cost.czynsz)}${cost.mediaSum > 0 ? `+~${num(cost.mediaSum)}` : ''}`);
+    } else {
+      // Base rent unknown ("zapytaj o cenę") or non-PLN — the header already shows "цена по запросу",
+      // so list only the add-on costs; never render a zero or foreign base rent as a bare PLN number.
+      const extras = [
+        cost.czynsz > 0 ? `czynsz ${num(cost.czynsz)}` : null,
+        cost.mediaSum > 0 ? `media ~${num(cost.mediaSum)}` : null,
+      ].filter(Boolean);
+      payLine.push(`+ ${extras.join(' + ')}`);
+    }
   }
   if (parsed?.availableFrom) payLine.push(`с ${esc(trunc(parsed.availableFrom, 24))}`);
   if (parsed?.minimumLease) payLine.push(`мин. ${esc(trunc(parsed.minimumLease, 24))}`);

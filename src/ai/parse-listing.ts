@@ -582,21 +582,8 @@ export async function evaluateRejection(
   rejectionCriteria: string,
   ctx: AiCallCtx = {},
 ): Promise<RejectionResult> {
-  // Fold the listing content (price + description) into the cache key so a CHANGED listing — e.g. a
-  // price drop from over-budget to in-budget — re-evaluates instead of returning the stale verdict.
-  const contentSig = `${listing.price ?? ''}|${(listing.description ?? '').slice(0, 4000)}`;
-  // Fold parse identity in too: a re-parse under a new model/version can change what the verdict
-  // should be, so it must not serve the old model's cached rejection.
-  const criteriaHash = hashText(`${RENTAL_PARSE_VERSION}::${PARSE_MODEL}::${rejectionCriteria}::${contentSig}`);
-
-  // Check rejection cache
-  const cached = getRejectionCache(listing.platform, listing.platformId, criteriaHash);
-  if (cached) {
-    recordLocalCacheHit({ feature: 'rejection_eval', ...ctx }, PARSE_MODEL);
-    return cached;
-  }
-
-  // Build a compact summary from listing + universal parse for the rejection prompt
+  // Build a compact summary from listing + universal parse for the rejection prompt.
+  // (The cache key is derived from this summary below, once it is fully built.)
   const summaryParts: string[] = [`Title: ${listing.title}`];
 
   // Listing-level fields (from crawler data — always available)
@@ -617,11 +604,17 @@ export async function evaluateRejection(
       {
         price: typeof l.price === 'number' ? l.price : 0,
         rent: typeof l.rent === 'number' ? l.rent : null,
+        currency: typeof l.currency === 'string' ? l.currency : undefined,
       },
       universalParse as ParsedRentalData,
     );
-    if (cost.total > 0) {
+    // Only assert a PLN total when the base rent is actually known in PLN; otherwise the "total"
+    // is just czynsz+media (understated) or a foreign-currency sum mislabelled as PLN — never hand
+    // the rejection LLM a fabricated number.
+    if (cost.basePriceKnown && cost.total > 0) {
       summaryParts.push(`Total monthly cost: ${cost.total} PLN`);
+    } else if (!cost.basePriceKnown) {
+      summaryParts.push(`Total monthly cost: base rent not stated (price on request or non-PLN)`);
     }
   }
   if ('contractType' in universalParse && universalParse.contractType != null) {
@@ -663,6 +656,21 @@ export async function evaluateRejection(
   // Common fields
   if (universalParse.descriptionSummary) {
     summaryParts.push(`Summary: ${universalParse.descriptionSummary}`);
+  }
+
+  // Derive the cache key from EXACTLY what the rejection LLM sees. summaryParts folds in every
+  // verdict-driving input (rent price + czynsz admin, the computed PLN total, floor/area/rooms/
+  // district, and the parse-derived contract/quiet/condition/etc.), so any change that would alter
+  // the verdict busts the cache and forces a fresh evaluation — while a stable listing keeps hitting
+  // cache (the underlying parse is itself cached). Parse identity uses the version constant for THIS
+  // parse type so an ITEM_PARSE_VERSION bump invalidates item verdicts and a RENTAL_PARSE_VERSION
+  // bump rental verdicts — not the wrong half.
+  const parseVersion = 'estimatedMedia' in universalParse ? RENTAL_PARSE_VERSION : ITEM_PARSE_VERSION;
+  const criteriaHash = hashText(`${parseVersion}::${PARSE_MODEL}::${rejectionCriteria}::${summaryParts.join('\n')}`);
+  const cached = getRejectionCache(listing.platform, listing.platformId, criteriaHash);
+  if (cached) {
+    recordLocalCacheHit({ feature: 'rejection_eval', ...ctx }, PARSE_MODEL);
+    return cached;
   }
 
   const userMessage = `LISTING SUMMARY:

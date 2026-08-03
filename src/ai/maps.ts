@@ -500,7 +500,13 @@ function offlineMetroPlace(n: NearbyMetro, requestedLine?: WarsawMetroLine): Nea
 
 /** Metro AmenityResult computed offline: nearest station on the requested whitelist, else line, else any. */
 function offlineMetroAmenity(lat: number, lng: number, pref: AmenityPreference): AmenityResult {
-  const near = nearestMetroStations(lat, lng, { line: pref.line, stations: pref.stations, limit: MAX_PLACES_PER_TYPE });
+  let near = nearestMetroStations(lat, lng, { line: pref.line, stations: pref.stations, limit: MAX_PLACES_PER_TYPE });
+  // A whitelist that resolved to ZERO known stations (every name mistyped / not in the verified
+  // table) must not turn every candidate into a false "метро рядом не найдено" reject. Fall back to
+  // the requested line (else all stations) so the gate still judges against a real nearest station.
+  if (near.length === 0 && pref.stations && pref.stations.length > 0) {
+    near = nearestMetroStations(lat, lng, { line: pref.line, limit: MAX_PLACES_PER_TYPE });
+  }
   const places = near.map((n) => offlineMetroPlace(n, pref.line));
   const nearest = places[0] ?? null;
   const withinLimit = nearest != null && nearest.walkingMinutes <= pref.maxMinutes;
@@ -550,6 +556,7 @@ export async function centralStationEstimate(
   lng: number,
   approximate = false,
   uncertaintyMeters = 0,
+  anchorDistanceMeters = 0,
 ): Promise<CentralStationEstimate> {
   try {
     const c = await calculateCommute(lat, lng, WARSZAWA_CENTRALNA.address, 'transit', getNextMondayWarsawTs(11));
@@ -557,7 +564,10 @@ export async function centralStationEstimate(
     // For an uncertain location the true door-to-door time straddles `base`: widen the range BOTH
     // ways so the min is genuinely optimistic. checkCenterGate rejects only when even the optimistic
     // min exceeds the limit, so a symmetric range keeps borderline approximate flats (with a ⚠️).
-    const extra = approximate ? Math.ceil(uncertaintyMeters / WALK_METERS_PER_MINUTE) : 0;
+    // Fold in anchorDistanceMeters too: on the metro-annulus path (localized only as "N m from
+    // Metro X") base is measured from the STATION, and the flat sits `anchorDistanceMeters` away —
+    // so the optimistic min must account for that offset as well, matching the metro/amenity ranges.
+    const extra = approximate ? Math.ceil((anchorDistanceMeters + uncertaintyMeters) / WALK_METERS_PER_MINUTE) : 0;
     const min = Math.max(1, base - extra);
     const max = Math.max(min + 1, Math.ceil(base * 1.25) + extra);
     return { distanceText: ruDistanceText(c.distance), durationMinRange: { min, max } };
@@ -1076,7 +1086,7 @@ export async function scoreLocation(
   const inMetroArea = nearestStation != null && nearestStation.crowMeters <= METRO_SERVICE_RADIUS_M;
   const metroNearest = inMetroArea ? metroNearestWithUncertainty(lat, lng, estimate) : [];
   const centralStation = inMetroArea
-    ? await centralStationEstimate(lat, lng, approximate, estimate?.uncertaintyMeters ?? 0)
+    ? await centralStationEstimate(lat, lng, approximate, estimate?.uncertaintyMeters ?? 0, estimate?.anchorDistanceMeters ?? 0)
     : null;
 
   let commute: CommuteResult | null = null;
