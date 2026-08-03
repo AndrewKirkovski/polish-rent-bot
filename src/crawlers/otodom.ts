@@ -298,13 +298,22 @@ export async function searchOtodom(params: OtodomSearchParams): Promise<CrawlRes
 
     const nextData = await extractNextData(page);
     if (!nextData) {
-      console.error(`  Otodom: no __NEXT_DATA__ found at ${url.slice(0, 120)}`);
-      return { platform: 'otodom', listings: [], totalAvailable: 0, page: 0, hasNextPage: false, nextPageUrl: null };
+      // No SSR payload = a bot-challenge / redirect page (HTTP 200 but no Next.js data), NOT a real
+      // empty result. THROW so searchRentalListings' all-failed guard can tell an Otodom outage from
+      // a genuine empty (mirrors searchOlxRentals rejecting on a total OLX outage) — a fulfilled-empty
+      // here would silently mask the outage as "nothing matched".
+      throw new Error(`otodom: no __NEXT_DATA__ (likely blocked/redirected) at ${url.slice(0, 120)}`);
     }
 
     const pageProps = nextData.props?.pageProps;
     const tracking = pageProps?.tracking?.listing;
-    const items = pageProps?.data?.searchAds?.items ?? [];
+    const searchAds = pageProps?.data?.searchAds;
+    if (!searchAds) {
+      // Payload present but the searchAds container is missing = a structural/anti-bot anomaly, not a
+      // genuine zero-result (which still SSRs searchAds.items: []). Treat as an outage signal, not empty.
+      throw new Error(`otodom: missing searchAds payload (structure change / block) at ${url.slice(0, 120)}`);
+    }
+    const items = searchAds.items ?? [];
 
     const listings = items.map(parseOtodomSearchItem).filter(Boolean) as Listing[];
 

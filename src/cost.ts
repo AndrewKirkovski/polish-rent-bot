@@ -28,6 +28,12 @@ const MEDIA_ORDER: Array<{ key: keyof ParsedRentalData['estimatedMedia']; label:
   { key: 'other', label: 'media' }, // lump zaliczka / undifferentiated "media ~X"
 ];
 
+/** Display unit for a listing's price amount: 'zł' for PLN (the overwhelming common case), else the
+ *  raw currency code — so a non-PLN reject message doesn't mislabel e.g. a EUR figure as zł. */
+export function priceUnit(currency?: string | null): string {
+  return (currency ?? 'PLN') === 'PLN' ? 'zł' : (currency as string);
+}
+
 /** Safe pre-parse budget skip: najem (base rent) alone is a guaranteed lower bound on the
  *  true total — czynsz/media are >= 0 and the AI may even refine czynsz below the crawler's
  *  value, so gating on price+rent could wrongly drop an in-budget flat. Gate on najem only. */

@@ -73,7 +73,11 @@ export function fingerprintsMatch(a: ListingFingerprint, b: ListingFingerprint):
   // otherwise two different area-less flats auto-pass it and can be merged as false duplicates.
   const areaKnown = a.areaBucket > 0 && b.areaBucket > 0;
   if (areaKnown && !bucketsClose(a.areaBucket, b.areaBucket, 5)) return false;
-  if (!bucketsClose(a.priceBucket, b.priceBucket, 50)) return false;
+  // priceBucket 0 means "price unknown" (unparseable, or Otodom "zapytaj o cenę"). Same lenient
+  // philosophy as the area/rooms gates: only enforce the price gate when BOTH prices are known, else a
+  // flat cross-posted with the price hidden on one side would never dedup against its priced copy.
+  const priceKnown = a.priceBucket > 0 && b.priceBucket > 0;
+  if (priceKnown && !bucketsClose(a.priceBucket, b.priceBucket, 50)) return false;
 
   if (a.streetKey && b.streetKey && a.streetKey === b.streetKey) return true;
   // With a known area corroborating, a 0.6 title match is enough; with area unknown, demand a much

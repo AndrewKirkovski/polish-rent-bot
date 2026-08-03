@@ -13,7 +13,13 @@ const nstr = z.string().nullable().default(null).catch(null);
 const nbool = z.boolean().nullable().default(null).catch(null);
 const nenum = <T extends readonly [string, ...string[]]>(values: T) =>
   z.enum(values).nullable().default(null).catch(null);
-const nstrarr = z.array(z.string()).default([]).catch([]);
+// Per-ELEMENT tolerant string array: keep the valid string items instead of dropping the whole array
+// when one element is non-conforming, and coerce a bare string into a single-element array. (A plain
+// `.catch([])` is all-or-nothing, which for `restrictions` is a fail-open into the rejection filter.)
+const nstrarr = z.preprocess(
+  (v) => (Array.isArray(v) ? v.filter((x) => typeof x === 'string') : typeof v === 'string' ? [v] : []),
+  z.array(z.string()).catch([]),
+);
 const DEFAULT_LOCATION_HINT = { query: null, kind: 'none' as const, anchorDistanceMeters: null, uncertaintyMeters: null, evidence: null };
 const DEFAULT_MEDIA = { water: null, electricity: null, gas: null, internet: null, heating: null, other: null };
 
@@ -33,7 +39,12 @@ export const ParsedRentalDataSchema = z.looseObject({
   // string) must collapse to "none" — handled downstream — NOT throw away the whole listing parse.
   locationHint: z.object({
     query: z.string().nullable().default(null).catch(null),
-    kind: z.enum(['address', 'intersection', 'building', 'estate', 'transit_stop', 'landmark', 'neighborhood', 'none']).catch('none').default('none'),
+    // .default('none') for a genuinely-omitted kind, but .catch('landmark') for an out-of-enum
+    // synonym (Haiku emitting 'metro'/'street'/'station'): 'none' would DISCARD the still-present,
+    // geocodable `query` entirely (isUsableDescriptionLocationHint drops kind==='none'), whereas
+    // 'landmark' keeps it as a point anchor — the downstream evidence + duplicatesPlatformArea guards
+    // still filter a bad/echo anchor, so the worst case is a coarse point, not a lost one.
+    kind: z.enum(['address', 'intersection', 'building', 'estate', 'transit_stop', 'landmark', 'neighborhood', 'none']).default('none').catch('landmark'),
     anchorDistanceMeters: z.number().min(0).max(50_000).nullable().default(null).catch(null),
     uncertaintyMeters: z.number().min(0).max(20_000).nullable().default(null).catch(null),
     evidence: z.string().nullable().default(null).catch(null),

@@ -622,6 +622,13 @@ export async function evaluateRejection(
     } else if (!cost.basePriceKnown) {
       summaryParts.push(`Total monthly cost: base rent not stated (price on request or non-PLN)`);
     }
+    // Deposit (kaucja): surface it so deposit-based rejection criteria (e.g. "залог не больше 5000")
+    // can actually fire — the LLM only sees this summary. Prefer the parsed numeric, then the
+    // parsed note, then the crawler value.
+    const rp = universalParse as ParsedRentalData;
+    const deposit = rp.deposit ?? (typeof l.deposit === 'number' ? l.deposit : null);
+    if (deposit != null) summaryParts.push(`Deposit (kaucja): ${deposit} ${cur}`);
+    else if (rp.depositNote) summaryParts.push(`Deposit (kaucja): ${rp.depositNote}`);
   }
   if ('contractType' in universalParse && universalParse.contractType != null) {
     summaryParts.push(`Contract type: ${universalParse.contractType}`);

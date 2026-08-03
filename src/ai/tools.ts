@@ -11,6 +11,7 @@ import { formatRichRentalNotification, formatRichItemNotification, splitMessage,
 import { escapeHtml } from '../utils/html.js';
 import { searchRentalListings, CITY_PROVINCE_MAP, resolveCityId } from '../search/rental-search.js';
 import { enrichRentalListing } from '../search/enrich-listing.js';
+import { coordsTrustworthy, preserveTrustworthyCoords } from '../search/listing-coords.js';
 import { checkAmenityGate, checkCenterGate, resolveStrictAmenities } from '../search/amenity-gate.js';
 import { computeFitScore, preScore } from '../search/fit-score.js';
 import { isSoftRejection, type RejectionCategory } from '../search/rejection.js';
@@ -30,7 +31,7 @@ import {
   getAuthorizedTelegramIds,
 } from '../storage/db.js';
 import type { Listing, ParsedRentalData, ParsedItemData, LocationScore } from '../types.js';
-import { computeRentalCost, exceedsBudgetFloor } from '../cost.js';
+import { computeRentalCost, exceedsBudgetFloor, priceUnit } from '../cost.js';
 import { genResultId, prefixResultIdHtml, prefixResultIdPlain } from '../utils/result-id.js';
 
 // ---------------------------------------------------------------------------
@@ -604,13 +605,14 @@ async function execFindRentals(
     // Reserve a result ID for this candidate up-front so even rejection paths
     // (and the catch-all error handler below) can reference it. Reuse the listing's existing cached
     // id (as the monitor does) so re-searching the same flat keeps its old [ID] resolvable.
-    const resultId = getCachedListingByPlatform(listing.platform, listing.platformId)?.resultId ?? newUniqueResultId();
+    const priorCached = getCachedListingByPlatform(listing.platform, listing.platformId);
+    const resultId = priorCached?.resultId ?? newUniqueResultId();
 
     // Pre-parse budget short-circuit: base rent alone already over budget → the true total
     // can only be higher, so skip the expensive enrich + AI parse (see exceedsBudgetFloor).
     if (priceTo != null && exceedsBudgetFloor(listing, priceTo)) {
       // HARD: base rent alone already over budget — the true total can only be higher.
-      await emitReject(resultId, listing, 'budget_floor', `дороже бюджета (аренда ${listing.price} zł > ${priceTo})`);
+      await emitReject(resultId, listing, 'budget_floor', `дороже бюджета (аренда ${listing.price} ${priceUnit(listing.currency)} > ${priceTo})`);
       continue;
     }
 
@@ -645,6 +647,10 @@ async function execFindRentals(
       // Fetch detail page / phone for richer data
       console.log(`[find_rentals] ${i + 1}/${candidateCount}: ${listing.platform} "${listing.title.slice(0, 50)}"`);
       const enrichedListing = await enrichRentalListing(listing);
+      // Never downgrade a prior row's trustworthy coords: this pre-enrichment write (and the error
+      // path) would otherwise clobber address-grade coords a richer pass already persisted with the
+      // fuzzy platform pin. Carrying them forward also seeds enrichListingLocation with a good prior.
+      preserveTrustworthyCoords(enrichedListing, priorCached?.listing as Listing | undefined);
       cachedForm = enrichedListing; // prefer the enriched form for any later (error-path) caching
 
       // Cache the enriched Listing immediately so show_listing / get_listing
@@ -694,6 +700,15 @@ async function execFindRentals(
       // basePriceKnown guard: surface it as a soft reject the user can override, never a fake pass.
       if ((priceTo != null || priceFrom != null) && !cost.basePriceKnown) {
         await emitReject(resultId, enrichedListing, 'budget_max', 'цена не указана или не в PLN — бюджет не проверить', true);
+        continue;
+      }
+
+      // Parse failed → czynsz/media unknown, so cost.total is understated (base + listing.rent only).
+      // With a budget filter set, gating on it produces a false below-min reject OR silently
+      // under-enforces the max. Surface it as unverifiable instead — mirrors the monitor's parse-fail
+      // defer (basePriceKnown alone certifies only the base rent, not the full total).
+      if ((priceTo != null || priceFrom != null) && parsedData == null) {
+        await emitReject(resultId, enrichedListing, 'budget_max', 'не удалось разобрать объявление — бюджет не проверить', true);
         continue;
       }
 
@@ -926,7 +941,8 @@ async function execFindItems(
     const item = candidates[i];
 
     // Reserve a result ID up-front; reuse the item's cached id so re-searches keep [ID]s resolvable.
-    const resultId = getCachedListingByPlatform(item.platform, item.platformId)?.resultId ?? newUniqueResultId();
+    const priorItem = getCachedListingByPlatform(item.platform, item.platformId);
+    const resultId = priorItem?.resultId ?? newUniqueResultId();
 
     try {
       // Fetch phone if not available
@@ -936,6 +952,12 @@ async function execFindItems(
           const phone = await fetchItemPhone(item.platformId);
           if (phone) enrichedItem = { ...item, phone };
         } catch (e) { console.warn(`[find_items] Phone fetch failed for ${item.platformId}:`, e instanceof Error ? e.message : e); }
+      }
+      // Don't downgrade: if this re-search's phone fetch yielded nothing but a prior row already had
+      // one, carry the prior phone forward so the cache write can't strip a previously-captured number.
+      if (!enrichedItem.phone) {
+        const priorPhone = (priorItem?.listing as ItemListing | undefined)?.phone;
+        if (priorPhone) enrichedItem = { ...enrichedItem, phone: priorPhone };
       }
 
       // Cache the enriched item immediately so show_listing / get_listing
@@ -1301,8 +1323,7 @@ async function execShowListing(
     // building-accurate. Rescore only for a precise OLX pin or an Otodom (detail-page) listing; for a
     // fuzzy pin leave the card's honest "⚠️ unknown" rather than fabricate precision.
     let locationScore: LocationScore | null = null;
-    const coordsTrustworthy = rental.coordsPrecise === true || rental.platform === 'otodom';
-    if (rental.lat != null && rental.lng != null && coordsTrustworthy) {
+    if (rental.lat != null && rental.lng != null && coordsTrustworthy(rental)) {
       try {
         locationScore = await scoreLocation(rental.lat, rental.lng, []);
       } catch (e) {

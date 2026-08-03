@@ -179,11 +179,14 @@ test('locationEvidenceSupportsAnchor accepts a Polish declension (wola/woli)', (
   assert.equal(locationEvidenceSupportsAnchor('metro Wola, Warszawa', 'przy stacji Woli'), true);
 });
 
-test('a malformed locationHint collapses to "none" instead of sinking the whole parse', () => {
-  // Haiku abbreviating the compound enum ("transit") or returning a bare string must not throw.
+test('a malformed locationHint kind keeps the geocodable query (→ landmark) instead of sinking the parse', () => {
+  // Haiku emitting an out-of-enum kind synonym ("transit") must NOT throw AND must not discard the
+  // still-usable query — it collapses to 'landmark' (a geocodable point anchor), keeping the location.
   const a = ParsedRentalDataSchema.parse({ adminFee: 600, locationHint: { query: 'metro Bemowo', kind: 'transit' } });
-  assert.equal(a.locationHint.kind, 'none');
+  assert.equal(a.locationHint.kind, 'landmark');
+  assert.equal(a.locationHint.query, 'metro Bemowo');
   assert.equal(a.adminFee, 600);
+  // A bare-string locationHint (the whole object is malformed) still collapses to the 'none' default.
   const b = ParsedRentalDataSchema.parse({ adminFee: 600, locationHint: 'metro Bemowo' });
   assert.equal(b.locationHint.kind, 'none');
   assert.equal(b.adminFee, 600);
@@ -200,7 +203,8 @@ test('a bad top-level enum / boolean / array value collapses instead of discardi
     internetType: '5G',         // not in the enum
     balcony: 'tak',             // not a boolean
     parkingIncluded: 'nie',     // not a boolean
-    redFlags: 'first floor',    // not an array
+    positives: ['jasne', 42, 'ciche'], // mixed array — drop the bad element, keep the strings
+    restrictions: 'без животных',       // bare string → single-element array (per-element tolerance)
   });
   assert.equal(p.contractType, null);
   assert.equal(p.furnished, null);
@@ -208,7 +212,8 @@ test('a bad top-level enum / boolean / array value collapses instead of discardi
   assert.equal(p.internetType, null);
   assert.equal(p.balcony, null);
   assert.equal(p.parkingIncluded, null);
-  assert.deepEqual(p.redFlags, []);
+  assert.deepEqual(p.positives, ['jasne', 'ciche']);   // valid string elements survive one bad sibling
+  assert.deepEqual(p.restrictions, ['без животных']);   // coerced, not dropped
   assert.equal(p.adminFee, 600); // sibling fields survive
 });
 

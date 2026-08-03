@@ -9,9 +9,10 @@ import type { ItemListing } from '../crawlers/olx-items.js';
 import { parseRentalListing, parseItemListing, evaluateRejection, triageRentalListing } from '../ai/parse-listing.js';
 import { createUnknownLocationScore, scoreLocation } from '../ai/maps.js';
 import type { AmenityPreference } from '../ai/maps.js';
-import { computeRentalCost, exceedsBudgetFloor } from '../cost.js';
+import { computeRentalCost, exceedsBudgetFloor, priceUnit } from '../cost.js';
 import { searchRentalListings, resolveCityId } from '../search/rental-search.js';
 import { enrichRentalListing } from '../search/enrich-listing.js';
+import { preserveTrustworthyCoords } from '../search/listing-coords.js';
 import { checkAmenityGate, checkCenterGate, resolveStrictAmenities } from '../search/amenity-gate.js';
 import { notificationDedupKey } from '../search/listing-fingerprint.js';
 import { computeFitScore, preScore } from '../search/fit-score.js';
@@ -353,7 +354,7 @@ export function startScheduler(
                 const l = listing as Listing;
                 if (exceedsBudgetFloor(l, monitorConfig.priceTo)) {
                   console.log(`[scheduler] Budget pre-reject "${l.title}": аренда ${l.price} > ${monitorConfig.priceTo} (no AI call)`);
-                  recordMonitorRejection(monitor.id, l, 'budget_floor', `аренда ${l.price} zł > ${monitorConfig.priceTo} zł`);
+                  recordMonitorRejection(monitor.id, l, 'budget_floor', `аренда ${l.price} ${priceUnit(l.currency)} > ${monitorConfig.priceTo} zł`);
                   markListingSeen(monitor.id, l.platform, l.platformId, l.url, l.title, l.price);
                   continue;
                 }
@@ -408,7 +409,12 @@ export function startScheduler(
               } catch (parseErr) {
                 console.error('[scheduler] AI parse failed:', parseErr);
                 const msg = parseErr instanceof Error ? parseErr.message : String(parseErr);
-                parseFailedDeterministically = /invalid JSON|No text in Claude/i.test(msg);
+                // Allow-list the genuinely TRANSIENT (outage) signals — retry those indefinitely
+                // without counting. Everything else (invalid JSON, a content refusal, a 400
+                // invalid_request, or any unrecognized error) defaults to DETERMINISTIC so it counts
+                // toward MAX_PARSE_DEFERS and can't loop forever occupying a per-cycle slot.
+                const transient = /\b(429|500|502|503|504|529)\b|overloaded|rate.?limit|timeout|timed out|ETIMEDOUT|ECONNRESET|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|fetch failed|socket hang up|connection error|network|aborted|terminated/i.test(msg);
+                parseFailedDeterministically = !transient;
               }
 
               if (monitor.type === 'rental' && (parsedData as ParsedRentalData | null)?.isConcreteApartment === false) {
@@ -420,23 +426,21 @@ export function startScheduler(
 
               try {
                 // Best-effort early cache without ID — recall for rejected listings is low value.
-                // Delivered alerts overwrite with a real resultId below. Guard against DOWNGRADING a
-                // richer row: if a prior search already cached this flat WITH geocoded coords and this
-                // pre-enrichment listing has none, skip the write so show_listing can still recompute
-                // the metro/Centralna block from the persisted coords (cacheListing overwrites
-                // listing_json unconditionally on conflict).
+                // Delivered alerts overwrite with a real resultId below. Never DOWNGRADE a richer
+                // row: carry any prior trustworthy coords onto this pre-enrichment listing (which has
+                // at most a fuzzy platform pin) so show_listing can still recompute the metro/Centralna
+                // block — cacheListing overwrites listing_json unconditionally on conflict.
                 const prior = getCachedListingByPlatform(workingListing.platform, workingListing.platformId);
-                const priorHasCoords = monitor.type === 'rental' && (prior?.listing as Listing | undefined)?.lat != null;
-                const thisHasCoords = monitor.type === 'rental' && (workingListing as Listing).lat != null;
-                if (!(priorHasCoords && !thisHasCoords)) {
-                  cacheListing({
-                    platform: workingListing.platform,
-                    platformId: workingListing.platformId,
-                    kind: monitor.type === 'rental' ? 'rental' : 'item',
-                    resultId: prior?.resultId ?? null,
-                    listing: workingListing,
-                  });
+                if (monitor.type === 'rental') {
+                  preserveTrustworthyCoords(workingListing as Listing, prior?.listing as Listing | undefined);
                 }
+                cacheListing({
+                  platform: workingListing.platform,
+                  platformId: workingListing.platformId,
+                  kind: monitor.type === 'rental' ? 'rental' : 'item',
+                  resultId: prior?.resultId ?? null,
+                  listing: workingListing,
+                });
               } catch (cacheErr) {
                 console.error('[scheduler] cacheListing failed:', cacheErr instanceof Error ? cacheErr.message : cacheErr);
               }
@@ -448,7 +452,7 @@ export function startScheduler(
                 // A base rent already over the cap is a certain reject regardless of parse state.
                 if (config.priceTo != null && cost.najem > config.priceTo) {
                   console.log(`[scheduler] Budget reject "${l.title}": najem ${cost.najem} > ${config.priceTo}`);
-                  recordMonitorRejection(monitor.id, l, 'budget_max', `аренда ${cost.najem} zł > ${config.priceTo} zł`);
+                  recordMonitorRejection(monitor.id, l, 'budget_max', `аренда ${cost.najem} ${priceUnit(l.currency)} > ${config.priceTo} zł`);
                   markListingSeen(monitor.id, l.platform, l.platformId, l.url, l.title, l.price);
                   continue;
                 }
@@ -609,18 +613,12 @@ export function startScheduler(
               // Reuse a prior search/monitor result ID when present so one flat ↔ one code.
               const prior = getCachedListingByPlatform(workingListing.platform, workingListing.platformId);
               const resultId = prior?.resultId ?? newUniqueResultId();
-              // Coord-merge, not downgrade: if this pass geocoded only approximate coords (lat left
-              // null) but a prior row already holds trustworthy ones, carry them forward so this
-              // delivery write can't strip coords show_listing needs for the metro/Centralna block
-              // (cacheListing overwrites listing_json unconditionally on conflict).
+              // Coord-merge, not downgrade: if this pass didn't reach trustworthy coords (approximate
+              // geocode, or an OLX fuzzy pin from a parse that dropped the addressHint) but a prior
+              // row already holds trustworthy ones, carry them forward so this delivery write can't
+              // strip coords show_listing needs (cacheListing overwrites listing_json unconditionally).
               if (monitor.type === 'rental') {
-                const priorL = prior?.listing as Listing | undefined;
-                const wl = workingListing as Listing;
-                if (wl.lat == null && priorL?.lat != null) {
-                  wl.lat = priorL.lat;
-                  wl.lng = priorL.lng;
-                  wl.coordsPrecise = priorL.coordsPrecise;
-                }
+                preserveTrustworthyCoords(workingListing as Listing, prior?.listing as Listing | undefined);
               }
               try {
                 cacheListing({
