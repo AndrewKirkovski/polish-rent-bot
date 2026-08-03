@@ -101,7 +101,7 @@ const HINT_KIND_LABEL: Record<HintKind, string> = {
   transit_stop: 'остановка', landmark: 'ориентир', neighborhood: 'район',
 };
 
-interface LocCandidate {
+export interface LocCandidate {
   lat: number; lng: number;
   sigma: number;           // ~1σ uncertainty radius, metres
   reliability: number;     // prior trust 0..1
@@ -109,7 +109,7 @@ interface LocCandidate {
   source: string;
   evidence: string | null;
 }
-interface MetroConstraint {
+export interface MetroConstraint {
   station: { name: string; lat: number; lng: number };
   distance: number;        // apartment is ~this far from the station (anchorDistanceMeters)
   margin: number;          // ± tolerance incl. station footprint
@@ -199,8 +199,9 @@ async function gatherLocationCandidates(
   return { candidates, constraint, unverifiedEvidence };
 }
 
-/** Fuse agreeing candidates (inverse-variance weighted) and apply the metro annulus constraint. */
-function fuseLocationCandidates(candidates: LocCandidate[], constraint: MetroConstraint | null): EnrichedLocation {
+/** Fuse agreeing candidates (inverse-variance weighted) and apply the metro annulus constraint.
+ *  Exported (pure) so the clustering/combine/constraint math can be unit-tested directly. */
+export function fuseLocationCandidates(candidates: LocCandidate[], constraint: MetroConstraint | null): EnrichedLocation {
   const primary = [...candidates].sort((a, b) => b.reliability / b.sigma - a.reliability / a.sigma)[0]!;
   const cluster = candidates.filter((c) =>
     c === primary || haversineMeters(primary.lat, primary.lng, c.lat, c.lng) <= AGREE_K * (primary.sigma + c.sigma));

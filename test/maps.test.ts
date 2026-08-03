@@ -8,7 +8,7 @@ import {
   warsawMetroLinesForStation,
   metroNearestWithUncertainty,
 } from '../src/ai/maps.js';
-import { classifyGeocodePrecision, isUsableDescriptionLocationHint, enrichListingLocation } from '../src/ai/location.js';
+import { classifyGeocodePrecision, isUsableDescriptionLocationHint, enrichListingLocation, fuseLocationCandidates, type LocCandidate } from '../src/ai/location.js';
 import type { Listing, ParsedRentalData } from '../src/types.js';
 
 const walk = { walking: true, transit: false, driving: false, checkFrequency: false, transitFallback: false };
@@ -90,6 +90,37 @@ test('location fusion: a pin far from the claimed station is flagged as a confli
   assert.equal(e.precision, 'district');
   assert.ok(e.uncertaintyMeters >= 1000, `not falsely tightened, got ${e.uncertaintyMeters}`);
   assert.match(e.source, /расхожден/);
+});
+
+const cand = (over: Partial<LocCandidate>): LocCandidate => ({ lat: 52.2385, lng: 20.9594, sigma: 120, reliability: 0.85, precisionFloor: 'street', source: 'pin', evidence: null, ...over });
+
+test('fuseLocationCandidates: single candidate is returned unchanged', () => {
+  const e = fuseLocationCandidates([cand({})], null);
+  assert.equal(e.precision, 'street');
+  assert.equal(e.uncertaintyMeters, 120);
+  assert.ok(Math.abs(e.lat! - 52.2385) < 1e-6 && Math.abs(e.lng! - 20.9594) < 1e-6);
+});
+
+test('fuseLocationCandidates: two ~350 m-apart candidates are not reported as ±87 m (spread inflation)', () => {
+  const a = cand({ lat: 52.2400, sigma: 120 });
+  const b = cand({ lat: 52.2368, sigma: 125, reliability: 0.75, source: 'street' });
+  const e = fuseLocationCandidates([a, b], null);
+  assert.ok(e.uncertaintyMeters >= 150, `spread-inflated, got ${e.uncertaintyMeters}`); // inverse-variance alone ≈ 87
+});
+
+test('fuseLocationCandidates: a metro constraint on the annulus corroborates (keeps point, notes station)', () => {
+  const e = fuseLocationCandidates([cand({})], { station: { name: 'Młynów', lat: 52.23766, lng: 20.9601 }, distance: 70, margin: 150, evidence: 'e' });
+  assert.equal(e.precision, 'street');
+  assert.match(e.source, /Młynów/);
+  assert.ok(e.uncertaintyMeters <= 200);
+});
+
+test('fuseLocationCandidates: a pin far from the claimed station is flagged as conflict, not tightened', () => {
+  const fuzzy = cand({ sigma: 1800, reliability: 0.4, precisionFloor: 'district', source: 'pin' });
+  const e = fuseLocationCandidates([fuzzy], { station: { name: 'Politechnika', lat: 52.21866, lng: 21.01530 }, distance: 0, margin: 400, evidence: 'e' });
+  assert.equal(e.precision, 'district');
+  assert.match(e.source, /расхожден/);
+  assert.ok(e.uncertaintyMeters >= 1000);
 });
 
 test('metroNearestWithUncertainty keeps the truly-nearest station first when anchor offset > uncertainty', () => {

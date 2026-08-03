@@ -6,16 +6,11 @@ import sanitizeHtml from 'sanitize-html';
 import type { Listing, ParsedRentalData, ParsedItemData, LocationScore, NearbyPlace } from '../types.js';
 import type { ItemListing } from '../crawlers/olx-items.js';
 import { computeRentalCost } from '../cost.js';
-import { escapeHtml } from '../utils/html.js';
+import { escapeHtml, TELEGRAM_SANITIZE } from '../utils/html.js';
 
 /** Repair broken HTML from message splitting — close unclosed tags, strip orphan close tags */
 function sanitizeChunk(html: string): string {
-  return sanitizeHtml(html, {
-    allowedTags: ['b', 'strong', 'i', 'em', 'u', 'ins', 's', 'strike', 'del',
-                  'a', 'code', 'pre', 'blockquote', 'tg-emoji', 'tg-spoiler', 'span'],
-    allowedAttributes: { 'a': ['href'], 'tg-emoji': ['emoji-id'], 'code': ['class'], 'span': ['class'], 'blockquote': ['expandable'] },
-    transformTags: { 'strong': 'b', 'em': 'i', 'ins': 'u', 'strike': 's', 'del': 's' },
-  });
+  return sanitizeHtml(html, TELEGRAM_SANITIZE);
 }
 
 // ---------------------------------------------------------------------------

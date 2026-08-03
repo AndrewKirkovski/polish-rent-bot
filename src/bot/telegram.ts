@@ -68,6 +68,7 @@ async function ensureAuth(msg: Msg): Promise<boolean> {
 
 import { marked } from 'marked';
 import sanitizeHtml from 'sanitize-html';
+import { TELEGRAM_SANITIZE } from '../utils/html.js';
 
 // Configure marked for inline-only output (no <p> wrappers for single paragraphs)
 marked.setOptions({ breaks: true, gfm: true });
@@ -90,18 +91,7 @@ function mdToHtml(text: string): string {
     .replace(/<hr\s*\/?>/g, '────────\n');   // horizontal rule
 
   // sanitize-html: keep only Telegram-supported tags
-  const clean = sanitizeHtml(processed, {
-    allowedTags: ['b', 'strong', 'i', 'em', 'u', 'ins', 's', 'strike', 'del',
-                  'a', 'code', 'pre', 'blockquote', 'tg-emoji', 'tg-spoiler', 'span'],
-    allowedAttributes: { 'a': ['href'], 'tg-emoji': ['emoji-id'], 'code': ['class'], 'span': ['class'], 'blockquote': ['expandable'] },
-    transformTags: {
-      'strong': 'b',
-      'em': 'i',
-      'ins': 'u',
-      'strike': 's',
-      'del': 's',
-    },
-  });
+  const clean = sanitizeHtml(processed, TELEGRAM_SANITIZE);
 
   return clean.replace(/\n{3,}/g, '\n\n').trim();
 }
