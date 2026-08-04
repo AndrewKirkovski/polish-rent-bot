@@ -143,7 +143,14 @@ export function dedupeCrossPlatform(listings: Listing[]): Listing[] {
   return kept;
 }
 
-/** Stable key for cross-monitor notification dedup within one scheduler cycle. */
+/** Stable key for the PERSISTENT, household-wide notification-dedup table (notified_fingerprints) —
+ *  a physical flat is alerted at most once across cycles and monitors. It is an exact key over
+ *  city|rooms|areaBucket|priceBucket|titleKey. Known limitation: because it hashes the fuzzy titleKey
+ *  as an exact component and omits streetKey, it can differ for two records that fingerprintsMatch()
+ *  considers the SAME flat (a cross-post whose title differs, matched there via streetKey or a
+ *  title-jaccard), so such a repost can occasionally produce one extra alert. Fully closing that would
+ *  require storing the fingerprint components and doing a fingerprintsMatch()-based lookup rather than
+ *  an exact key — deferred as disproportionate to the one-duplicate-alert impact. */
 export function notificationDedupKey(listing: Listing): string {
   const fp = fingerprintListing(listing);
   return fingerprintKey(fp);

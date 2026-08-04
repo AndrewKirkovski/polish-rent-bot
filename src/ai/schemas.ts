@@ -48,7 +48,7 @@ export const ParsedRentalDataSchema = z.looseObject({
     anchorDistanceMeters: z.number().min(0).max(50_000).nullable().default(null).catch(null),
     uncertaintyMeters: z.number().min(0).max(20_000).nullable().default(null).catch(null),
     evidence: z.string().nullable().default(null).catch(null),
-  }).default(DEFAULT_LOCATION_HINT).catch(DEFAULT_LOCATION_HINT),
+  }).default(DEFAULT_LOCATION_HINT).catch(() => ({ ...DEFAULT_LOCATION_HINT })),
   isConcreteApartment: z.boolean().nullable().default(true).catch(true),
   estimatedMedia: z.object({
     water: nnum,
@@ -57,7 +57,7 @@ export const ParsedRentalDataSchema = z.looseObject({
     internet: nnum,
     heating: nnum,
     other: nnum,
-  }).default(DEFAULT_MEDIA).catch(DEFAULT_MEDIA),
+  }).default(DEFAULT_MEDIA).catch(() => ({ ...DEFAULT_MEDIA })),
   contractType: nenum(['najem_okazjonalny', 'najem_zwykly', 'najem_instytucjonalny']),
   availableFrom: nstr,
   minimumLease: nstr,

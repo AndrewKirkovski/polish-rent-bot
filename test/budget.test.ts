@@ -168,6 +168,13 @@ test('computeRentalCost flags a missing base price and does not present czynsz+m
   assert.equal(c.total, 800); // 0 + 600 + 200 — NOT a real monthly total
 });
 
+test('computeRentalCost floors a hallucinated negative adminFee/media at 0 (cannot understate total under budget_max)', () => {
+  const c = computeRentalCost({ price: 4000, rent: null }, mkParsed({ adminFee: -500, estimatedMedia: { water: 100, electricity: -200, gas: null, internet: null, heating: null, other: null } }));
+  assert.equal(c.czynsz, 0);       // -500 floored to 0, not subtracted
+  assert.equal(c.mediaSum, 100);   // -200 dropped, 100 kept
+  assert.equal(c.total, 4100);     // 4000 + 0 + 100 — never 4000 - 500 - 200
+});
+
 test('rental schema tolerates a unit-suffixed numeric instead of discarding the whole parse', () => {
   const p = ParsedRentalDataSchema.parse({ deposit: '6000 zł', adminFee: 600, estimatedMedia: { electricity: '~200' } });
   assert.equal(p.deposit, null);                    // bad field → null, not a thrown parse

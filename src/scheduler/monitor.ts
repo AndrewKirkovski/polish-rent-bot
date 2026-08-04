@@ -449,17 +449,29 @@ export function startScheduler(
               if (monitor.type === 'rental' && (config.priceTo != null || config.priceFrom != null)) {
                 const l = workingListing as Listing;
                 const cost = computeRentalCost(l, parsedData as ParsedRentalData | null);
+                const deferKey = `${monitor.id}:${l.platform}:${l.platformId}`;
                 // A base rent already over the cap is a certain reject regardless of parse state.
                 if (config.priceTo != null && cost.najem > config.priceTo) {
                   console.log(`[scheduler] Budget reject "${l.title}": najem ${cost.najem} > ${config.priceTo}`);
                   recordMonitorRejection(monitor.id, l, 'budget_max', `аренда ${cost.najem} ${priceUnit(l.currency)} > ${config.priceTo} zł`);
+                  parseDeferCounts.delete(deferKey);
+                  markListingSeen(monitor.id, l.platform, l.platformId, l.url, l.title, l.price);
+                  continue;
+                }
+                // "Zapytaj o cenę" (price=0) or non-PLN: basePriceKnown depends ONLY on the crawler
+                // listing, not the parse — no amount of parsing can ever verify the budget, so reject
+                // NOW, BEFORE the parse-null defer, instead of wastefully re-triaging+enriching+parsing
+                // it every cycle. Mirrors find_rentals' ordering.
+                if (!cost.basePriceKnown) {
+                  console.log(`[scheduler] Budget reject "${l.title}": цена не указана или не в PLN`);
+                  recordMonitorRejection(monitor.id, l, 'budget_max', 'цена не указана или не в PLN — бюджет не проверить');
+                  parseDeferCounts.delete(deferKey);
                   markListingSeen(monitor.id, l.platform, l.platformId, l.url, l.title, l.price);
                   continue;
                 }
                 // Parse failed → czynsz/media unknown, total unverifiable. DEFER: don't deliver a
                 // possibly-over-budget flat, and don't mark seen, so it is re-attempted next cycle
                 // instead of silently passing on the base rent alone.
-                const deferKey = `${monitor.id}:${l.platform}:${l.platformId}`;
                 if (!parsedData) {
                   // A TRANSIENT failure (API outage/rate-limit/timeout) must NOT count toward give-up:
                   // defer indefinitely so the listing is re-delivered once the provider recovers,
@@ -492,13 +504,6 @@ export function startScheduler(
                 }
                 // Parse succeeded — clear any prior defer count so a later transient failure gets a fresh budget.
                 parseDeferCounts.delete(deferKey);
-                // "Zapytaj o cenę" (no base rent): czynsz+media is NOT the real cost — can't verify budget.
-                if (!cost.basePriceKnown) {
-                  console.log(`[scheduler] Budget reject "${l.title}": цена не указана`);
-                  recordMonitorRejection(monitor.id, l, 'budget_max', 'цена не указана — бюджет не проверить');
-                  markListingSeen(monitor.id, l.platform, l.platformId, l.url, l.title, l.price);
-                  continue;
-                }
                 const estimatedTotal = cost.total;
                 if (config.priceTo != null && estimatedTotal > config.priceTo) {
                   console.log(`[scheduler] Budget reject "${l.title}": ${estimatedTotal} > ${config.priceTo}`);
@@ -631,9 +636,13 @@ export function startScheduler(
               } catch (cacheErr) {
                 console.error('[scheduler] cacheListing (deliver) failed:', cacheErr instanceof Error ? cacheErr.message : cacheErr);
               }
-              seedResultIdForFamily(resultId, workingListing, monitor.user_id);
 
               if (shouldEmitMonitorNotification(fullRescan)) {
+                // Seed the in-memory reply-to-card map ONLY when a card is actually sent. During a full
+                // rescan (Infinity cap, notifications suppressed) this would otherwise add a resultMap
+                // entry per passing candidate for cards that never exist — the DB cache write above
+                // already preserves the resultId for later show_listing resolution.
+                seedResultIdForFamily(resultId, workingListing, monitor.user_id);
                 await notifyFn(
                   monitor.user_id,
                   workingListing,

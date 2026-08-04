@@ -648,6 +648,21 @@ export async function evaluateRejection(
   if ('parkingIncluded' in universalParse && universalParse.parkingIncluded != null) {
     summaryParts.push(`Parking: ${universalParse.parkingIncluded}`);
   }
+  // WFH-core signals the household ranks on — surface them so free-text criteria like "обязательно
+  // оптоволокно" / "только светлые" / "минимум 2 отдельные комнаты" can actually fire (the rejection
+  // LLM only sees this summary; a missing field is treated as PASS).
+  if ('separateRooms' in universalParse && universalParse.separateRooms != null) {
+    summaryParts.push(`Separate (non-passthrough) rooms: ${universalParse.separateRooms}`);
+  }
+  if ('layoutType' in universalParse && universalParse.layoutType != null) {
+    summaryParts.push(`Layout: ${universalParse.layoutType}`);
+  }
+  if ('naturalLight' in universalParse && universalParse.naturalLight != null) {
+    summaryParts.push(`Natural light: ${universalParse.naturalLight}`);
+  }
+  if ('internetType' in universalParse && universalParse.internetType != null) {
+    summaryParts.push(`Internet: ${universalParse.internetType}`);
+  }
   if ('restrictions' in universalParse) {
     const restrictions = universalParse.restrictions as string[];
     if (restrictions.length > 0) summaryParts.push(`Restrictions: ${restrictions.join(', ')}`);

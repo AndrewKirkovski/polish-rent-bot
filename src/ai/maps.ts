@@ -3,7 +3,7 @@
 // Smart amenity intelligence: transport-mode-aware, frequency-aware for transit stops
 
 import { createHash } from 'node:crypto';
-import { getMapsCacheEntry, setMapsCacheEntry, clearEmptyMapsCache } from '../storage/db.js';
+import { getMapsCacheEntry, setMapsCacheEntry } from '../storage/db.js';
 import type { AmenityResult, NearbyPlace, CommuteResult, LocationScore, LocationPrecision, CentralStationEstimate } from '../types.js';
 import {
   WARSZAWA_CENTRALNA,
@@ -279,22 +279,6 @@ interface DirectionsResponse {
   status: string;
   routes?: DirectionsRoute[];
   error_message?: string;
-}
-
-// ---------------------------------------------------------------------------
-// Startup: clear stale error-cached data. Called explicitly from main so that merely importing
-// maps.ts (e.g. in a test or a tool) has no DB side effect.
-// ---------------------------------------------------------------------------
-
-export function initMapsCacheMaintenance(): void {
-  try {
-    const cleared = clearEmptyMapsCache();
-    if (cleared > 0) {
-      console.log(`[maps] Cleared ${cleared} stale error-cached entries`);
-    }
-  } catch (err) {
-    console.warn('[maps] Startup cache cleanup failed (DB may not be ready):', err instanceof Error ? err.message : err);
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1098,6 +1082,13 @@ export async function scoreLocation(
     : pointAmenities;
 
   const approximate = !!estimate && estimate.precision !== 'exact' && estimate.precision !== 'street';
+  // The center-time widening must follow the SAME positional uncertainty the amenity gate + metro
+  // card use (any uncertaintyMeters/anchorDistanceMeters > 0, INCLUDING street precision's ±50-200 m),
+  // not the coarser `approximate` flag. Otherwise a street-precision flat gets lenient amenity gates
+  // but a firm, un-widened center gate for the identical uncertainty — inconsistently hard-rejecting a
+  // borderline flat whose true transit time to Centralna is within the limit. (The triangle warning
+  // stays on `approximate` so a street flat isn't labelled "примерная локация".)
+  const widenCenter = !!estimate && (estimate.uncertaintyMeters > 0 || estimate.anchorDistanceMeters > 0);
 
   // Always-present card content: 2 nearest stations + transit time to Warszawa Centralna — but
   // only inside the Warsaw metro service area. For a listing in another city (multi-city search),
@@ -1107,7 +1098,7 @@ export async function scoreLocation(
   const inMetroArea = nearestStation != null && nearestStation.crowMeters <= METRO_SERVICE_RADIUS_M;
   const metroNearest = inMetroArea ? metroNearestWithUncertainty(lat, lng, estimate) : [];
   const centralStation = inMetroArea
-    ? await centralStationEstimate(lat, lng, approximate, estimate?.uncertaintyMeters ?? 0, estimate?.anchorDistanceMeters ?? 0)
+    ? await centralStationEstimate(lat, lng, widenCenter, estimate?.uncertaintyMeters ?? 0, estimate?.anchorDistanceMeters ?? 0)
     : null;
 
   let commute: CommuteResult | null = null;

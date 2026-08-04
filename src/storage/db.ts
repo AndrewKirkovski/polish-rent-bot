@@ -788,18 +788,6 @@ export function cleanExpiredMapsCache(maxAgeDays = 7): number {
   return result.changes;
 }
 
-/** Purge ONLY error-flagged nearby results. A genuine "nothing within radius" is an empty places
- *  array too, but it's a valid, cacheable negative — deleting every empty-places entry on boot
- *  wiped those and forced a needless re-fetch each start. Key on the explicit error flag instead. */
-export function clearEmptyMapsCache(): number {
-  const db = getDb();
-  const result = db.prepare(`
-    DELETE FROM maps_cache
-    WHERE cache_key LIKE 'nearby%'
-      AND result LIKE '%"error":true%'
-  `).run();
-  return result.changes;
-}
 
 // ---------------------------------------------------------------------------
 // Rejection cache (two-tier AI caching)

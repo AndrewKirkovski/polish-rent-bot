@@ -92,7 +92,7 @@ function parseItemOffer(raw: any): ItemListing {
   const photos = (raw.photos ?? []).map((p: any) => {
     const link: string = p.link ?? '';
     return link.replace('{width}', String(p.width ?? 800)).replace('{height}', String(p.height ?? 600));
-  });
+  }).filter((u: string) => u.length > 0); // drop empty URLs (missing link) — an empty media fails the Telegram album (mirrors Otodom)
 
   return {
     platformId: String(raw.id),

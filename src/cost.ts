@@ -49,14 +49,18 @@ export function computeRentalCost(
   // Only a PLN base rent is a verifiable budget figure; a non-PLN listing (rare, e.g. EUR) must not
   // be summed/ranked as if the number were PLN — treat it like an unknown price.
   const basePriceKnown = najem > 0 && (listing.currency ?? 'PLN') === 'PLN';
-  const czynsz = parsed?.adminFee ?? listing.rent ?? 0;
+  // Floor components at 0: the schema tolerates a wrong TYPE but not a negative VALUE, and a
+  // hallucinated negative adminFee/utility (e.g. a "discount") would understate cost.total and could
+  // slip a genuinely over-budget flat under the hard budget_max gate — defeating the whole reason the
+  // total is computed in code rather than trusted from the LLM.
+  const czynsz = Math.max(0, parsed?.adminFee ?? listing.rent ?? 0);
 
   const mediaParts: Array<{ label: string; value: number }> = [];
   const media = parsed?.estimatedMedia;
   if (media) {
     for (const { key, label } of MEDIA_ORDER) {
       const value = media[key];
-      if (value != null) mediaParts.push({ label, value });
+      if (value != null && value > 0) mediaParts.push({ label, value });
     }
   }
   const mediaSum = mediaParts.reduce((sum, p) => sum + p.value, 0);
