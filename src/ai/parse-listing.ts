@@ -627,7 +627,10 @@ export async function evaluateRejection(
     // parsed note, then the crawler value.
     const rp = universalParse as ParsedRentalData;
     const deposit = rp.deposit ?? (typeof l.deposit === 'number' ? l.deposit : null);
-    if (deposit != null) summaryParts.push(`Deposit (kaucja): ${deposit} ${cur}`);
+    // A kaucja parsed from the Polish description (rp.deposit) is quoted in zł regardless of the
+    // platform's listing currency, so label it PLN; only the crawler's structured l.deposit follows
+    // the listing currency. (Mirrors the base-rent block's care not to hand the LLM a mislabeled sum.)
+    if (deposit != null) summaryParts.push(`Deposit (kaucja): ${deposit} ${rp.deposit != null ? 'PLN' : cur}`);
     else if (rp.depositNote) summaryParts.push(`Deposit (kaucja): ${rp.depositNote}`);
   }
   if ('contractType' in universalParse && universalParse.contractType != null) {

@@ -511,7 +511,10 @@ async function execFindRentals(
   const areaFrom = input.areaFrom as number | undefined;
   const areaTo = input.areaTo as number | undefined;
   const ownerType = input.ownerType as string | undefined;
-  const platformsInput = (input.platforms as string | undefined) ?? 'all';
+  // Normalize the LLM-supplied platforms the same way create/update_monitor do — tool inputs aren't
+  // zod-validated and the API doesn't enforce the enum, so an off-enum token ('both', 'olx,otodom',
+  // 'OLX', an array) would otherwise make doOlx/doOtodom both false and silently return zero results.
+  const platformsInput = normalizeSearchPlatforms(input.platforms) ?? 'all';
   const amenities = (input.amenities as AmenityPreference[] | undefined) ?? [];
   const workAddress = input.workAddress as string | undefined;
   const commuteMode = (input.commuteMode as string | undefined) ?? 'transit';

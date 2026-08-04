@@ -760,6 +760,9 @@ export async function findNearbyAmenities(
     // per-threshold on cache hits (computeWithinLimit), which needs transitMinutes to always
     // be present — otherwise a later smaller-threshold read can't apply the transit fallback.
     const needTransitFallback = tc.transitFallback;
+    // Any grocery reachable by TRANSIT within the limit — captured across ALL measured places (incl.
+    // those ranked past the kept top-3 by walking), so the point-path gate matches applyLocationUncertainty.
+    let anyTransitWithinLimit = false;
 
     if ((needTransit || needTransitFallback) && destinations) {
       const mondayTs = getNextMondayWarsawTs();
@@ -777,6 +780,9 @@ export async function findNearbyAmenities(
             const el = elements[i];
             if (el.status === 'OK') {
               const transitMins = Math.round(el.duration.value / 60);
+              // Record the transit-fallback (groceries) within-limit signal for EVERY measured place,
+              // even one that won't be kept in the top-3 — the gate only needs one transit-close grocery.
+              if (tc.transitFallback && transitMins <= pref.maxMinutes) anyTransitWithinLimit = true;
               // For airport: create places array from transit (walking not applicable → -1)
               if (!tc.walking) {
                 nearbyPlaces.push({
@@ -871,7 +877,11 @@ export async function findNearbyAmenities(
 
     // ---- D. Compute withinLimit ----
     const nearest = nearbyPlaces[0] ?? null;
-    const withinLimit = computeWithinLimit(nearest, tc, pref.maxMinutes);
+    let withinLimit = computeWithinLimit(nearest, tc, pref.maxMinutes);
+    // Transit fallback (groceries): a supermarket far on foot but a short transit ride within the
+    // limit satisfies the gate even when it isn't the nearest-by-walking place — match
+    // applyLocationUncertainty (which scans all places), so the point path isn't stricter.
+    if (!withinLimit && tc.transitFallback) withinLimit = anyTransitWithinLimit;
 
     const amenityResult: AmenityResult = {
       type: pref.type,

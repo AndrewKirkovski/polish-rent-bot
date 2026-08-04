@@ -147,6 +147,13 @@ export async function searchRentalListings(params: RentalSearchParams): Promise<
     }
   }
 
+  // No runnable backend at all (e.g. platforms='olx' for a city outside CITY_ID_MAP, so OLX was
+  // skipped and Otodom is disabled) → surface it as an error instead of a misleading empty result,
+  // so a monitor records a visible searchError rather than a healthy-looking 0-delivery run forever.
+  if (searchPromises.length === 0) {
+    throw new Error(`rental search has no runnable backend for city "${city}" with platforms=${platforms} (OLX city unresolved and Otodom disabled)`);
+  }
+
   const searchResults = await Promise.allSettled(searchPromises);
   let filtered = searchResults
     .filter((r): r is PromiseFulfilledResult<Listing[]> => r.status === 'fulfilled')

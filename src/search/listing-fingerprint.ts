@@ -105,6 +105,15 @@ function mergeFromDuplicate(winner: Listing, loser: Listing): Listing {
   }
   if (winner.photos.length === 0 && loser.photos.length > 0) winner.photos = loser.photos;
   if (!winner.district && loser.district) winner.district = loser.district;
+  // Recover a KNOWN base price/rent from the loser when the winner's is unknown ("zapytaj o cenę",
+  // price<=0). The price gate is skipped when either side's price is unknown, so a hidden-price record
+  // can win the quality tiebreak — without this, the only usable budget figure (on the dropped copy)
+  // would be discarded and the flat later rejected as "цена не указана".
+  if ((winner.price == null || winner.price <= 0) && loser.price > 0) {
+    winner.price = loser.price;
+    winner.currency = loser.currency;
+  }
+  if (winner.rent == null && loser.rent != null) winner.rent = loser.rent;
   return winner;
 }
 

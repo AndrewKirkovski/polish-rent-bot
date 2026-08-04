@@ -174,6 +174,11 @@ function parseOlxOffer(raw: any): Listing {
   const params = raw.params ?? [];
 
   const priceVal = getParamValue(params, 'price');
+  // Read the real currency the OLX API supplies on the price param (mirrors olx-items.ts) instead of
+  // hardcoding 'PLN' — else a non-PLN rental would force basePriceKnown=true and bypass every non-PLN
+  // budget/label safeguard in cost/fit-score.
+  const priceParam = params.find((p: any) => p.key === 'price');
+  const priceCurrency: string = priceParam?.value?.currency ?? 'PLN';
   const rentVal = getParamValue(params, 'rent');
   const areaStr = getParamValue(params, 'm');
   const ROOM_KEY_MAP: Record<string, number> = { one: 1, two: 2, three: 3, four: 4 };
@@ -205,7 +210,7 @@ function parseOlxOffer(raw: any): Listing {
     title: raw.title ?? '',
     description: (raw.description ?? '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim(),
     price: typeof priceVal === 'number' ? priceVal : parseFloat(String(priceVal)) || 0,
-    currency: 'PLN',
+    currency: priceCurrency,
     rent: rentVal ? (typeof rentVal === 'number' ? rentVal : parseFloat(String(rentVal)) || null) : null,
     deposit: null, // extracted via AI later
     area,

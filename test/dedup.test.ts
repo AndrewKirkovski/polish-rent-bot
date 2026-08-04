@@ -33,3 +33,13 @@ test('dedupe keeps higher-quality record and merges phone', () => {
   assert.equal(out[0].platform, 'otodom');      // coords + otodom → higher quality
   assert.equal(out[0].phone, '111');            // phone merged from dropped OLX record
 });
+
+test('dedupe recovers a known price when the price-unknown record wins the quality tiebreak', () => {
+  // OLX "zapytaj o cenę" (price 0) but higher quality (coords + photos); Otodom carries the real price.
+  const olx = mkListing({ platform: 'olx', platformId: 'o1', price: 0, currency: 'PLN', lat: 52.1, lng: 21.0, photos: ['a', 'b', 'c', 'd'] });
+  const oto = mkListing({ platform: 'otodom', platformId: 't1', price: 3200, currency: 'PLN', photos: ['x', 'y'] });
+  const out = dedupeCrossPlatform([olx, oto]);
+  assert.equal(out.length, 1);
+  assert.equal(out[0].platform, 'olx');   // higher quality wins the tiebreak
+  assert.equal(out[0].price, 3200);       // but the known price is recovered from the dropped copy
+});
