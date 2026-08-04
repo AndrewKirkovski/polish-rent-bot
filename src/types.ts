@@ -172,6 +172,10 @@ export interface AmenityResult {
   places: NearbyPlace[];          // closest candidates, sorted by expected/reachable distance
   nearest: NearbyPlace | null;    // shortcut to places[0]
   withinLimit: boolean;           // true if nearest <= maxMinutes
+  /** For transit-fallback types (groceries): the MIN transit minutes across ALL measured places
+   *  (even ones not kept in the top-3). Threshold-independent, so a cache-hit recompute at a
+   *  different maxMinutes can re-apply the transit fallback (the maps cache key omits maxMinutes). */
+  bestTransitMinutes?: number | null;
   uncertain?: boolean;            // estimated range crosses the requested threshold
   error?: boolean;                // transient Maps API/measurement failure — verdict UNKNOWN,
                                   // not a genuine "nothing nearby" (empty places is ambiguous otherwise)

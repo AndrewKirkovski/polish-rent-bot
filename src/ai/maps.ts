@@ -601,8 +601,11 @@ export async function findNearbyAmenities(
       const r = unwrapCache<AmenityResult>(cached!);
       // The cache key omits maxMinutes; recompute withinLimit for THIS request's threshold
       // from the (threshold-independent) cached place minutes rather than trusting the
-      // boolean that was written under whatever limit first populated the entry.
-      r.withinLimit = computeWithinLimit(r.nearest, tc, pref.maxMinutes);
+      // boolean that was written under whatever limit first populated the entry. Apply the
+      // transit fallback from the persisted bestTransitMinutes so a non-nearest transit-close
+      // grocery isn't lost on cache read (matches the fresh compute above).
+      r.withinLimit = computeWithinLimit(r.nearest, tc, pref.maxMinutes)
+        || (tc.transitFallback && r.bestTransitMinutes != null && r.bestTransitMinutes <= pref.maxMinutes);
       results.push(r);
       continue;
     }
@@ -760,9 +763,10 @@ export async function findNearbyAmenities(
     // per-threshold on cache hits (computeWithinLimit), which needs transitMinutes to always
     // be present — otherwise a later smaller-threshold read can't apply the transit fallback.
     const needTransitFallback = tc.transitFallback;
-    // Any grocery reachable by TRANSIT within the limit — captured across ALL measured places (incl.
-    // those ranked past the kept top-3 by walking), so the point-path gate matches applyLocationUncertainty.
-    let anyTransitWithinLimit = false;
+    // MIN transit minutes across ALL measured places (incl. those ranked past the kept top-3 by
+    // walking). Stored on the result so the point-path gate matches applyLocationUncertainty AND the
+    // cache-hit recompute can re-apply the transit fallback (nearest alone loses the signal).
+    let bestTransitMinutes: number | null = null;
 
     if ((needTransit || needTransitFallback) && destinations) {
       const mondayTs = getNextMondayWarsawTs();
@@ -780,9 +784,9 @@ export async function findNearbyAmenities(
             const el = elements[i];
             if (el.status === 'OK') {
               const transitMins = Math.round(el.duration.value / 60);
-              // Record the transit-fallback (groceries) within-limit signal for EVERY measured place,
-              // even one that won't be kept in the top-3 — the gate only needs one transit-close grocery.
-              if (tc.transitFallback && transitMins <= pref.maxMinutes) anyTransitWithinLimit = true;
+              // Track the best (min) transit time across EVERY measured place, even one that won't be
+              // kept in the top-3 — the transit-fallback gate only needs the closest-by-transit grocery.
+              if (tc.transitFallback) bestTransitMinutes = bestTransitMinutes == null ? transitMins : Math.min(bestTransitMinutes, transitMins);
               // For airport: create places array from transit (walking not applicable → -1)
               if (!tc.walking) {
                 nearbyPlaces.push({
@@ -881,7 +885,7 @@ export async function findNearbyAmenities(
     // Transit fallback (groceries): a supermarket far on foot but a short transit ride within the
     // limit satisfies the gate even when it isn't the nearest-by-walking place — match
     // applyLocationUncertainty (which scans all places), so the point path isn't stricter.
-    if (!withinLimit && tc.transitFallback) withinLimit = anyTransitWithinLimit;
+    if (!withinLimit && tc.transitFallback && bestTransitMinutes != null) withinLimit = bestTransitMinutes <= pref.maxMinutes;
 
     const amenityResult: AmenityResult = {
       type: pref.type,
@@ -889,6 +893,9 @@ export async function findNearbyAmenities(
       places: nearbyPlaces,
       nearest,
       withinLimit,
+      // Persist the threshold-independent transit-fallback signal so a cache-hit recompute (below)
+      // doesn't lose it (it can't be reconstructed from `nearest` alone).
+      ...(tc.transitFallback ? { bestTransitMinutes } : {}),
     };
 
     // Missing candidates or route measurements can only hide a closer result.

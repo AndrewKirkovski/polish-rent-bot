@@ -371,57 +371,49 @@ export function startBot(): TelegramBot {
   const sendPhotosFn = wrapBroadcastPhotos(makeSendPhotosFn(bot));
   const echoFn = makeEchoFn(bot);
 
-  // --- /start ---
-  bot.onText(/^\/start(?:@\w+)?\b/, async (msg: Msg) => {
-    try {
-      if (!(await ensureAuth(msg))) return;
-      const text = [
-        '\uD83C\uDDF5\uD83C\uDDF1 <b>Polish Rent &amp; Items Bot</b>',
-        '',
-        "I'm an AI-powered assistant that helps you find apartments and items in Poland.",
-        '',
-        'Just tell me what you need in plain language, for example:',
-        '- "Find me a 2-room apartment in Krakow up to 3000 PLN"',
-        '- "Search for a used iPhone 15 under 2500 PLN"',
-        '- "Set up a monitor for rentals in Warszawa"',
-        '',
-        'Or use /help for more info.',
-      ].join('\n');
-      await safeSend(bot, msg.chat.id, text, { parse_mode: 'HTML' });
-    } catch (err) {
-      console.error('[telegram] /start handler error:', err);
-    }
-  });
-
-  // --- /help ---
-  bot.onText(/^\/help(?:@\w+)?\b/, async (msg: Msg) => {
-    try {
-      if (!(await ensureAuth(msg))) return;
-      const text = [
-        '<b>How to use this bot</b>',
-        '',
-        'Send me any message in natural language.',
-        '',
-        'I can:',
-        '- Search rentals on OLX and Otodom',
-        '- Search for used items by keyword',
-        '- Analyze listings (costs, contract type, amenities)',
-        '- Score locations (nearby metro, gym, pool, commute)',
-        '- Create monitors that notify you of new listings',
-        '',
-        '<b>Examples:</b>',
-        '"Find apartments in Gdansk, 2 rooms, max 2500 PLN"',
-        '"Monitor iPhones under 3000 PLN in Warszawa"',
-        '"Show my monitors"',
-        '"Stop monitor 5"',
-        '',
-        'Tip: reply to a listing card (or its photo) to ask about that apartment.',
-      ].join('\n');
-      await safeSend(bot, msg.chat.id, text, { parse_mode: 'HTML' });
-    } catch (err) {
-      console.error('[telegram] /help handler error:', err);
-    }
-  });
+  // --- /start & /help ---
+  // Single-sourced as helpers and dispatched from the bot.on('message') handler below (NOT via
+  // bot.onText). onText matches only RAW msg.text, while the message handler skips commands using the
+  // TRIMMED text with a caption fallback \u2014 so a " /start" (leading space) or a photo captioned "/start"
+  // matched neither and was silently dropped. Dispatching from the message handler covers all forms.
+  const sendStartMessage = async (msg: Msg) => {
+    const text = [
+      '\uD83C\uDDF5\uD83C\uDDF1 <b>Polish Rent &amp; Items Bot</b>',
+      '',
+      "I'm an AI-powered assistant that helps you find apartments and items in Poland.",
+      '',
+      'Just tell me what you need in plain language, for example:',
+      '- "Find me a 2-room apartment in Krakow up to 3000 PLN"',
+      '- "Search for a used iPhone 15 under 2500 PLN"',
+      '- "Set up a monitor for rentals in Warszawa"',
+      '',
+      'Or use /help for more info.',
+    ].join('\n');
+    await safeSend(bot, msg.chat.id, text, { parse_mode: 'HTML' });
+  };
+  const sendHelpMessage = async (msg: Msg) => {
+    const text = [
+      '<b>How to use this bot</b>',
+      '',
+      'Send me any message in natural language.',
+      '',
+      'I can:',
+      '- Search rentals on OLX and Otodom',
+      '- Search for used items by keyword',
+      '- Analyze listings (costs, contract type, amenities)',
+      '- Score locations (nearby metro, gym, pool, commute)',
+      '- Create monitors that notify you of new listings',
+      '',
+      '<b>Examples:</b>',
+      '"Find apartments in Gdansk, 2 rooms, max 2500 PLN"',
+      '"Monitor iPhones under 3000 PLN in Warszawa"',
+      '"Show my monitors"',
+      '"Stop monitor 5"',
+      '',
+      'Tip: reply to a listing card (or its photo) to ask about that apartment.',
+    ].join('\n');
+    await safeSend(bot, msg.chat.id, text, { parse_mode: 'HTML' });
+  };
 
   // --- Catch-all: forward everything else to AI agent ---
   // Whole body wrapped: an uncaught throw here (e.g. a DB error in ensureAuth) would become
@@ -440,10 +432,12 @@ export function startBot(): TelegramBot {
         }
       }
 
-      // /start and /help are handled above — skip them here
-      if (/^\/start\b/.test(text) || /^\/help\b/.test(text)) return;
-
       if (!(await ensureAuth(msg))) return;
+
+      // /start & /help — dispatched here from the TRIMMED text (which also covers a photo caption /
+      // leading whitespace), so they're never dropped by an onText-vs-skip mismatch.
+      if (/^\/start\b/.test(text)) { await sendStartMessage(msg); return; }
+      if (/^\/help\b/.test(text)) { await sendHelpMessage(msg); return; }
 
       const userId = msg.from!.id;
       const chatId = msg.chat.id;

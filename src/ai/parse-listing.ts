@@ -147,8 +147,6 @@ export function rentalParseCacheKey(
     | 'city'
     | 'district'
     | 'street'
-    | 'lat'
-    | 'lng'
     | 'advertiserType'
   >,
   version = RENTAL_PARSE_VERSION,
@@ -175,8 +173,11 @@ export function rentalParseCacheKey(
     `city:${listing.city}`,
     `district:${listing.district ?? ''}`,
     `street:${listing.street ?? ''}`,
-    `lat:${listing.lat ?? ''}`,
-    `lng:${listing.lng ?? ''}`,
+    // NOTE: lat/lng deliberately EXCLUDED — the parse prompt never reads raw coordinates, and coords
+    // are path-dependent (preserveTrustworthyCoords mutates them on opposite sides of the parse in
+    // find_rentals vs the monitor). Folding them in made the two paths compute different keys and
+    // perpetually miss/overwrite each other's cache. The key must stay coordinate-independent so
+    // search and monitor share one cached parse.
     `advertiser:${listing.advertiserType ?? ''}`,
   ];
   return hashText(parts.join('\n'));
@@ -665,6 +666,14 @@ export async function evaluateRejection(
   }
   if ('internetType' in universalParse && universalParse.internetType != null) {
     summaryParts.push(`Internet: ${universalParse.internetType}`);
+  }
+  // Lease logistics — surface so move-in-timing / lease-length criteria ("въезд не раньше сентября",
+  // "минимальный срок не больше 12 мес") can fire; a missing field is treated as PASS by the LLM.
+  if ('availableFrom' in universalParse && universalParse.availableFrom != null) {
+    summaryParts.push(`Available from: ${universalParse.availableFrom}`);
+  }
+  if ('minimumLease' in universalParse && universalParse.minimumLease != null) {
+    summaryParts.push(`Minimum lease: ${universalParse.minimumLease}`);
   }
   if ('restrictions' in universalParse) {
     const restrictions = universalParse.restrictions as string[];

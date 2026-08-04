@@ -8,7 +8,7 @@ import type { Server } from 'node:http';
 import { timingSafeEqual } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
-import { resolve, dirname, join } from 'node:path';
+import { resolve, dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   getUsageSummary,
@@ -297,8 +297,12 @@ export function startHttpServer(
   const hasDist = existsSync(indexHtml);
 
   if (hasDist) {
-    app.use('/assets/*', serveStatic({ root: './dashboard/dist' }));
-    app.get('/favicon.ico', serveStatic({ path: './dashboard/dist/favicon.ico' }));
+    // serveStatic resolves `root`/`path` against process.cwd(), but index.html is resolved absolutely
+    // from this file — derive a CWD-relative path from the SAME distRoot so assets/favicon don't 404
+    // when launched from a different working directory (systemd, a wrapper) even though index.html loads.
+    const assetRoot = relative(process.cwd(), distRoot) || '.';
+    app.use('/assets/*', serveStatic({ root: assetRoot }));
+    app.get('/favicon.ico', serveStatic({ path: join(assetRoot, 'favicon.ico') }));
     app.get('*', async (c) => {
       try {
         const html = await readFile(indexHtml, 'utf-8');

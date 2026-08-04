@@ -44,8 +44,12 @@ export function olxRoomCounts(roomsFrom?: number, roomsTo?: number): number[] | 
 export function resolveOlxDistrictIds(city: string, districts: string[]): number[] {
   const cityDistricts = OLX_DISTRICTS[stripDiacritics(city)];
   if (!cityDistricts) return [];
+  // Canonicalize separators so a space/underscore slug resolves the hyphenated OLX_DISTRICTS keys
+  // (e.g. "praga poludnie" -> "praga-poludnie"); else it misses and OLX silently falls to city-wide.
+  const canon = (x: string) => stripDiacritics(x).replace(/[\s_]+/g, '-');
+  const byCanon = new Map(Object.entries(cityDistricts).map(([k, v]) => [canon(k), v]));
   return districts
-    .map((d) => cityDistricts[stripDiacritics(d)])
+    .map((d) => byCanon.get(canon(d)))
     .filter((id): id is number => id != null);
 }
 
@@ -192,13 +196,18 @@ export async function searchRentalListings(params: RentalSearchParams): Promise<
   }
 
   if (districts.length > 0) {
-    const normalizedDistricts = districts.map(stripDiacritics);
+    // Canonicalize word separators too (not just case/diacritics): platform LABELS use spaces
+    // ("Stare Miasto", "Praga-Południe") while config/LLM slugs are often hyphenated ("stare-miasto"),
+    // and stripDiacritics alone leaves '-' vs ' ' mismatched → neither substring test matches and a
+    // whole platform's in-district results are silently dropped.
+    const normSep = (x: string) => stripDiacritics(x).replace(/[\s_-]+/g, ' ').trim();
+    const normalizedDistricts = districts.map(normSep);
     filtered = filtered.filter((l) => {
       // Results are already district-scoped server-side (OLX district_id / Otodom locations), and
       // most Otodom + some OLX items carry a null district label. Match the null-passthrough
       // convention of the sibling filters above; only drop a listing whose KNOWN district differs.
       if (!l.district) return true;
-      const nd = stripDiacritics(l.district);
+      const nd = normSep(l.district);
       return normalizedDistricts.some((d) => nd.includes(d) || d.includes(nd));
     });
   }

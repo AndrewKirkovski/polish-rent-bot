@@ -15,6 +15,12 @@ test('exceedsBudgetFloor: base rent within budget → do not skip (even if czyns
   assert.equal(exceedsBudgetFloor(mkListing({ price: 4000, rent: 5000 }), 8000), false);
 });
 
+test('exceedsBudgetFloor: a non-PLN price is never a hard floor (falls through to the soft unverifiable path)', () => {
+  // A sub-PLN currency number over the PLN budget must NOT hard-drop the flat; only PLN is comparable.
+  assert.equal(exceedsBudgetFloor(mkListing({ price: 9000, currency: 'CZK' }), 8000), false);
+  assert.equal(exceedsBudgetFloor(mkListing({ price: 9000, currency: 'PLN' }), 8000), true);
+});
+
 test('rentalParseCacheKey folds in the version — a bump misses old rows', () => {
   const listing = mkListing({ description: 'ładne mieszkanie na Mokotowie' });
   assert.notEqual(rentalParseCacheKey(listing, 'wfh-v1'), rentalParseCacheKey(listing, 'wfh-v2'));

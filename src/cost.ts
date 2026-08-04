@@ -36,9 +36,11 @@ export function priceUnit(currency?: string | null): string {
 
 /** Safe pre-parse budget skip: najem (base rent) alone is a guaranteed lower bound on the
  *  true total — czynsz/media are >= 0 and the AI may even refine czynsz below the crawler's
- *  value, so gating on price+rent could wrongly drop an in-budget flat. Gate on najem only. */
-export function exceedsBudgetFloor(listing: Pick<Listing, 'price'>, priceTo: number): boolean {
-  return listing.price > priceTo;
+ *  value, so gating on price+rent could wrongly drop an in-budget flat. Gate on najem only.
+ *  Only meaningful for a PLN price: a non-PLN number isn't comparable to a PLN budget, so let it
+ *  fall through to the soft "бюджет не проверить" path (basePriceKnown) rather than hard-drop it. */
+export function exceedsBudgetFloor(listing: Pick<Listing, 'price' | 'currency'>, priceTo: number): boolean {
+  return (listing.currency ?? 'PLN') === 'PLN' && listing.price > priceTo;
 }
 
 export function computeRentalCost(

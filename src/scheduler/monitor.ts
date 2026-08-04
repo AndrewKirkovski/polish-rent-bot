@@ -218,13 +218,21 @@ async function maybeSendDailyRejectionReport(reportFn: (text: string) => void | 
 
   try {
     await reportFn(report);
+  } catch (err) {
+    // SEND failed → leave the markers untouched so the next cycle retries within the same day.
+    console.error('[scheduler] Daily rejection report send failed (will retry next cycle):', err instanceof Error ? err.message : err);
+    return;
+  }
+  // Send SUCCEEDED — advance the markers in a SEPARATE try so a post-send DB write hiccup can't be
+  // mistaken for a send failure and re-broadcast the identical digest. lastDate (the re-send gate at
+  // the top) is written first, so even a lastAt failure won't re-send (only over-widen the next window).
+  try {
     setAppState('rejectionReport.lastDate', today);
     setAppState('rejectionReport.lastAt', sqliteUtc(now));
-    console.log(`[scheduler] Daily rejection report sent (${rows.length} rejections since ${lastAt})`);
-  } catch (err) {
-    // Leave the markers untouched so the next cycle retries within the same day.
-    console.error('[scheduler] Daily rejection report send failed (will retry next cycle):', err instanceof Error ? err.message : err);
+  } catch (markErr) {
+    console.error('[scheduler] Daily rejection report marker write failed (digest already sent):', markErr instanceof Error ? markErr.message : markErr);
   }
+  console.log(`[scheduler] Daily rejection report sent (${rows.length} rejections since ${lastAt})`);
 }
 
 export function shouldSkipNotifiedFingerprint(
@@ -417,6 +425,38 @@ export function startScheduler(
                 parseFailedDeterministically = !transient;
               }
 
+              // Parse-null handling for EVERY rental monitor (not only budgeted ones): a null parse
+              // must never fall through the not_concrete/contract/rejectionCriteria filters and get
+              // delivered + marked seen. Defer a transient failure (retry next cycle); cap a
+              // deterministic one (give up after MAX_PARSE_DEFERS); on success clear any prior count.
+              if (monitor.type === 'rental') {
+                const rl = workingListing as Listing;
+                const deferKey = `${monitor.id}:${rl.platform}:${rl.platformId}`;
+                if (!parsedData) {
+                  if (!parseFailedDeterministically) {
+                    console.log(`[scheduler] Defer (transient parse failure — not counting) "${rl.title}"`);
+                    continue;
+                  }
+                  const deferrals = (parseDeferCounts.get(deferKey) ?? 0) + 1;
+                  if (deferrals >= MAX_PARSE_DEFERS) {
+                    console.log(`[scheduler] Give up (parse failed ${deferrals}x) "${rl.title}"`);
+                    parseDeferCounts.delete(deferKey);
+                    recordMonitorRejection(monitor.id, rl, 'error', 'не удалось разобрать объявление');
+                    markListingSeen(monitor.id, rl.platform, rl.platformId, rl.url, rl.title, rl.price);
+                    continue;
+                  }
+                  parseDeferCounts.set(deferKey, deferrals);
+                  while (parseDeferCounts.size > MAX_DEFER_ENTRIES) {
+                    const oldest = parseDeferCounts.keys().next().value;
+                    if (oldest === undefined) break;
+                    parseDeferCounts.delete(oldest);
+                  }
+                  console.log(`[scheduler] Defer (parse failed, ${deferrals}/${MAX_PARSE_DEFERS}) "${rl.title}"`);
+                  continue;
+                }
+                parseDeferCounts.delete(deferKey); // successful parse → reset the defer budget
+              }
+
               if (monitor.type === 'rental' && (parsedData as ParsedRentalData | null)?.isConcreteApartment === false) {
                 console.log(`[scheduler] Drop "${workingListing.title}": не конкретная квартира`);
                 recordMonitorRejection(monitor.id, workingListing, 'not_concrete', 'не конкретная квартира');
@@ -449,61 +489,23 @@ export function startScheduler(
               if (monitor.type === 'rental' && (config.priceTo != null || config.priceFrom != null)) {
                 const l = workingListing as Listing;
                 const cost = computeRentalCost(l, parsedData as ParsedRentalData | null);
-                const deferKey = `${monitor.id}:${l.platform}:${l.platformId}`;
-                // A base rent already over the cap is a certain reject regardless of parse state.
-                if (config.priceTo != null && cost.najem > config.priceTo) {
+                // A PLN base rent already over the cap is a certain reject regardless of parse state.
+                // (Non-PLN falls through to the basePriceKnown reject below with the correct reason.)
+                if (config.priceTo != null && (l.currency ?? 'PLN') === 'PLN' && cost.najem > config.priceTo) {
                   console.log(`[scheduler] Budget reject "${l.title}": najem ${cost.najem} > ${config.priceTo}`);
                   recordMonitorRejection(monitor.id, l, 'budget_max', `аренда ${cost.najem} ${priceUnit(l.currency)} > ${config.priceTo} zł`);
-                  parseDeferCounts.delete(deferKey);
                   markListingSeen(monitor.id, l.platform, l.platformId, l.url, l.title, l.price);
                   continue;
                 }
-                // "Zapytaj o cenę" (price=0) or non-PLN: basePriceKnown depends ONLY on the crawler
-                // listing, not the parse — no amount of parsing can ever verify the budget, so reject
-                // NOW, BEFORE the parse-null defer, instead of wastefully re-triaging+enriching+parsing
-                // it every cycle. Mirrors find_rentals' ordering.
+                // "Zapytaj o cenę" (price=0) or non-PLN: basePriceKnown depends only on the crawler
+                // listing, so the budget can never be verified — reject with a clear reason. (parsedData
+                // is guaranteed non-null here: the parse-null defer ran upstream for every rental.)
                 if (!cost.basePriceKnown) {
                   console.log(`[scheduler] Budget reject "${l.title}": цена не указана или не в PLN`);
                   recordMonitorRejection(monitor.id, l, 'budget_max', 'цена не указана или не в PLN — бюджет не проверить');
-                  parseDeferCounts.delete(deferKey);
                   markListingSeen(monitor.id, l.platform, l.platformId, l.url, l.title, l.price);
                   continue;
                 }
-                // Parse failed → czynsz/media unknown, total unverifiable. DEFER: don't deliver a
-                // possibly-over-budget flat, and don't mark seen, so it is re-attempted next cycle
-                // instead of silently passing on the base rent alone.
-                if (!parsedData) {
-                  // A TRANSIENT failure (API outage/rate-limit/timeout) must NOT count toward give-up:
-                  // defer indefinitely so the listing is re-delivered once the provider recovers,
-                  // rather than being marked seen and lost for the whole market during the outage.
-                  if (!parseFailedDeterministically) {
-                    console.log(`[scheduler] Defer (transient parse failure — not counting) "${l.title}"`);
-                    continue;
-                  }
-                  // Only a DETERMINISTIC failure (content-policy refusal, reliably-invalid JSON) is
-                  // capped, so it can't re-run triage+enrich+parse every cycle indefinitely.
-                  const deferrals = (parseDeferCounts.get(deferKey) ?? 0) + 1;
-                  if (deferrals >= MAX_PARSE_DEFERS) {
-                    console.log(`[scheduler] Give up (parse failed ${deferrals}x — budget unverifiable) "${l.title}"`);
-                    parseDeferCounts.delete(deferKey);
-                    recordMonitorRejection(monitor.id, l, 'error', 'не удалось разобрать объявление — бюджет не проверить');
-                    markListingSeen(monitor.id, l.platform, l.platformId, l.url, l.title, l.price);
-                    continue;
-                  }
-                  parseDeferCounts.set(deferKey, deferrals);
-                  // Bound memory: a listing that defers once then drops off page 1 (sold/removed) never
-                  // reaches give-up or a successful parse, so its entry would linger for the process
-                  // lifetime. Evict oldest-first (Map insertion order) when over the cap.
-                  while (parseDeferCounts.size > MAX_DEFER_ENTRIES) {
-                    const oldest = parseDeferCounts.keys().next().value;
-                    if (oldest === undefined) break;
-                    parseDeferCounts.delete(oldest);
-                  }
-                  console.log(`[scheduler] Defer (parse failed — budget unverifiable, ${deferrals}/${MAX_PARSE_DEFERS}) "${l.title}"`);
-                  continue;
-                }
-                // Parse succeeded — clear any prior defer count so a later transient failure gets a fresh budget.
-                parseDeferCounts.delete(deferKey);
                 const estimatedTotal = cost.total;
                 if (config.priceTo != null && estimatedTotal > config.priceTo) {
                   console.log(`[scheduler] Budget reject "${l.title}": ${estimatedTotal} > ${config.priceTo}`);
