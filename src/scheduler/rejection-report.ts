@@ -12,7 +12,7 @@
 //   Явно мимо: комната/подселение 40 · не по комнатам 8 · не квартира 5   ← HARD — tally only
 
 import type { MonitorRejectionRow } from '../storage/db.js';
-import { REJECTION_LABEL, type RejectionCategory } from '../search/rejection.js';
+import { REJECTION_LABEL, isSoftRejection, type RejectionCategory } from '../search/rejection.js';
 import { escapeHtml } from '../utils/html.js';
 
 /** Max links listed per soft category before collapsing the rest into "+N". */
@@ -33,14 +33,19 @@ export function buildRejectionReport(rows: MonitorRejectionRow[]): string | null
   if (rows.length === 0) return null;
 
   // One physical flat can be rejected by several overlapping monitors in the same window; count it
-  // once (first rejection wins) so the "отклонено N" header and per-category lists don't inflate.
-  const seenListing = new Set<string>();
-  rows = rows.filter((r) => {
+  // once so the "отклонено N" header and per-category lists don't inflate. Among duplicates PREFER a
+  // SOFT-tier reject (surfaced with a clickable link under "Стоит взглянуть") over a HARD tally-only
+  // one, so a borderline flat isn't buried in "Явно мимо" just because another monitor's structural
+  // reject landed a few seconds earlier. Map preserves first-seen (rejected_at ASC) order.
+  const byKey = new Map<string, MonitorRejectionRow>();
+  for (const r of rows) {
     const key = `${r.platform}:${r.platform_id}`;
-    if (seenListing.has(key)) return false;
-    seenListing.add(key);
-    return true;
-  });
+    const existing = byKey.get(key);
+    if (!existing || (isSoftRejection(r.category as RejectionCategory) && !isSoftRejection(existing.category as RejectionCategory))) {
+      byKey.set(key, r);
+    }
+  }
+  rows = [...byKey.values()];
   if (rows.length === 0) return null;
 
   const byCat = new Map<string, MonitorRejectionRow[]>();

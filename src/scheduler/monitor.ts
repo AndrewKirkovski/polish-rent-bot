@@ -425,18 +425,23 @@ export function startScheduler(
                 parseFailedDeterministically = !transient;
               }
 
-              // Parse-null handling for EVERY rental monitor (not only budgeted ones): a null parse
-              // must never fall through the not_concrete/contract/rejectionCriteria filters and get
-              // delivered + marked seen. Defer a transient failure (retry next cycle); cap a
-              // deterministic one (give up after MAX_PARSE_DEFERS); on success clear any prior count.
+              // A TRANSIENT (outage) parse failure retries for BOTH rentals AND items — otherwise an
+              // item is delivered once as a degraded card (no condition/defects) and marked seen,
+              // losing the AI analysis for the whole outage batch. (Deterministic item failures still
+              // deliver a best-effort degraded card; only rentals cap+give-up on deterministic ones.)
+              if (!parsedData && !parseFailedDeterministically) {
+                console.log(`[scheduler] Defer (transient parse failure — not counting) "${workingListing.title}"`);
+                continue;
+              }
+
+              // Parse-null handling for EVERY rental monitor (not only budgeted ones): a null (now
+              // DETERMINISTIC) parse must never fall through the not_concrete/contract/rejectionCriteria
+              // filters and get delivered + marked seen. Cap the retries (give up after
+              // MAX_PARSE_DEFERS); on success clear any prior count.
               if (monitor.type === 'rental') {
                 const rl = workingListing as Listing;
                 const deferKey = `${monitor.id}:${rl.platform}:${rl.platformId}`;
                 if (!parsedData) {
-                  if (!parseFailedDeterministically) {
-                    console.log(`[scheduler] Defer (transient parse failure — not counting) "${rl.title}"`);
-                    continue;
-                  }
                   const deferrals = (parseDeferCounts.get(deferKey) ?? 0) + 1;
                   if (deferrals >= MAX_PARSE_DEFERS) {
                     console.log(`[scheduler] Give up (parse failed ${deferrals}x) "${rl.title}"`);

@@ -81,12 +81,17 @@ export async function searchRentalListings(params: RentalSearchParams): Promise<
   const roomsTo = params.roomsTo ?? params.roomsFrom;
 
   const searchPromises: Promise<Listing[]>[] = [];
+  // Did OLX apply server-side district scoping (a real district_id)? If districts were requested but
+  // none resolved (every non-Warsaw city — OLX_DISTRICTS only maps warszawa), OLX runs city-wide and
+  // the null-district post-filter passthrough would otherwise leak out-of-district rows.
+  let olxDistrictScoped = false;
 
   if (doOlx) {
     const cityId = resolveCityId(city);
     let districtIds: number[] | undefined;
     if (districts.length > 0) {
       districtIds = resolveOlxDistrictIds(city, districts);
+      olxDistrictScoped = districtIds.length > 0;
       if (districtIds.length === 0) {
         console.warn(
           `[rental-search] Districts requested but no OLX IDs resolved for ${city}: ${districts.join(', ')}`,
@@ -136,7 +141,10 @@ export async function searchRentalListings(params: RentalSearchParams): Promise<
           type: 'wynajem',
           estate: 'mieszkanie',
           province,
-          city: city || undefined,
+          // Fold diacritics like the district: Otodom's URL slug is ASCII ("gdansk"/"lodz"/"wroclaw"),
+          // so a raw "gdańsk"/"łódź" builds a non-canonical path that returns no __NEXT_DATA__ and
+          // makes searchOtodom throw — silently zeroing Otodom for the 5 diacritic cities OLX handles.
+          city: city ? stripDiacritics(city) : undefined,
           district: district ? stripDiacritics(district) : undefined,
           // priceFrom omitted on purpose (base-rent min → false negatives); enforced post-parse.
           priceTo: params.priceTo,
@@ -203,10 +211,11 @@ export async function searchRentalListings(params: RentalSearchParams): Promise<
     const normSep = (x: string) => stripDiacritics(x).replace(/[\s_-]+/g, ' ').trim();
     const normalizedDistricts = districts.map(normSep);
     filtered = filtered.filter((l) => {
-      // Results are already district-scoped server-side (OLX district_id / Otodom locations), and
-      // most Otodom + some OLX items carry a null district label. Match the null-passthrough
-      // convention of the sibling filters above; only drop a listing whose KNOWN district differs.
-      if (!l.district) return true;
+      // Otodom is district-scoped server-side (locations param) and OLX only when a district_id was
+      // applied (olxDistrictScoped). A null-district row passes ONLY when its platform was actually
+      // scoped — else an OLX CITY-WIDE result (no district_id, common on non-Warsaw cities) would leak
+      // out-of-district flats through the passthrough. Otodom null-district rows still pass.
+      if (!l.district) return l.platform !== 'olx' || olxDistrictScoped;
       const nd = normSep(l.district);
       return normalizedDistricts.some((d) => nd.includes(d) || d.includes(nd));
     });

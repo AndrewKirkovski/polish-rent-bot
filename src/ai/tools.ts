@@ -1147,6 +1147,14 @@ async function execUpdateMonitor(
   // silently breaking both platforms. (Mirrors the province re-resolution below.)
   if (updates.city && updates.districts == null) delete newConfig.districts;
 
+  // A lone roomsFrom update ("make it exactly 4 rooms") must not leave a stale roomsTo from the old
+  // config: drop it so runMonitor's `roomsTo ?? roomsFrom` recovers an exact count. Belt-and-braces:
+  // clamp any inverted range (roomsTo < roomsFrom) that would silently reject every listing.
+  if ('roomsFrom' in updates && updates.roomsTo == null) delete newConfig.roomsTo;
+  if (typeof newConfig.roomsFrom === 'number' && typeof newConfig.roomsTo === 'number' && newConfig.roomsTo < newConfig.roomsFrom) {
+    newConfig.roomsTo = newConfig.roomsFrom;
+  }
+
   // If the city changed without an explicit province, re-resolve it (mirror create). A stale
   // province from the old city malforms the Otodom URL and silently breaks that platform.
   if (updates.city && updates.province == null) {

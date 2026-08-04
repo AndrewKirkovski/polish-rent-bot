@@ -1013,7 +1013,11 @@ export function applyLocationUncertainty(
     const transitPlace = tc.transitFallback
       ? places.find((place) => place.transitMinutes != null && place.transitMinutes <= pref.maxMinutes) ?? null
       : null;
-    const withinLimit = ranges.some((range) => range.max <= pref.maxMinutes) || transitPlace != null;
+    // Also honor bestTransitMinutes — the point path computes it across ALL measured places (incl. a
+    // transit-close supermarket ranked past the kept top-3 by walking, which is absent from `places`).
+    // Without it, the approximate path would be STRICTER than the exact/point path it mirrors.
+    const transitWithinLimit = tc.transitFallback && amenity.bestTransitMinutes != null && amenity.bestTransitMinutes <= pref.maxMinutes;
+    const withinLimit = ranges.some((range) => range.max <= pref.maxMinutes) || transitPlace != null || transitWithinLimit;
     // `uncertain` must be MUTUALLY EXCLUSIVE with `withinLimit` — the amenities score counts them as
     // separate buckets (within=1, uncertain=0.5), so an amenity in both double-counts (>1.0). Gate the
     // whole expression on !withinLimit. Also fold in an ALREADY-SET amenity.uncertain (e.g. an

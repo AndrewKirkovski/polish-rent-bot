@@ -181,6 +181,14 @@ test('computeRentalCost floors a hallucinated negative adminFee/media at 0 (cann
   assert.equal(c.total, 4100);     // 4000 + 0 + 100 — never 4000 - 500 - 200
 });
 
+test('computeRentalCost: a negative AI adminFee falls back to the crawler czynsz, not discards it', () => {
+  // najem 7000 + real crawler czynsz 1500 = 8500 (over an 8000 budget). A bogus adminFee:-300 must NOT
+  // win the ?? and floor to 0 (which would understate to 7000 and slip under budget) — fall back to rent.
+  const c = computeRentalCost({ price: 7000, rent: 1500 }, mkParsed({ adminFee: -300 }));
+  assert.equal(c.czynsz, 1500);
+  assert.equal(c.total, 8500);
+});
+
 test('rental schema tolerates a unit-suffixed numeric instead of discarding the whole parse', () => {
   const p = ParsedRentalDataSchema.parse({ deposit: '6000 zł', adminFee: 600, estimatedMedia: { electricity: '~200' } });
   assert.equal(p.deposit, null);                    // bad field → null, not a thrown parse

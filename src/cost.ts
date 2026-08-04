@@ -54,8 +54,11 @@ export function computeRentalCost(
   // Floor components at 0: the schema tolerates a wrong TYPE but not a negative VALUE, and a
   // hallucinated negative adminFee/utility (e.g. a "discount") would understate cost.total and could
   // slip a genuinely over-budget flat under the hard budget_max gate — defeating the whole reason the
-  // total is computed in code rather than trusted from the LLM.
-  const czynsz = Math.max(0, parsed?.adminFee ?? listing.rent ?? 0);
+  // total is computed in code rather than trusted from the LLM. Treat a NEGATIVE adminFee as invalid
+  // (not merely floor it) so the crawler's real czynsz fallback still applies — else `??` would let
+  // the bogus negative win over listing.rent and then floor it to 0, DISCARDING the ground truth.
+  const adminFee = parsed?.adminFee;
+  const czynsz = Math.max(0, adminFee != null && adminFee >= 0 ? adminFee : (listing.rent ?? 0));
 
   const mediaParts: Array<{ label: string; value: number }> = [];
   const media = parsed?.estimatedMedia;
