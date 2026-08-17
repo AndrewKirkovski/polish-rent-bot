@@ -79,6 +79,28 @@ test('location fusion: a fuzzy OLX pin is kept at the pin (not snapped to the st
   assert.ok(e.uncertaintyMeters <= 400, `metro-confirmed → tightened, got ${e.uncertaintyMeters}`);
 });
 
+test('location fusion: coords we derived earlier come back at the uncertainty they actually had', async () => {
+  // An earlier pass fused this listing to ±520 route metres and persisted the point. Re-ingesting it
+  // as a seller's building pin would report σ=120 — tighter than the evidence behind it — and the
+  // gates now hard-reject from the optimistic edge, so laundered precision deletes listings.
+  const e = await enrichListingLocation(
+    olxListing({ coordsPrecise: true, coordsOuterRadiusMeters: 520 }),
+    mlynowParsed(),
+  );
+  assert.match(e.source, /прошлого прохода/, 'labelled as our own earlier result, not a platform pin');
+  // 520 route metres ÷ 1.3 ÷ 2σ = 200 m crow, then the agreeing metro anchor may tighten it — but it
+  // must not be reported at the 120 m a platform pin would have claimed.
+  assert.ok(e.uncertaintyMeters > 120, `must not be laundered tighter than its evidence, got ${e.uncertaintyMeters}`);
+  assert.ok(e.uncertaintyMeters <= 200, `and no wider than it was, got ${e.uncertaintyMeters}`);
+});
+
+test('location fusion: a genuine platform pin is still trusted as one', async () => {
+  // No coordsOuterRadiusMeters → these are OLX's own seller-placed coordinates, not ours.
+  const e = await enrichListingLocation(olxListing({ coordsPrecise: true }), mlynowParsed());
+  assert.match(e.source, /с площадки/);
+  assert.ok(e.uncertaintyMeters <= 120, `platform pin keeps its tight prior, got ${e.uncertaintyMeters}`);
+});
+
 test('location fusion: a pin far from the claimed station is flagged as a conflict, not falsely tightened', async () => {
   // Pin is near Młynów, but the hint claims "at metro Politechnika" (~4 km away): the constraint must
   // NOT corroborate/tighten — the point stays coarse and the disagreement is surfaced.

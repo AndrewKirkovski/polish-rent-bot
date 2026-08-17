@@ -775,8 +775,10 @@ async function execFindRentals(
               enrichedListing.lng = enriched.lng;
               // Mark the persisted coords trustworthy: these are address-grade (geocoded street /
               // fused precise), so show_listing must re-score them even for an OLX row whose original
-              // platform pin was fuzzy (coordsPrecise reflects only the now-discarded pin).
+              // platform pin was fuzzy (coordsPrecise reflects only the now-discarded pin). Record the
+              // honest radius so a later pass treats them as OUR derived point, not a seller's pin.
               enrichedListing.coordsPrecise = true;
+              enrichedListing.coordsOuterRadiusMeters = enriched.outerRadiusMeters;
               try {
                 cacheListing({ platform: enrichedListing.platform, platformId: enrichedListing.platformId, kind: 'rental', resultId, listing: enrichedListing });
               } catch (e) { console.warn('[find_rentals] re-cache after enrich failed:', e instanceof Error ? e.message : e); }

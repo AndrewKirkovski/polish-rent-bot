@@ -74,6 +74,29 @@ test('soft link list caps at 5 and collapses the rest into "+N"', () => {
   assert.match(out, /\+2/);                                // remaining 2 collapsed
 });
 
+test('location rejects show their reason, so an inferred verdict is not read as a measured one', () => {
+  const reason = 'метро: Wilanowska, ~2,6 км–5,0 км, ~33–65 мин пешком (лимит 7 мин) — оценка по примерной локации ±1,2 км';
+  const out = buildRejectionReport([mkRow('amenity', { reason })])!;
+  assert.match(out, /~33–65 мин пешком/);
+  assert.match(out, /оценка по примерной локации/);
+  // Other soft categories stay compact — one line, links only.
+  const budget = buildRejectionReport([mkRow('budget_max', { reason: 'дороже на 400 zł' })])!;
+  assert.doesNotMatch(budget, /дороже на 400/);
+});
+
+test('an over-long location reason is trimmed rather than blowing the message limit', () => {
+  const out = buildRejectionReport([mkRow('amenity', { reason: 'м'.repeat(400) })])!;
+  assert.match(out, /…/);
+  assert.ok(out.length < 400, `expected a trimmed line, got ${out.length} chars`);
+});
+
+test('a location reject with no recorded reason still renders as a link', () => {
+  const out = buildRejectionReport([mkRow('amenity', { reason: null })])!;
+  assert.match(out, /далеко до удобств \(1\)/);
+  assert.match(out, /<a href="https:\/\/example\.com\//);
+  assert.doesNotMatch(out, /[·—]\s*$/m, 'no dangling separator when there is no reason');
+});
+
 test('titles are HTML-escaped in links', () => {
   const out = buildRejectionReport([mkRow('amenity', { title: 'Loft <b>& sauna</b>' })])!;
   assert.match(out, /Loft &lt;b&gt;&amp; sauna/);

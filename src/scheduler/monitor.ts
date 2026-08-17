@@ -579,8 +579,11 @@ export function startScheduler(
                       (workingListing as Listing).lat = enriched.lat;
                       (workingListing as Listing).lng = enriched.lng;
                       // Address-grade coords → mark trustworthy so show_listing re-scores them even
-                      // for an OLX row whose original fuzzy pin left coordsPrecise=false.
+                      // for an OLX row whose original fuzzy pin left coordsPrecise=false. Record the
+                      // honest radius alongside: these are DERIVED coords, and a later pass must not
+                      // re-ingest them as a seller-placed pin at a tighter uncertainty than this.
                       (workingListing as Listing).coordsPrecise = true;
+                      (workingListing as Listing).coordsOuterRadiusMeters = enriched.outerRadiusMeters;
                     }
                     locationScore = await scoreLocation(
                       enriched.lat,

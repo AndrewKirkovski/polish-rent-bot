@@ -40,10 +40,20 @@ export interface Listing {
   region: string;
   lat: number | null;
   lng: number | null;
-  /** OLX only: true when the platform map pin is the seller-placed building pin
-   *  (map.show_detailed=true), false when it's a fuzzed area centroid; null/undefined
-   *  for platforms without the signal (e.g. Otodom). */
+  /** True when the coordinates are trustworthy enough to re-score from: either the OLX platform pin
+   *  is the seller-placed building pin (map.show_detailed=true), or WE derived address-grade coords
+   *  and persisted them. False for a fuzzed OLX area centroid; null/undefined for platforms without
+   *  the signal (e.g. Otodom). Use `coordsOuterRadiusMeters` to tell the two sources apart. */
   coordsPrecise?: boolean | null;
+  /** Set ONLY when `lat`/`lng` are coordinates we derived ourselves and persisted (a geocoded street
+   *  or a fused location), carrying that result's honest outer radius in ROUTE metres. Absent for a
+   *  genuine platform pin.
+   *
+   *  Two things depend on the distinction: a derived point must not be re-ingested as if it were a
+   *  seller's pin (which would report it tighter than the evidence behind it), and it is not
+   *  INDEPENDENT of the street/description evidence a later pass re-derives — counting both would
+   *  treat one piece of evidence as two. */
+  coordsOuterRadiusMeters?: number | null;
 
   // Contact
   phone: string | null;

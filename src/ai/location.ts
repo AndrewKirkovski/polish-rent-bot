@@ -185,10 +185,27 @@ async function gatherLocationCandidates(
   let constraint: MetroConstraint | null = null;
   let unverifiedEvidence: string | null = null;
 
+  // Coordinates we DERIVED on an earlier pass and persisted (see Listing.coordsOuterRadiusMeters).
+  // Held back rather than pushed here: they were computed from the same street/description evidence
+  // this pass re-derives below, so they are not an independent source. Fusing both would count one
+  // piece of evidence twice and report a point tighter than the evidence supports — which, now that
+  // the gates hard-reject from the optimistic edge, means deleting listings for distances they may
+  // not have. Used only as a FALLBACK when this pass produces no text-derived candidate (e.g. the
+  // parse varied and dropped the addressHint), and always at the uncertainty it actually had.
+  const derivedPin = listing.lat != null && listing.lng != null && listing.coordsOuterRadiusMeters != null
+    ? {
+        lat: listing.lat, lng: listing.lng,
+        // Invert the stored 2σ route radius back to the ~1σ crow σ the fusion works in.
+        sigma: clampMeters((listing.coordsOuterRadiusMeters / WALK_DETOUR_FACTOR) / OUTER_SIGMA_K, 25, 20_000),
+        reliability: 0.8, precisionFloor: 'street' as LocationPrecision,
+        source: 'уточнённые координаты с прошлого прохода', evidence: null,
+      } satisfies LocCandidate
+    : null;
+
   // Platform map pin. OLX self-declares precision via show_detailed (coordsPrecise): a precise
   // seller pin is building-accurate; a fuzzed one is only a neighborhood centroid. (Otodom pins
   // are returned as exact earlier; anything here with coordsPrecise unset is treated as fuzzy.)
-  if (listing.lat != null && listing.lng != null) {
+  if (listing.lat != null && listing.lng != null && derivedPin == null) {
     candidates.push(listing.coordsPrecise
       ? { lat: listing.lat, lng: listing.lng, sigma: 120, reliability: 0.85, precisionFloor: 'street', source: 'точная метка с площадки', evidence: null }
       : { lat: listing.lat, lng: listing.lng, sigma: 1800, reliability: 0.4, precisionFloor: 'district', source: 'метка района с площадки', evidence: null });
@@ -264,6 +281,10 @@ async function gatherLocationCandidates(
   } else if (hint?.query || hint?.evidence) {
     unverifiedEvidence ??= hint.evidence ?? hint.query;
   }
+
+  // Fall back to the point an earlier pass derived only if this pass found nothing text-derived —
+  // otherwise it would double-count the evidence that produced it (see `derivedPin` above).
+  if (derivedPin && candidates.length === 0) candidates.push(derivedPin);
 
   return { candidates, constraint, unverifiedEvidence };
 }
@@ -403,7 +424,8 @@ export async function enrichListingLocation(
       // Ads quote WALKING distance ("500 m od metra"), which is already route metres — the
       // parse copies it verbatim, so it must not be detour-scaled a second time here.
       anchorDistanceMeters: constraint.distance,
-      uncertaintyMeters: constraint.margin,
+      // The field's contract is CROW metres; the margin is ad-quoted walking metres.
+      uncertaintyMeters: Math.round(constraint.margin / WALK_DETOUR_FACTOR),
       // A station spans ~STATION_FOOTPRINT_M of entrances, so the honest ring is margin + that,
       // in route metres.
       outerRadiusMeters: capOuter(constraint.margin + STATION_FOOTPRINT_ROUTE_M),

@@ -25,5 +25,8 @@ export function preserveTrustworthyCoords(current: Listing, prior: Listing | nul
     current.lat = prior.lat;
     current.lng = prior.lng;
     current.coordsPrecise = prior.coordsPrecise;
+    // Carry the provenance too. Without it a point WE derived arrives looking like a seller-placed
+    // platform pin, and the location fusion would trust it tighter than the evidence behind it.
+    current.coordsOuterRadiusMeters = prior.coordsOuterRadiusMeters;
   }
 }

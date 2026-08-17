@@ -35,6 +35,23 @@ function link(row: MonitorRejectionRow): string {
   return `<a href="${esc(row.url)}">${title}</a>`;
 }
 
+/**
+ * Categories whose rejections are worth reading individually, so each gets its own line WITH the
+ * reason. `amenity` covers the location gates, whose verdict can be inferred from an approximate
+ * region — the reason carries both the measured range and the ±radius it was inferred from, and a
+ * bare title link would present a speculative reject as indistinguishable from a measured one.
+ */
+const SHOW_REASON: ReadonlySet<string> = new Set<RejectionCategory>(['amenity']);
+
+/** Reason trimmed to keep a 10-item category inside one Telegram message. Separated with "·"
+ *  because the reason itself carries an em-dash before the "оценка по примерной локации" caveat. */
+function reasonSuffix(row: MonitorRejectionRow): string {
+  const reason = (row.reason ?? '').trim();
+  if (!reason) return '';
+  const clipped = reason.length > 110 ? `${reason.slice(0, 109)}…` : reason;
+  return ` · ${esc(clipped)}`;
+}
+
 export function buildRejectionReport(rows: MonitorRejectionRow[]): string | null {
   if (rows.length === 0) return null;
 
@@ -69,9 +86,16 @@ export function buildRejectionReport(rows: MonitorRejectionRow[]): string | null
     const items = byCat.get(cat);
     if (!items || items.length === 0) continue;
     const cap = softLinkCap(cat);
-    const shown = items.slice(0, cap).map(link).join(', ');
+    const kept = items.slice(0, cap);
     const extra = items.length > cap ? ` +${items.length - cap}` : '';
-    softLines.push(`• ${REJECTION_LABEL[cat]} (${items.length}): ${shown}${extra}`);
+    if (SHOW_REASON.has(cat)) {
+      // One line per listing so the reason stays readable.
+      softLines.push(`• ${REJECTION_LABEL[cat]} (${items.length}):`);
+      for (const row of kept) softLines.push(`   ${link(row)}${reasonSuffix(row)}`);
+      if (extra) softLines.push(`  ${extra.trim()}`);
+    } else {
+      softLines.push(`• ${REJECTION_LABEL[cat]} (${items.length}): ${kept.map(link).join(', ')}${extra}`);
+    }
   }
   if (softLines.length > 0) {
     lines.push('', '<b>Стоит взглянуть:</b>', ...softLines);
