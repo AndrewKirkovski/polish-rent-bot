@@ -420,14 +420,17 @@ export function startBot(): TelegramBot {
   // an unhandledRejection and main.ts hard-exits the process, killing the bot for everyone.
   bot.on('message', async (msg: Msg) => {
     try {
-      const text = (msg.text ?? msg.caption ?? '').trim();
+      const rawText = msg.text ?? msg.caption ?? '';
+      const text = rawText.trim();
       if (!text) return;
 
-      // Log custom emoji entities for collecting emoji IDs
+      // Log custom emoji entities for collecting emoji IDs. Entity offset/length index the ORIGINAL
+      // (untrimmed) text, so slice rawText — slicing the trimmed `text` misreads them when there's
+      // leading whitespace.
       const customEmojis = (msg.entities ?? msg.caption_entities ?? []).filter((e: { type: string }) => e.type === 'custom_emoji');
       if (customEmojis.length > 0) {
         for (const e of customEmojis) {
-          const emojiChar = text.slice(e.offset, e.offset + e.length);
+          const emojiChar = rawText.slice(e.offset, e.offset + e.length);
           console.log(`[emoji] Custom emoji: "${emojiChar}" → id: ${(e as { custom_emoji_id?: string }).custom_emoji_id}`);
         }
       }

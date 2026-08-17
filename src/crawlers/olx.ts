@@ -251,7 +251,11 @@ export async function searchOlx(params: OlxSearchParams): Promise<CrawlResult> {
   const data = await fetchJson<any>(url);
 
   if (!data?.data) {
-    return { platform: 'olx', listings: [], totalAvailable: 0, page: 0, hasNextPage: false, nextPageUrl: null };
+    // A 200 body WITHOUT the `data` array container is a structural anomaly (soft-block / redirect /
+    // API change), NOT a genuine empty result (which is `{ data: [] }` — data.data present but empty).
+    // Throw so a whole-run OLX outage surfaces via searchOlxRentals' all-errored guard instead of
+    // masking as "no results" (mirrors the Otodom missing-searchAds throw). Per-combo callers catch it.
+    throw new Error('olx: missing data payload (structure change / block)');
   }
 
   const listings = data.data.map(parseOlxOffer);

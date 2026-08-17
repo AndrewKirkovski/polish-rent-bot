@@ -934,7 +934,9 @@ async function execFindItems(
   const searchId = genId();
   ctx.lastSearchId = searchId;
   // Don't clear resultMap — old IDs stay resolvable across searches
-  try { await sendFn(ctx.chatId, `${displayTotal} найдено… [${searchId}]`, { parse_mode: undefined }); } catch (e) { console.error('[tools] send failed:', e instanceof Error ? e.message : e); }
+  // Surface the "city not recognized → nationwide" caveat to the USER (not only in the model-facing
+  // return), so a dropped city filter can't silently pass off nationwide items as local.
+  try { await sendFn(ctx.chatId, `${displayTotal} найдено…${cityNote} [${searchId}]`, { parse_mode: undefined }); } catch (e) { console.error('[tools] send failed:', e instanceof Error ? e.message : e); }
 
   const shown: ItemListing[] = [];
   const shownIds: string[] = [];

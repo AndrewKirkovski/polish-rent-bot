@@ -21,7 +21,7 @@ const PARSE_MODEL = process.env.PARSE_MODEL || 'claude-haiku-4-5';
 
 // Folded into the parse cache key; bump on any RENTAL_PROMPT/schema change so stale
 // old-schema rows miss instead of returning objects without the new fields.
-export const RENTAL_PARSE_VERSION = 'wfh-v6-location-evidence-validation';
+export const RENTAL_PARSE_VERSION = 'wfh-v7-no-coords-in-prompt';
 export const ITEM_PARSE_VERSION = 'v2';
 // Folded into the rejection cache key; bump on any REJECTION_PROMPT change so already-cached
 // verdicts computed under the old rejection rules are re-evaluated instead of served stale.
@@ -375,7 +375,6 @@ Heating: ${listing.heating ?? 'unknown'}
 City: ${listing.city}, District: ${listing.district ?? 'unknown'}
 Street: ${listing.street ?? 'unknown'}
 Advertiser: ${listing.advertiserType ?? 'unknown'}
-Coordinates: ${listing.lat ?? 'unknown'}, ${listing.lng ?? 'unknown'}
 
 GROUND-TRUTH FACTS (do NOT contradict; infer only the 'unknown' ones from the description):
 - internet available: ${tri(listing.hasInternet)}

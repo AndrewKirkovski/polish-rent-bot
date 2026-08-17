@@ -5,7 +5,7 @@ import type TelegramBot from 'node-telegram-bot-api';
 import sanitizeHtml from 'sanitize-html';
 import type { Listing, ParsedRentalData, ParsedItemData, LocationScore, NearbyPlace } from '../types.js';
 import type { ItemListing } from '../crawlers/olx-items.js';
-import { computeRentalCost } from '../cost.js';
+import { computeRentalCost, priceUnit } from '../cost.js';
 import { escapeHtml, TELEGRAM_SANITIZE, decodeBasicEntities } from '../utils/html.js';
 
 /** Repair broken HTML from message splitting — close unclosed tags, strip orphan close tags */
@@ -169,8 +169,13 @@ export function formatRentalCard(
     } else {
       // Base rent unknown ("zapytaj o cenę") or non-PLN — the header already shows "цена по запросу",
       // so list only the add-on costs; never render a zero or foreign base rent as a bare PLN number.
+      // czynsz is PLN when it came from the PLN-parsed adminFee or the listing itself is PLN; else it's
+      // the foreign listing.rent → label it with its currency so it isn't misread as zł. mediaSum is
+      // always PLN (parsed from the Polish description).
+      const czynszIsPln = (parsed?.adminFee != null && parsed.adminFee >= 0) || (listing.currency ?? 'PLN') === 'PLN';
+      const czynszStr = czynszIsPln ? num(cost.czynsz) : `${num(cost.czynsz)} ${priceUnit(listing.currency)}`;
       const extras = [
-        cost.czynsz > 0 ? `czynsz ${num(cost.czynsz)}` : null,
+        cost.czynsz > 0 ? `czynsz ${czynszStr}` : null,
         cost.mediaSum > 0 ? `media ~${num(cost.mediaSum)}` : null,
       ].filter(Boolean);
       payLine.push(`+ ${extras.join(' + ')}`);
