@@ -430,6 +430,14 @@ export function startScheduler(
               // losing the AI analysis for the whole outage batch. (Deterministic item failures still
               // deliver a best-effort degraded card; only rentals cap+give-up on deterministic ones.)
               if (!parsedData && !parseFailedDeterministically) {
+                // During a full rescan (notifications suppressed) BASELINE a candidate we can't analyze
+                // instead of leaving it UNSEEN — the rescan wiped seen_listings, so an unseen deferral
+                // re-appears next NORMAL cycle and gets ALERTED, defeating the rescan's silent
+                // re-baseline. show_listing recomputes the analysis on demand later.
+                if (fullRescan) {
+                  markListingSeen(monitor.id, workingListing.platform, workingListing.platformId, workingListing.url, workingListing.title, workingListing.price);
+                  continue;
+                }
                 console.log(`[scheduler] Defer (transient parse failure — not counting) "${workingListing.title}"`);
                 continue;
               }
@@ -442,6 +450,13 @@ export function startScheduler(
                 const rl = workingListing as Listing;
                 const deferKey = `${monitor.id}:${rl.platform}:${rl.platformId}`;
                 if (!parsedData) {
+                  // Same rescan-baseline rule as the transient branch above (this is the deterministic
+                  // path): during a rescan, mark seen instead of deferring so it can't leak an alert.
+                  if (fullRescan) {
+                    parseDeferCounts.delete(deferKey);
+                    markListingSeen(monitor.id, rl.platform, rl.platformId, rl.url, rl.title, rl.price);
+                    continue;
+                  }
                   const deferrals = (parseDeferCounts.get(deferKey) ?? 0) + 1;
                   if (deferrals >= MAX_PARSE_DEFERS) {
                     console.log(`[scheduler] Give up (parse failed ${deferrals}x) "${rl.title}"`);
@@ -600,18 +615,28 @@ export function startScheduler(
                   locationScore?.precision,
                   strictAmenities,
                 );
-                if (!gate.pass) {
-                  console.log(`[scheduler] Amenity reject "${workingListing.title}": ${gate.reason}`);
-                  recordMonitorRejection(monitor.id, workingListing, 'amenity', gate.reason ?? 'далеко до удобств');
+                // A verdict inferred from a REGION is still marked seen, like any other reject.
+                // Leaving it re-checkable was tempting — a later pass might localize the flat
+                // precisely — but re-enrichment is DETERMINISTIC for unchanged listing data, so the
+                // next cycle recomputes the identical verdict. All it would buy is a per-cycle cost:
+                // triage is deliberately uncached (it relies on this very seen-gate), the platform
+                // phone/detail fetch re-runs, and the listing would permanently occupy a slot in the
+                // per-cycle cap — starving genuinely new listings. Recovery already has a mechanism:
+                // a full rescan clears seen_listings. `inferred` survives only to label the reason.
+                const applyGateReject = (result: { inferred?: boolean; reason?: string }, fallback: string): void => {
+                  const reason = result.reason ?? fallback;
+                  console.log(`[scheduler] Location reject "${workingListing.title}": ${reason}`);
+                  recordMonitorRejection(monitor.id, workingListing, 'amenity', reason);
                   markListingSeen(monitor.id, workingListing.platform, workingListing.platformId, workingListing.url, workingListing.title, workingListing.price);
+                };
+                if (!gate.pass) {
+                  applyGateReject(gate, 'далеко до удобств');
                   continue;
                 }
 
                 const centerGate = checkCenterGate(locationScore, config.maxCenterMinutes, locationScore?.precision);
                 if (!centerGate.pass) {
-                  console.log(`[scheduler] Center reject "${workingListing.title}": ${centerGate.reason}`);
-                  recordMonitorRejection(monitor.id, workingListing, 'amenity', centerGate.reason ?? 'далеко от центра');
-                  markListingSeen(monitor.id, workingListing.platform, workingListing.platformId, workingListing.url, workingListing.title, workingListing.price);
+                  applyGateReject(centerGate, 'далеко от центра');
                   continue;
                 }
               }

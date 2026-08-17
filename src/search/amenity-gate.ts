@@ -4,7 +4,18 @@
 // that maps.ts already computes with the type-appropriate metric.
 
 import type { LocationScore, LocationPrecision, AmenityResult } from '../types.js';
-import type { AmenityPreference } from '../ai/maps.js';
+import { matchesAmenityRequest, formatRuRadius, type AmenityPreference } from '../ai/maps.js';
+
+/**
+ * Precision classes where the coordinates describe a REGION large enough that a Places search
+ * centred on them could have missed an amenity near the flat's true position. The limits are still
+ * enforced for these — from the optimistic edge of the region — but an EMPTY result is treated as
+ * unknown rather than as a confirmed absence. (Street precision tops out around 500 m against a
+ * 5 km search radius, so an empty result there really is an absence.)
+ */
+export function isCoarsePrecision(precision: LocationPrecision | undefined): boolean {
+  return precision === 'approximate' || precision === 'district';
+}
 
 export const AMENITY_LABELS: Record<string, string> = {
   metro: 'метро',
@@ -68,8 +79,31 @@ export function resolveStrictAmenities(explicit?: boolean): boolean {
 export interface AmenityGateResult {
   pass: boolean;
   reason?: string;
+  /** The verdict rests on a REGION rather than a measured position. Used to label the reason so a
+   *  digest line can't be read as a surveyed distance; it does not change the caller's handling. */
+  inferred?: boolean;
 }
 
+/** Whether the verdict was derived from a region. Keyed on the ACTUAL radius the ranges were built
+ *  from, not the precision label — a `street`-classified geocode with a wide bounds box is just as
+ *  inferred as a district centroid, and mislabelling it would understate the caveat. */
+function verdictIsInferred(locationScore: LocationScore | null): boolean {
+  return (locationScore?.locationOuterRadiusMeters ?? 0) > 0;
+}
+
+/**
+ * Hard filter on the user's amenity limits.
+ *
+ * An approximate or district-level location is still enforced, judged from the MOST OPTIMISTIC
+ * edge of the uncertainty region: if the closest the flat could possibly be still breaks the
+ * limit, that is evidence, not ignorance. (A whitelisted station 10–20 min away from the region's
+ * edges fails a 7-min requirement — 10 already exceeds 7.) Uncertainty may only ever rescue a
+ * listing whose optimistic edge is INSIDE the limit; `applyLocationUncertainty` marks exactly
+ * those `uncertain`.
+ *
+ * Genuine ignorance still passes: no coordinates at all, a failed measurement, or a criterion we
+ * could not honour.
+ */
 export function checkAmenityGate(
   locationScore: LocationScore | null,
   amenities: AmenityPreference[],
@@ -79,26 +113,26 @@ export function checkAmenityGate(
   if (!strict) return { pass: true };
   if (amenities.length === 0) return { pass: true };
 
-  // Missing/district-only location is an UNKNOWN verdict, not a rejection. The card carries
+  // No coordinates at all → nothing to measure from, so no verdict is possible. The card carries
   // a warning so users can decide whether to verify it with the landlord.
-  if (!locationScore || precision === 'none' || precision === 'district') {
+  if (!locationScore || precision === 'none') {
     return { pass: true };
   }
+  const inferred = verdictIsInferred(locationScore);
 
   for (const pref of amenities) {
-    const sameType = locationScore.amenities.filter((a) => a.type === pref.type);
-    const result = pref.type !== 'metro'
-      ? sameType[0]
-      : pref.line
-        ? sameType.find((a) => a.requestedLine === pref.line)
-        : sameType.find((a) => a.requestedLine == null);
+    const result = locationScore.amenities.find((a) => matchesAmenityRequest(pref, a));
     // Transient Maps API/measurement failure → verdict unknown; keep-with-flag rather than
     // falsely rejecting "not nearby" (and, in the monitor, permanently dropping the listing).
     if (result?.error) continue;
+    // We measured something other than what was asked for (e.g. a station whitelist that matched
+    // no real station). Never hard-reject against a substituted criterion.
+    if (result?.criterionSubstituted) continue;
     if (!result || result.places.length === 0) {
-      if (precision === 'approximate') continue;
+      if (isCoarsePrecision(precision)) continue;
       const line = pref.type === 'metro' && pref.line ? ` ${pref.line}` : '';
-      return { pass: false, reason: `${amenityLabel(pref.type)}${line} рядом не найдено` };
+      const reason = `${amenityLabel(pref.type)}${line} рядом не найдено`;
+      return { pass: false, reason: withInferenceNote(reason, inferred, locationScore), inferred };
     }
 
     // A range that crosses the requested threshold remains a warning. If the whole
@@ -108,7 +142,7 @@ export function checkAmenityGate(
     if (!result.withinLimit) {
       if (pref.type === 'metro') {
         const reason = metroRejectionReason(result, pref);
-        if (reason) return { pass: false, reason };
+        if (reason) return { pass: false, reason: withInferenceNote(reason, inferred, locationScore), inferred };
       }
       // Show the range the gate actually judged (for an approximate anchor), not the point-search
       // minutes — otherwise the message can read "9 мин (лимит 7)" for a listing kept for its range.
@@ -117,31 +151,47 @@ export function checkAmenityGate(
         ? `~${n.walkingMinutesRange.min}–${n.walkingMinutesRange.max}`
         : String(nearestMinutes(result) ?? '?');
       const line = pref.type === 'metro' && pref.line ? ` ${pref.line}` : '';
-      return { pass: false, reason: `${amenityLabel(pref.type)}${line} ${mins} ${unit(pref.type)} (лимит ${pref.maxMinutes} мин)` };
+      const reason = `${amenityLabel(pref.type)}${line} ${mins} ${unit(pref.type)} (лимит ${pref.maxMinutes} мин)`;
+      return { pass: false, reason: withInferenceNote(reason, inferred, locationScore), inferred };
     }
   }
 
   return { pass: true };
 }
 
+/** Tell the reader when a rejection was inferred from a region rather than measured at an address,
+ *  so a digest line can't be mistaken for a surveyed distance. */
+function withInferenceNote(reason: string, inferred: boolean, locationScore: LocationScore | null): string {
+  if (!inferred) return reason;
+  const radius = locationScore?.locationOuterRadiusMeters;
+  return radius != null && radius > 0
+    ? `${reason} — оценка по примерной локации ±${formatRuRadius(radius)}`
+    : `${reason} — оценка по примерной локации`;
+}
+
 /**
  * Hard filter on public-transport time to the city center (Warszawa Centralna). Mirrors the
- * amenity gate's leniency: unknown/district-only locations and routing failures keep the listing
- * (with the card's warning) rather than falsely rejecting. Rejects only when even the optimistic
- * (min) transit time already exceeds the limit.
+ * amenity gate: an approximate or district-level location is still enforced, from the optimistic
+ * (min) edge of its region — `centralStationEstimate` measures that edge with a second route for
+ * a loosely localized flat, and floors it at what transit can physically achieve over the
+ * remaining straight-line distance. Only genuine ignorance passes: no coordinates, or a routing
+ * failure that leaves us without a time at all.
  */
 export function checkCenterGate(
   locationScore: LocationScore | null,
   maxCenterMinutes: number | undefined,
   precision: LocationPrecision | undefined,
 ): AmenityGateResult {
-  if (maxCenterMinutes == null) return { pass: true };
-  if (!locationScore || precision === 'none' || precision === 'district') return { pass: true };
+  // Ignore a nonsense limit rather than rejecting everything (0) or nothing (NaN).
+  if (maxCenterMinutes == null || !Number.isFinite(maxCenterMinutes) || maxCenterMinutes <= 0) return { pass: true };
+  if (!locationScore || precision === 'none') return { pass: true };
   const central = locationScore.centralStation;
   if (!central || !central.durationMinRange) return { pass: true }; // routing unknown → keep-with-flag
   if (central.durationMinRange.min > maxCenterMinutes) {
     const { min, max } = central.durationMinRange;
-    return { pass: false, reason: `центр (Warszawa Centralna): ~${min}–${max} мин > лимит ${maxCenterMinutes} мин` };
+    const inferred = verdictIsInferred(locationScore);
+    const reason = `центр (Warszawa Centralna): ~${min}–${max} мин > лимит ${maxCenterMinutes} мин`;
+    return { pass: false, reason: withInferenceNote(reason, inferred, locationScore), inferred };
   }
   return { pass: true };
 }

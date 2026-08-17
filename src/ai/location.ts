@@ -10,17 +10,60 @@
 import type { Listing, LocationPrecision, ParsedRentalData } from '../types.js';
 import { geocodeAddress, buildAddressFromListing, warsawMetroLinesForStation } from './maps.js';
 import type { GeocodedLocation } from './maps.js';
-import { findMetroStation, haversineMeters } from '../geo/metro.js';
+import { findMetroStation, haversineMeters, walkMetersFromCrow, WALK_DETOUR_FACTOR } from '../geo/metro.js';
 import { fetchOtodomDetail } from '../crawlers/otodom.js';
+
+/**
+ * σ is a ~1σ radius, which covers only ~39% of a 2D Gaussian's mass. The gates hard-reject on
+ * the optimistic edge of the region, so they need a radius that actually CONTAINS the true
+ * position — otherwise a flat whose real location is 2σ from the fused point gets deleted for
+ * a distance it doesn't have. 2σ (~86% of the mass) is the outer bound we enforce against.
+ */
+const OUTER_SIGMA_K = 2;
+
+/** No honest region is larger than this; caps a pathological geocode box or ad-quoted radius. */
+const MAX_OUTER_RADIUS_M = 25_000;
+
+/** Fallback extent for a district/city centroid when the geocoder returned no bounds box. */
+const ASSUMED_AREA_RADIUS_M = 2500;
 
 export interface EnrichedLocation {
   lat: number | null;
   lng: number | null;
   precision: LocationPrecision;
+  /** Distance from the returned point to the apartment, in ROUTE (walking-path) metres.
+   *  Non-zero ONLY on the metro-annulus path, where the returned point is the STATION and the
+   *  apartment sits on a ring around it. Every other branch returns a plausible apartment
+   *  position, i.e. a disc, and leaves this 0. */
   anchorDistanceMeters: number;
+  /** ~1σ positional uncertainty in CROW metres. Diagnostic/legacy: the gates use
+   *  `outerRadiusMeters` instead, because σ is not a containing bound. */
   uncertaintyMeters: number;
+  /** Honest OUTER bound of the uncertainty region, in ROUTE metres. This is the number every
+   *  hard gate measures the optimistic edge from, so it must contain the true position. */
+  outerRadiusMeters: number;
   source: string;
   evidence: string | null;
+}
+
+const capOuter = (meters: number): number => Math.max(0, Math.min(MAX_OUTER_RADIUS_M, Math.round(meters)));
+
+/**
+ * Outer radius (route metres) for a geocoded point: the wider of the precision-class estimate and
+ * the geocoder's own measured extent, so an area match can't be reported tighter than the area it
+ * actually covers.
+ *
+ * The precision-class figure is a σ, exactly as it is on the fused path, so it gets the same
+ * OUTER_SIGMA_K inflation — otherwise identical geocoder evidence would yield a containing bound
+ * through `fuseLocationCandidates` and a bare 1σ here, and this branch's listings would be rejected
+ * for distances they may not have. A MEASURED extent is already a containing bound, so it is not
+ * inflated; the wider of the two wins.
+ */
+function geocodeOuterRadius(geo: GeocodedLocation, classifiedUncertainty: number): number {
+  return capOuter(walkMetersFromCrow(Math.max(
+    OUTER_SIGMA_K * classifiedUncertainty,
+    geo.areaRadiusMeters ?? 0,
+  )));
 }
 
 export function classifyGeocodePrecision(
@@ -52,6 +95,17 @@ function geocodeAreaUncertainty(geo: GeocodedLocation): number {
   if (types.has('neighborhood') || types.has('sublocality')) return 1500;
   if (types.has('route')) return 600;
   return 0;
+}
+
+/**
+ * Uncertainty for a geocoded candidate, in CROW metres, never tighter than the area the geocoder
+ * says it matched. The precision-class constants above are averages: a long street ("Puławska"
+ * spans ~10 km) or a sprawling estate resolves to a `route`/`neighborhood` type whose real extent
+ * dwarfs the 600/1500 m assumption. Understating it here would raise every downstream optimistic
+ * edge and reject flats that are genuinely close to what the user asked for.
+ */
+function candidateSigma(geo: GeocodedLocation, classifiedUncertainty: number): number {
+  return Math.max(classifiedUncertainty, geo.areaRadiusMeters ?? 0);
 }
 
 type UsableDescriptionLocationHint = ParsedRentalData['locationHint'] & {
@@ -90,7 +144,10 @@ export function isUsableDescriptionLocationHint(
 // ---------------------------------------------------------------------------
 
 const AGREE_K = 1.5;             // two candidates "agree" when within AGREE_K*(σ_a + σ_b)
-const STATION_FOOTPRINT_M = 150; // a metro "point" really spans its entrances
+/** A metro "point" really spans its entrances. A physical extent, so this is CROW metres — every
+ *  use that combines it with an ad-quoted (walking) distance must detour-scale it first. */
+const STATION_FOOTPRINT_M = 150;
+const STATION_FOOTPRINT_ROUTE_M = walkMetersFromCrow(STATION_FOOTPRINT_M);
 
 type HintKind = Exclude<ParsedRentalData['locationHint']['kind'], 'none'>;
 const HINT_KIND_DEFAULT_UNC: Record<HintKind, number> = {
@@ -147,7 +204,7 @@ async function gatherLocationCandidates(
     if (geo) {
       const q = classifyGeocodePrecision(geo);
       candidates.push({
-        lat: geo.lat, lng: geo.lng, sigma: q.uncertaintyMeters,
+        lat: geo.lat, lng: geo.lng, sigma: candidateSigma(geo, q.uncertaintyMeters),
         reliability: listing.street ? 0.75 : 0.7, precisionFloor: q.precision,
         source: listing.street ? 'улица из объявления' : 'адрес из описания',
         evidence: listing.street ?? parsed?.addressHint ?? null,
@@ -161,14 +218,23 @@ async function gatherLocationCandidates(
   // any other geocodable anchor → a point candidate.
   const hint = parsed?.locationHint;
   if (hint && isUsableDescriptionLocationHint(hint, listing.city, listing.district)) {
-    const station = hint.kind === 'transit_stop'
+    // findMetroStation's table is WARSAW-ONLY and matches on a bare name, so several ordinary Polish
+    // words (Centrum, Politechnika, Bemowo…) collide with real Warsaw stations. Only treat a
+    // transit_stop as a metro constraint for a Warsaw listing — otherwise a Kraków/Wrocław flat would
+    // be pinned to a same-named Warsaw station ~250 km away (fabricating a Warsaw metro/commute block).
+    // A non-Warsaw transit_stop falls through to the generic geocode-in-its-own-city anchor below.
+    const cityLc = (listing.city ?? '').toLowerCase();
+    const inWarsaw = cityLc.includes('warszaw') || cityLc.includes('warsaw');
+    const station = hint.kind === 'transit_stop' && inWarsaw
       ? findMetroStation(hint.query.split(',')[0]?.trim() ?? hint.query)
       : null;
     if (station) {
       constraint = {
         station,
+        // Both are ROUTE metres: the ad quotes walking distance, so the station footprint is
+        // detour-scaled before it can act as the floor.
         distance: clampMeters(hint.anchorDistanceMeters ?? 0, 0, 50_000),
-        margin: clampMeters(Math.max(STATION_FOOTPRINT_M, hint.uncertaintyMeters ?? 400), STATION_FOOTPRINT_M, 20_000),
+        margin: clampMeters(Math.max(STATION_FOOTPRINT_ROUTE_M, hint.uncertaintyMeters ?? 400), STATION_FOOTPRINT_ROUTE_M, 20_000),
         evidence: hint.evidence,
       };
     } else {
@@ -179,7 +245,10 @@ async function gatherLocationCandidates(
         // A stated distance to a non-station anchor (a landmark N m away) widens it into an annulus;
         // fold that distance into sigma so it stays a usable — if coarse — point candidate.
         const anchorDist = clampMeters(hint.anchorDistanceMeters ?? 0, 0, 50_000);
-        const baseUnc = Math.max(hint.uncertaintyMeters ?? HINT_KIND_DEFAULT_UNC[hint.kind], pointLike ? q.uncertaintyMeters : geocodeAreaUncertainty(geo));
+        const baseUnc = Math.max(
+          hint.uncertaintyMeters ?? HINT_KIND_DEFAULT_UNC[hint.kind],
+          candidateSigma(geo, pointLike ? q.uncertaintyMeters : geocodeAreaUncertainty(geo)),
+        );
         candidates.push({
           lat: geo.lat, lng: geo.lng,
           sigma: clampMeters(Math.max(baseUnc, anchorDist), 50, 20_000),
@@ -234,18 +303,27 @@ export function fuseLocationCandidates(candidates: LocCandidate[], constraint: M
 
   // Metro station as a radial CONSTRAINT: does the fused point genuinely sit on the claimed annulus?
   if (constraint) {
-    const d = haversineMeters(lat, lng, constraint.station.lat, constraint.station.lng);
+    const crowToStation = haversineMeters(lat, lng, constraint.station.lat, constraint.station.lng);
+    // `constraint.distance` and `.margin` are ad-quoted WALKING metres, so the separation has to be
+    // converted before they can be compared. Comparing a crow distance against a route one made a
+    // perfectly corroborating candidate look ~23% off — enough to flag agreeing evidence as
+    // "расхождение" on the card once the stated distance passed ~2.5 km.
+    const d = walkMetersFromCrow(crowToStation);
     const discrepancy = Math.abs(d - constraint.distance);
     // Corroborate only when the point is really near the annulus — the point's own sigma must NOT
     // buy agreement — and never tighten below the actual positional discrepancy. Corroboration can
     // only hold-or-tighten, never inflate: the 120 m "don't over-trust a metro hint" floor is
     // capped at the incoming sigma (Math.min(120, sigma)), so a point already tighter than 120 m
     // from independent evidence (precise pin + rooftop street) is preserved, not widened back to 120.
-    if (discrepancy <= constraint.margin + STATION_FOOTPRINT_M) {
-      sigma = clampMeters(Math.max(discrepancy, Math.min(sigma, constraint.margin + STATION_FOOTPRINT_M)), Math.min(120, sigma), sigma);
+    // σ is a CROW radius, so the route-metre discrepancy converts back before it can size σ.
+    const agreementBandRoute = constraint.margin + STATION_FOOTPRINT_ROUTE_M;
+    const discrepancyCrow = discrepancy / WALK_DETOUR_FACTOR;
+    const agreementBandCrow = agreementBandRoute / WALK_DETOUR_FACTOR;
+    if (discrepancy <= agreementBandRoute) {
+      sigma = clampMeters(Math.max(discrepancyCrow, Math.min(sigma, agreementBandCrow)), Math.min(120, sigma), sigma);
       note = `; ~${Math.round(d)} м до ${constraint.station.name}`;
     } else {
-      sigma = Math.max(sigma, discrepancy); // sources disagree → widen + flag
+      sigma = Math.max(sigma, discrepancyCrow); // sources disagree → widen + flag
       note = `; расхождение с ${constraint.station.name}`;
     }
   }
@@ -262,6 +340,7 @@ export function fuseLocationCandidates(candidates: LocCandidate[], constraint: M
     lat, lng, precision,
     anchorDistanceMeters: 0,
     uncertaintyMeters: Math.round(sigma),
+    outerRadiusMeters: capOuter(walkMetersFromCrow(OUTER_SIGMA_K * sigma)),
     source: [...new Set(cluster.map((c) => c.source))].join(' + ') + note,
     evidence,
   };
@@ -276,7 +355,7 @@ export async function enrichListingLocation(
     try {
       const detail = await fetchOtodomDetail(listing.url);
       if (detail?.lat != null && detail?.lng != null) {
-        return { lat: detail.lat, lng: detail.lng, precision: 'exact', anchorDistanceMeters: 0, uncertaintyMeters: 0, source: 'координаты Otodom', evidence: null };
+        return { lat: detail.lat, lng: detail.lng, precision: 'exact', anchorDistanceMeters: 0, uncertaintyMeters: 0, outerRadiusMeters: 0, source: 'координаты Otodom', evidence: null };
       }
       if (detail?.street) {
         const geo = await geocodeAddress(buildAddressFromListing(detail));
@@ -288,6 +367,7 @@ export async function enrichListingLocation(
             precision: quality.precision,
             anchorDistanceMeters: 0,
             uncertaintyMeters: quality.uncertaintyMeters,
+            outerRadiusMeters: geocodeOuterRadius(geo, quality.uncertaintyMeters),
             source: 'адрес Otodom',
             evidence: detail.street,
           };
@@ -300,7 +380,7 @@ export async function enrichListingLocation(
 
   // 2. Otodom already carries exact detail-page coordinates.
   if (listing.platform === 'otodom' && listing.lat != null && listing.lng != null) {
-    return { lat: listing.lat, lng: listing.lng, precision: 'exact', anchorDistanceMeters: 0, uncertaintyMeters: 0, source: 'координаты Otodom', evidence: null };
+    return { lat: listing.lat, lng: listing.lng, precision: 'exact', anchorDistanceMeters: 0, uncertaintyMeters: 0, outerRadiusMeters: 0, source: 'координаты Otodom', evidence: null };
   }
 
   // 3. Fuse every available signal (platform pin + geocoded street + description anchor) into the
@@ -320,23 +400,33 @@ export async function enrichListingLocation(
       lat: constraint.station.lat,
       lng: constraint.station.lng,
       precision: 'approximate',
+      // Ads quote WALKING distance ("500 m od metra"), which is already route metres — the
+      // parse copies it verbatim, so it must not be detour-scaled a second time here.
       anchorDistanceMeters: constraint.distance,
       uncertaintyMeters: constraint.margin,
+      // A station spans ~STATION_FOOTPRINT_M of entrances, so the honest ring is margin + that,
+      // in route metres.
+      outerRadiusMeters: capOuter(constraint.margin + STATION_FOOTPRINT_ROUTE_M),
       source: `ориентир из описания (остановка) ~${constraint.distance} м до ${constraint.station.name}`,
       evidence: constraint.evidence,
     };
   }
 
-  // 7. Last resort — geocode the district/city centroid.
+  // 7. Last resort — geocode the district/city centroid. The gates still enforce their limits
+  // here (from the optimistic edge of the area), so the radius must be the area's REAL extent:
+  // Warsaw dzielnice range from ~15 km² (Śródmieście) to ~80 km² (Wawer), and a flat 2.5 km
+  // guess would delete flats in the centre-facing corner of a large outer district.
   if (listing.district || listing.city) {
     const geo = await geocodeAddress(buildAddressFromListing({ street: null, district: listing.district, city: listing.city }));
     if (geo) {
+      const areaRadius = geo.areaRadiusMeters ?? ASSUMED_AREA_RADIUS_M;
       return {
         lat: geo.lat,
         lng: geo.lng,
         precision: 'district',
         anchorDistanceMeters: 0,
-        uncertaintyMeters: 2500,
+        uncertaintyMeters: areaRadius,
+        outerRadiusMeters: capOuter(walkMetersFromCrow(areaRadius)),
         source: unverifiedDescriptionEvidence
           ? 'центр района или города; ориентир из описания не подтверждён'
           : 'центр района или города',
@@ -351,6 +441,7 @@ export async function enrichListingLocation(
     precision: 'none',
     anchorDistanceMeters: 0,
     uncertaintyMeters: 0,
+    outerRadiusMeters: 0,
     source: 'нет данных о месте',
     evidence: unverifiedDescriptionEvidence,
   };

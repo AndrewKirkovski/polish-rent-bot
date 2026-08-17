@@ -17,6 +17,12 @@ import { escapeHtml } from '../utils/html.js';
 
 /** Max links listed per soft category before collapsing the rest into "+N". */
 const SOFT_LINK_CAP = 5;
+/** `amenity` now also covers rejects INFERRED from an approximate location — exactly the ones
+ *  worth eyeballing, since the verdict rests on a region rather than a measured address. Give the
+ *  category more room so they don't all collapse into "+N". */
+const SOFT_LINK_CAP_BY_CATEGORY: Partial<Record<RejectionCategory, number>> = { amenity: 10 };
+
+const softLinkCap = (cat: RejectionCategory): number => SOFT_LINK_CAP_BY_CATEGORY[cat] ?? SOFT_LINK_CAP;
 
 /** Fixed display order → deterministic output (and stable tests). */
 const SOFT_ORDER: RejectionCategory[] = ['budget_max', 'budget_min', 'contract', 'amenity', 'criteria', 'error'];
@@ -62,8 +68,9 @@ export function buildRejectionReport(rows: MonitorRejectionRow[]): string | null
   for (const cat of SOFT_ORDER) {
     const items = byCat.get(cat);
     if (!items || items.length === 0) continue;
-    const shown = items.slice(0, SOFT_LINK_CAP).map(link).join(', ');
-    const extra = items.length > SOFT_LINK_CAP ? ` +${items.length - SOFT_LINK_CAP}` : '';
+    const cap = softLinkCap(cat);
+    const shown = items.slice(0, cap).map(link).join(', ');
+    const extra = items.length > cap ? ` +${items.length - cap}` : '';
     softLines.push(`• ${REJECTION_LABEL[cat]} (${items.length}): ${shown}${extra}`);
   }
   if (softLines.length > 0) {

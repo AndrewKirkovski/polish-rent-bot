@@ -12,8 +12,18 @@ import {
   nearestMetroStations,
   straightLineToCentralnaMeters,
   warsawMetroLinesForStation,
+  haversineMeters,
 } from '../geo/metro.js';
 import type { NearbyMetro, WarsawMetroLine } from '../geo/metro.js';
+import {
+  bandFor,
+  bandIsEmpty,
+  crowMetersFromRoute,
+  routeMetersFromCrow,
+  optimisticMeters,
+  widenPlace,
+  type UncertaintyBand,
+} from '../geo/uncertainty.js';
 
 export type { AmenityResult, CommuteResult, LocationScore } from '../types.js';
 // Metro line membership is now table-driven (verified coordinates); re-export so existing
@@ -33,10 +43,25 @@ export interface AmenityPreference {
 
 export interface LocationEstimateContext {
   precision: LocationPrecision;
+  /** Route metres from the returned point to the apartment; non-zero only for the metro annulus. */
   anchorDistanceMeters: number;
+  /** ~1σ crow-flies uncertainty. Diagnostic only — never the basis of a hard verdict. */
   uncertaintyMeters: number;
+  /** Containing outer bound of the region, in ROUTE metres. All range math derives from this. */
+  outerRadiusMeters: number;
   source: string;
   evidence?: string | null;
+}
+
+/** The band of possible apartment-to-anchor route distances implied by an estimate. */
+function bandForEstimate(estimate?: LocationEstimateContext | null): UncertaintyBand {
+  if (!estimate) return { minMeters: 0, maxMeters: 0 };
+  return bandFor(estimate.anchorDistanceMeters, estimate.outerRadiusMeters);
+}
+
+/** Whether an estimate localizes the flat loosely enough that point measurements need widening. */
+export function estimateNeedsWidening(estimate?: LocationEstimateContext | null): boolean {
+  return !!estimate && !bandIsEmpty(bandForEstimate(estimate));
 }
 
 const API_KEY = process.env.GOOGLE_MAPS_API_KEY ?? '';
@@ -45,8 +70,18 @@ const PLACES_NEW_BASE = 'https://places.googleapis.com/v1';
 const CACHE_TTL_DAYS = 7;
 const SEARCH_RADIUS = 5000; // 5km — OLX coordinates are often district-center, not exact address
 const MAX_PLACES_PER_TYPE = 3;
+/**
+ * How many MEASURED places to keep per amenity type.
+ *
+ * Deliberately larger than MAX_PLACES_PER_TYPE (which stays the offline metro pool size). Once a
+ * coarse location can hard-reject, dropping candidates before the uncertainty ranges are computed
+ * becomes a false-rejection source: for an anchored ("N m from X") location the closest possible
+ * amenity is the one nearest the ring, not the one nearest the anchor. Keeping the whole measured
+ * set lets applyLocationUncertainty re-rank by the derived optimistic edge — and keeps this
+ * function's output independent of any particular region, so the 7-day cache stays reusable.
+ */
+const KEPT_PLACES_PER_TYPE = 10;
 const MAX_LINE_PLACES = 20;
-const MAX_DIRECTIONLESS_ANCHOR_FOR_STRICT_METERS = 3000;
 
 // Warsaw metro station data, coordinates, line membership, and nearest-station search live
 // in ../geo/metro.ts (verified, offline). warsawMetroLinesForStation is imported + re-exported
@@ -123,6 +158,21 @@ export function computeWithinLimit(nearest: NearbyPlace | null, tc: TransportCon
   }
   if (tc.transitFallback && !within && nearest.transitMinutes != null) within = nearest.transitMinutes <= maxMinutes;
   return within;
+}
+
+/**
+ * Whether an AmenityResult is the measurement of THIS preference. Identity is the type plus every
+ * constraint that changes what gets measured — line AND station whitelist. Keying on line alone
+ * let two metro prefs that differ only by whitelist resolve to each other, so a strict "7 min to
+ * one of these 5 stations" pref could be judged against a loose "any metro" measurement.
+ */
+export function matchesAmenityRequest(pref: AmenityPreference, result: { type: string; requestedLine?: 'M1' | 'M2'; requestedStations?: string[] }): boolean {
+  if (pref.type !== result.type) return false;
+  if (pref.type !== 'metro') return true;
+  if (pref.line !== result.requestedLine) return false;
+  const a = pref.stations ?? [];
+  const b = result.requestedStations ?? [];
+  return a.length === b.length && a.every((name, i) => name === b[i]);
 }
 
 /** Incomplete external evidence can confirm a pass, but must never prove rejection. */
@@ -236,10 +286,17 @@ interface DistanceMatrixElement {
   status: string;
 }
 interface DistanceMatrixResponse { rows: Array<{ elements: DistanceMatrixElement[] }>; status: string; error_message?: string }
+interface GeocodeLatLng { lat: number; lng: number }
+interface GeocodeViewport { northeast: GeocodeLatLng; southwest: GeocodeLatLng }
 interface GeocodeResult {
   geometry: {
-    location: { lat: number; lng: number };
+    location: GeocodeLatLng;
     location_type?: string;
+    /** Tight box around the result (present for area-grade results). More honest than a
+     *  guessed radius: a district's real extent instead of a flat 2.5 km assumption. */
+    bounds?: GeocodeViewport;
+    /** Recommended display box. Always present; wider than `bounds` for small results. */
+    viewport?: GeocodeViewport;
   };
   partial_match?: boolean;
   types?: string[];
@@ -254,6 +311,10 @@ export interface GeocodedLocation {
   partialMatch: boolean;
   resultTypes: string[];
   formattedAddress: string | null;
+  /** Half the diagonal of the geocoder's `bounds` box, in CROW metres — a measured radius that
+   *  covers the whole matched area. Undefined when the geocoder returned no bounds (or for a
+   *  cache entry written before this field existed). */
+  areaRadiusMeters?: number;
 }
 
 // Directions API types (for transit frequency)
@@ -285,12 +346,34 @@ interface DirectionsResponse {
 // Geocoding — fallback when listing has no coordinates
 // ---------------------------------------------------------------------------
 
+/**
+ * Crow radius around `origin` that covers the whole box: the largest distance from `origin` to any
+ * corner. NOT half the diagonal — that is the radius about the box's CENTRE, and a geocoder's
+ * `location` is a label point that can sit well off centre for an irregular area, so half-diagonal
+ * would leave the far corner outside the region and overstate the optimistic edge.
+ */
+function boxRadiusMeters(box: GeocodeViewport, origin: GeocodeLatLng): number {
+  const corners: GeocodeLatLng[] = [
+    box.northeast,
+    box.southwest,
+    { lat: box.northeast.lat, lng: box.southwest.lng },
+    { lat: box.southwest.lat, lng: box.northeast.lng },
+  ];
+  return Math.round(Math.max(...corners.map((c) => haversineMeters(origin.lat, origin.lng, c.lat, c.lng))));
+}
+
 export async function geocodeAddress(address: string): Promise<GeocodedLocation | null> {
-  const cacheKey = `geocode2:${hashStr(address)}`;
+  // Cache generation bumped to 3 when areaRadiusMeters was added: a gen-2 entry has no bounds
+  // data, and silently treating that as "no extent" would fall back to the guessed radius for
+  // a week. Bumping re-geocodes once instead.
+  const cacheKey = `geocode3:${hashStr(address)}`;
   const cached = getMapsCacheEntry(cacheKey);
   if (isCacheValid(cached)) return unwrapCache<GeocodedLocation>(cached!);
 
-  const url = `${MAPS_BASE}/geocode/json?address=${encodeURIComponent(address)}&key=${API_KEY}&language=pl`;
+  // components=country:PL keeps a loose street name from matching a same-named place abroad;
+  // a cross-country match would otherwise land >25 km from any Warsaw station and silently
+  // disarm both the metro and the center gate (see METRO_SERVICE_RADIUS_M suppression).
+  const url = `${MAPS_BASE}/geocode/json?address=${encodeURIComponent(address)}&components=country:PL&key=${API_KEY}&language=pl`;
   let res: GeocodeResponse;
   try {
     res = await fetchJson<GeocodeResponse>(url);
@@ -308,6 +391,10 @@ export async function geocodeAddress(address: string): Promise<GeocodedLocation 
 
   const first = res.results[0];
   const loc = first.geometry.location;
+  // Prefer `bounds` (the tight box around the matched feature) over `viewport` (a display box
+  // padded to a minimum size even for a single building) so a street address doesn't inherit a
+  // few-hundred-metre radius it doesn't have.
+  const box = first.geometry.bounds ?? null;
   const result: GeocodedLocation = {
     lat: loc.lat,
     lng: loc.lng,
@@ -315,6 +402,7 @@ export async function geocodeAddress(address: string): Promise<GeocodedLocation 
     partialMatch: first.partial_match === true,
     resultTypes: first.types ?? [],
     formattedAddress: first.formatted_address ?? null,
+    ...(box ? { areaRadiusMeters: boxRadiusMeters(box, loc) } : {}),
   };
   setMapsCacheEntry(cacheKey, wrapCache(result));
   return result;
@@ -467,6 +555,14 @@ function formatRuMeters(m: number): string {
   return `${(m / 1000).toFixed(1).replace('.', ',')} км`;
 }
 
+/** Uncertainty radius for display: "±650 м" / "±1,8 км". Shared by the card warning and the
+ *  rejection reasons so both quote the same number. */
+export function formatRuRadius(meters: number): string {
+  return meters >= 1000
+    ? `${(meters / 1000).toLocaleString('ru-RU', { maximumFractionDigits: 1 })} км`
+    : `${Math.round(meters)} м`;
+}
+
 /** Localize a Google distance string ("4,2 km" / "850 m") to Russian units. */
 function ruDistanceText(text: string): string {
   return text.replace(/\bkm\b/i, 'км').replace(/\bm\b/i, 'м');
@@ -482,40 +578,68 @@ function offlineMetroPlace(n: NearbyMetro, requestedLine?: WarsawMetroLine): Nea
   };
 }
 
-/** Metro AmenityResult computed offline: nearest station on the requested whitelist, else line, else any. */
-function offlineMetroAmenity(lat: number, lng: number, pref: AmenityPreference): AmenityResult {
-  let near = nearestMetroStations(lat, lng, { line: pref.line, stations: pref.stations, limit: MAX_PLACES_PER_TYPE });
+/** Metro AmenityResult computed offline: nearest station on the requested whitelist, else line, else any.
+ *  `band` (when the location is uncertain) changes WHICH stations are kept: the closest station by
+ *  optimistic edge is not the closest by raw distance once the region is an annulus, so the pool is
+ *  ranked by the edge before truncation. The table is small (38 stations) — ranking the whole pool
+ *  costs nothing and removes the truncation blind spot entirely. */
+function offlineMetroAmenity(
+  lat: number,
+  lng: number,
+  pref: AmenityPreference,
+  band: UncertaintyBand,
+): AmenityResult {
+  // Rank over the FULL pool, then truncate — see the note above.
+  const pool = nearestMetroStations(lat, lng, { line: pref.line, stations: pref.stations, limit: Infinity });
   // A whitelist that resolved to ZERO known stations (every name mistyped / not in the verified
   // table) must not turn every candidate into a false "метро рядом не найдено" reject. Fall back to
-  // the requested line (else all stations) so the gate still judges against a real nearest station.
-  if (near.length === 0 && pref.stations && pref.stations.length > 0) {
-    near = nearestMetroStations(lat, lng, { line: pref.line, limit: MAX_PLACES_PER_TYPE });
+  // the requested line (else all stations) so the card still shows a real station — but flag the
+  // substitution: the gate must never HARD-REJECT against a criterion the user didn't ask for.
+  const whitelistUnresolved = pool.length === 0 && !!pref.stations && pref.stations.length > 0;
+  const near = whitelistUnresolved
+    ? nearestMetroStations(lat, lng, { line: pref.line, limit: Infinity })
+    : pool;
+  if (whitelistUnresolved) {
+    console.warn(`[maps] Metro whitelist resolved to no known stations (${pref.stations!.join(', ')}) — judging against ${pref.line ?? 'all lines'} and flagging the verdict as unknown`);
   }
-  const places = near.map((n) => offlineMetroPlace(n, pref.line));
+  const ranked = [...near].sort((a, b) =>
+    optimisticMeters(a.walkMeters, band) - optimisticMeters(b.walkMeters, band)
+    || a.crowMeters - b.crowMeters);
+  const places = ranked.slice(0, MAX_PLACES_PER_TYPE).map((n) => offlineMetroPlace(n, pref.line));
   const nearest = places[0] ?? null;
-  // Out of the Warsaw metro service area (a non-Warsaw listing carrying a metro pref): the nearest
-  // "Warsaw" station is 100+ km away. Treat metro as UNKNOWN (keep-with-flag) rather than a confident
-  // hard reject naming a station ~250 km away — mirrors the inMetroArea suppression in scoreLocation.
-  const outOfArea = near.length > 0 && near[0].crowMeters > METRO_SERVICE_RADIUS_M;
+  // Out of the Warsaw metro service area — a listing in ANOTHER CITY that carries a metro pref: the
+  // nearest Warsaw station is 100+ km away. Treat metro as UNKNOWN rather than a confident hard
+  // reject naming a station ~250 km away; mirrors the inMetroArea suppression in scoreLocation.
+  //
+  // Measured against the UNRESTRICTED table, not the whitelist/line pool. Using the filtered pool
+  // conflated "this listing isn't in Warsaw" with "this Warsaw listing is far from the one station
+  // the user allows" — and the second case is exactly what the user wants rejected.
+  const outOfArea = (nearestMetroStations(lat, lng, { limit: 1 })[0]?.crowMeters ?? Infinity) > METRO_SERVICE_RADIUS_M;
   const withinLimit = !outOfArea && nearest != null && nearest.walkingMinutes <= pref.maxMinutes;
-  return { type: 'metro', requestedLine: pref.line, places, nearest, withinLimit, uncertain: outOfArea || undefined };
+  return {
+    type: 'metro',
+    requestedLine: pref.line,
+    requestedStations: pref.stations,
+    places,
+    nearest,
+    withinLimit,
+    // Mutually exclusive with withinLimit — the amenity score treats them as separate buckets, so a
+    // result in both would count more than once. (outOfArea already forces withinLimit false; a
+    // substituted whitelist does not, and a substituted station CAN be within limit.)
+    uncertain: (!withinLimit && (outOfArea || whitelistUnresolved)) || undefined,
+    ...(whitelistUnresolved ? { criterionSubstituted: true } : {}),
+  };
 }
 
-/** Expand one place's point distance into a ± range using the anchor uncertainty. Order-preserving:
+/** Expand one place's point distance into a ± range using the uncertainty band. Order-preserving:
  *  unlike applyLocationUncertainty (which re-sorts by the derived range for gate selection), this
  *  keeps the input's nearest-first-by-true-distance order for display. */
-function expandPlaceRange(place: NearbyPlace, radiusMin: number, radiusMax: number): NearbyPlace {
+function expandPlaceRange(place: NearbyPlace, band: UncertaintyBand): NearbyPlace {
   if (place.walkingMinutes < 0) return place;
-  const baseMeters = place.distanceMeters ?? place.walkingMinutes * 75;
-  const minMeters = baseMeters < radiusMin
-    ? radiusMin - baseMeters
-    : baseMeters > radiusMax ? baseMeters - radiusMax : 0;
-  const maxMeters = baseMeters + radiusMax;
-  const metersPerMinute = place.walkingMinutes > 0 && baseMeters > 0 ? baseMeters / place.walkingMinutes : 75;
+  const baseMeters = place.distanceMeters ?? place.walkingMinutes * WALK_METERS_PER_MINUTE;
   return {
     ...place,
-    walkingMinutesRange: { min: Math.max(0, Math.floor(minMeters / metersPerMinute)), max: Math.max(1, Math.ceil(maxMeters / metersPerMinute)) },
-    distanceMetersRange: { min: minMeters, max: maxMeters },
+    ...widenPlace(baseMeters, place.walkingMinutes, band),
     approximate: true,
   };
 }
@@ -528,10 +652,9 @@ export function metroNearestWithUncertainty(
 ): NearbyPlace[] {
   // nearestMetroStations returns nearest-first by true distance — preserve that order for display.
   const raw = nearestMetroStations(lat, lng, { limit: 2 }).map((n) => offlineMetroPlace(n));
-  if (!estimate || (estimate.uncertaintyMeters <= 0 && estimate.anchorDistanceMeters <= 0)) return raw;
-  const radiusMin = Math.max(0, estimate.anchorDistanceMeters - estimate.uncertaintyMeters);
-  const radiusMax = estimate.anchorDistanceMeters + estimate.uncertaintyMeters;
-  return raw.map((p) => expandPlaceRange(p, radiusMin, radiusMax));
+  if (!estimateNeedsWidening(estimate)) return raw;
+  const band = bandForEstimate(estimate);
+  return raw.map((p) => expandPlaceRange(p, band));
 }
 
 /**
@@ -539,25 +662,137 @@ export function metroNearestWithUncertainty(
  * returned as a min-based range. Falls back to an offline straight-line distance (no time)
  * if the routing API fails — never a fabricated time.
  */
+/** Fastest plausible public transport, door to door, including access and waiting: ~35 km/h.
+ *  A lower bound on minutes per crow-flies kilometre — nothing in Warsaw beats this. */
+const MIN_TRANSIT_MINUTES_PER_KM = 1.7;
+/** A trip only contains so much walking, so displacing the origin can only save so much time.
+ *  Without this cap the old `radius / walking-pace` model subtracted 33 min for a 2.5 km radius
+ *  and the center gate could never fire. */
+const MAX_WALK_SAVINGS_MINUTES = 12;
+/** Above this outer radius (route metres) we stop modelling the optimistic edge and MEASURE it
+ *  with a second route from the centre-facing edge of the region. */
+const MEASURE_EDGE_ABOVE_METERS = 800;
+/** A point inside the region may be better connected than the centre-facing edge point we measured
+ *  — a metro station sitting in the region away from the centre beats a nearer bus-only spot — so
+ *  the measured edge time is NOT itself a lower bound. Allowance grows with the region, because a
+ *  bigger region holds more chances of a faster link, and is capped so it can't erase the gate. */
+const EDGE_SLACK_BASE_MINUTES = 5;
+const EDGE_SLACK_PER_KM_MINUTES = 2;
+const EDGE_SLACK_CAP_MINUTES = 15;
+
+/**
+ * Optimistic minutes to the centre WITHOUT a second measurement: the centroid's measured time less
+ * a bounded walking saving, floored by what transit can physically achieve over the straight-line
+ * distance that remains. The floor is what stops the old unbounded `radius / walking-pace`
+ * subtraction from driving `min` to 1 and disabling the gate.
+ */
+export function modelledOptimisticCenter(
+  base: number,
+  reach: number,
+  edgeCrowMeters: number,
+  baseIsAchievable: boolean,
+): number {
+  const saving = Math.min(MAX_WALK_SAVINGS_MINUTES, Math.ceil(reach / WALK_METERS_PER_MINUTE));
+  const physicalFloor = Math.ceil((edgeCrowMeters / 1000) * MIN_TRANSIT_MINUTES_PER_KM);
+  const modelled = Math.max(1, physicalFloor, base - saving);
+  // When the measured point is itself a position the flat could occupy (any disc-shaped region),
+  // `base` caps the regional optimum: the floor's 35 km/h assumption must not override a real
+  // measurement wherever transit actually beats it — the long suburban-rail corridors do — or a
+  // listing gets rejected for a journey the very same call measured as within the limit.
+  //
+  // For an ANNULUS the anchor is a station the flat is explicitly NOT at (the ring has a hole), so
+  // `base` is not achievable and capping by it would understate the optimum instead.
+  return baseIsAchievable ? Math.max(1, Math.min(base, modelled)) : modelled;
+}
+
+/**
+ * Move `crowMeters` from (lat,lng) along the ray toward (toLat,toLng), PAST the destination if that
+ * is how far we were asked to go.
+ *
+ * Overshoot is required, not a quirk: when the destination lies inside an annulus's hole, the ring
+ * point closest to it sits on this same ray BEYOND it (for a circle of radius R about S and a point
+ * P inside with |SP| = d, the nearest ring point is at R along S→P, i.e. R − d past P). Clamping at
+ * the destination would silently return the destination itself, and routing it to itself yields ~0
+ * minutes — which reads as "no limit is enforceable" for precisely the listings we mean to judge.
+ */
+export function pointToward(lat: number, lng: number, toLat: number, toLng: number, crowMeters: number): { lat: number; lng: number } {
+  const total = haversineMeters(lat, lng, toLat, toLng);
+  if (total <= 0) return { lat, lng };
+  const f = crowMeters / total;
+  return { lat: lat + (toLat - lat) * f, lng: lng + (toLng - lng) * f };
+}
+
 export async function centralStationEstimate(
   lat: number,
   lng: number,
   approximate = false,
-  uncertaintyMeters = 0,
+  outerRadiusMeters = 0,
   anchorDistanceMeters = 0,
 ): Promise<CentralStationEstimate> {
+  const departure = getNextMondayWarsawTs(11);
   try {
-    const c = await calculateCommute(lat, lng, WARSZAWA_CENTRALNA.address, 'transit', getNextMondayWarsawTs(11));
+    const c = await calculateCommute(lat, lng, WARSZAWA_CENTRALNA.address, 'transit', departure);
     const base = c.durationMinutes;
-    // For an uncertain location the true door-to-door time straddles `base`: widen the range BOTH
-    // ways so the min is genuinely optimistic. checkCenterGate rejects only when even the optimistic
-    // min exceeds the limit, so a symmetric range keeps borderline approximate flats (with a ⚠️).
-    // Fold in anchorDistanceMeters too: on the metro-annulus path (localized only as "N m from
-    // Metro X") base is measured from the STATION, and the flat sits `anchorDistanceMeters` away —
-    // so the optimistic min must account for that offset as well, matching the metro/amenity ranges.
-    const extra = approximate ? Math.ceil((anchorDistanceMeters + uncertaintyMeters) / WALK_METERS_PER_MINUTE) : 0;
-    const min = Math.max(1, base - extra);
-    const max = Math.max(min + 1, Math.ceil(base * 1.25) + extra);
+    if (!approximate) {
+      return { distanceText: ruDistanceText(c.distance), durationMinRange: { min: base, max: Math.max(base + 1, Math.ceil(base * 1.25)) } };
+    }
+
+    // Where the apartment may be, relative to this point. Derived through the SAME band the amenity
+    // ranges use, so a ring is treated as a ring: collapsing an annulus to a disc of radius
+    // (anchor + outer) would claim a flat "4 km from Centrum" could be next to Centralna, when the
+    // ring's inner radius puts it at least ~2.6 km away in every direction.
+    const band = bandFor(anchorDistanceMeters, outerRadiusMeters);
+    const routeToCentralna = routeMetersFromCrow(straightLineToCentralnaMeters(lat, lng));
+    // Closest the flat could be to Centralna, and hence how far it still has to travel.
+    const edgeCrowMeters = crowMetersFromRoute(optimisticMeters(routeToCentralna, band));
+    // Region reaches Centralna → the flat could be next door to it, so no limit is enforceable.
+    // Short-circuit rather than pay for a Centralna→Centralna route that only returns ZERO_RESULTS.
+    const containsCentralna = edgeCrowMeters <= 0;
+    // Displace along the ray to Centralna by the band-clamped distance, landing on the closest
+    // position the flat could occupy. For a disc that is min(distance, radius) — the previous
+    // behaviour; for a ring it lands ON the ring, whether Centralna is outside it or (via
+    // pointToward's deliberate overshoot) inside its hole.
+    const reach = outerRadiusMeters + anchorDistanceMeters;
+    const displacementCrow = crowMetersFromRoute(
+      Math.min(band.maxMeters, Math.max(band.minMeters, routeToCentralna)),
+    );
+    // Whether the measured point is itself a place the flat could be. False for an annulus, whose
+    // inner radius excludes the anchor — so its measured time can't cap the regional optimum.
+    const baseIsAchievable = band.minMeters <= 0;
+
+    let min: number;
+    if (reach > MEASURE_EDGE_ABOVE_METERS && !containsCentralna) {
+      // MEASURE the optimistic edge: route again from the centre-facing edge of the region. A real
+      // transit time for the most favourable position, instead of subtracting walking-pace minutes
+      // from a transit time — which is what made this gate inoperative for coarse locations.
+      const edge = pointToward(lat, lng, WARSZAWA_CENTRALNA.lat, WARSZAWA_CENTRALNA.lng, displacementCrow);
+      const slack = Math.min(
+        EDGE_SLACK_CAP_MINUTES,
+        EDGE_SLACK_BASE_MINUTES + Math.ceil((displacementCrow / 1000) * EDGE_SLACK_PER_KM_MINUTES),
+      );
+      try {
+        const ec = await calculateCommute(edge.lat, edge.lng, WARSZAWA_CENTRALNA.address, 'transit', departure);
+        // A MEASURED route is stronger evidence than any model, so it is NOT floored by
+        // MIN_TRANSIT_MINUTES_PER_KM: the floor describes this very point, and letting a constant
+        // override a real measurement of it would reject listings with a genuinely fast link
+        // (suburban rail beats the 35 km/h assumption on the long corridors).
+        min = Math.max(1, ec.durationMinutes - slack);
+      } catch (err) {
+        // Edge routing failed while the centroid succeeded: fall back to the modelled saving rather
+        // than pretending the centroid time is the regional optimum.
+        console.warn('[maps] Centralna edge estimate failed, falling back to modelled savings:', err instanceof Error ? err.message : err);
+        min = modelledOptimisticCenter(base, reach, edgeCrowMeters, baseIsAchievable);
+      }
+    } else if (containsCentralna) {
+      min = 1;
+    } else {
+      min = modelledOptimisticCenter(base, reach, edgeCrowMeters, baseIsAchievable);
+    }
+
+    // Display-only upper bound. The walking-savings term is capped like the modelled min so a wide
+    // region doesn't render an uninformative "~8–109 мин" on the card.
+    const spread = Math.min(MAX_WALK_SAVINGS_MINUTES, Math.ceil(reach / WALK_METERS_PER_MINUTE));
+    const max = Math.max(min + 1, Math.ceil(base * 1.25) + spread);
     return { distanceText: ruDistanceText(c.distance), durationMinRange: { min, max } };
   } catch (err) {
     console.error('[maps] Centralna estimate failed:', err instanceof Error ? err.message : err);
@@ -576,13 +811,17 @@ export async function findNearbyAmenities(
   lat: number,
   lng: number,
   amenityPrefs: AmenityPreference[],
+  estimate?: LocationEstimateContext,
 ): Promise<AmenityResult[]> {
   const results: AmenityResult[] = [];
+  // The metro pool must be ranked by the optimistic edge, which depends on the region — so the
+  // estimate has to reach this far down, not just the later widening pass.
+  const band = bandForEstimate(estimate);
 
   for (const pref of amenityPrefs) {
     // Metro is deterministic and offline — nearest station(s) from the verified table.
     if (pref.type === 'metro') {
-      results.push(offlineMetroAmenity(lat, lng, pref));
+      results.push(offlineMetroAmenity(lat, lng, pref, band));
       continue;
     }
 
@@ -595,7 +834,9 @@ export async function findNearbyAmenities(
 
     const tc = getTransportConfig(pref.type);
     const requestedMetroLine = pref.type === 'metro' ? pref.line : undefined;
-    const cacheKey = `nearby9:${roundCoord(lat)}:${roundCoord(lng)}:${pref.type}:${requestedMetroLine ?? 'any'}`;
+    // Generation 10: the kept-place set changed (distance-sorted before truncation, and more of it
+    // retained), so gen-9 entries would serve a top-3 chosen by the old insertion-order slice.
+    const cacheKey = `nearby10:${roundCoord(lat)}:${roundCoord(lng)}:${pref.type}:${requestedMetroLine ?? 'any'}`;
     const cached = getMapsCacheEntry(cacheKey);
     if (isCacheValid(cached)) {
       const r = unwrapCache<AmenityResult>(cached!);
@@ -696,9 +937,15 @@ export async function findNearbyAmenities(
     }
 
     // ---- B. Measure distances ----
-    // Filter to places with valid location FIRST — keeps placesArr[i] aligned with elements[i]
+    // Filter to places with valid location FIRST — keeps placesArr[i] aligned with elements[i].
+    // Sort by straight-line distance BEFORE truncating: `allPlaces` is a Map in search-group
+    // insertion order, so a bare slice kept only the first group — for groceries that meant ten
+    // supermarkets up to 5 km away while a convenience store 80 m away was never measured.
     const placesArr = eligiblePlaces
       .filter(p => p.location != null)
+      .sort((a, b) =>
+        haversineMeters(lat, lng, a.location!.latitude, a.location!.longitude)
+        - haversineMeters(lat, lng, b.location!.latitude, b.location!.longitude))
       .slice(0, requestedMetroLine ? MAX_LINE_PLACES : 10);
     const destinations = placesArr
       .map(p => `${p.location!.latitude},${p.location!.longitude}`)
@@ -707,9 +954,14 @@ export async function findNearbyAmenities(
     let nearbyPlaces: NearbyPlace[] = [];
     // Track Distance-Matrix failures so a transient DM error isn't cached for 7 days as a
     // false "amenity not reachable" (which would poison the card, fit-score and strict gate).
-    // A place without coordinates cannot be measured and might be the closer option.
-    // Preserve that incompleteness so an over-limit result remains UNKNOWN.
-    let hadDistanceError = placesArr.length < eligiblePlaces.length;
+    //
+    // Only UNMEASURABLE places count as incompleteness. A place without coordinates might have been
+    // the closer option, so it keeps an over-limit result UNKNOWN. The distance CAP does not: the
+    // pool is now sorted by distance first, so everything dropped is strictly farther than what we
+    // kept and cannot change a proximity verdict. Comparing against the pre-cap pool size made this
+    // permanently true for every multi-group type (groceries searches 3 types × 10 results), which
+    // silently turned every over-limit grocery/gym/pool verdict into a keep-with-flag.
+    let hadDistanceError = eligiblePlaces.some((p) => p.location == null);
 
     // B1. Walking distances (for most amenities)
     if (tc.walking && destinations) {
@@ -753,7 +1005,7 @@ export async function findNearbyAmenities(
 
       nearbyPlaces = nearbyPlaces.filter(p => p.walkingMinutes >= 0);
       nearbyPlaces.sort((a, b) => a.walkingMinutes - b.walkingMinutes);
-      nearbyPlaces = nearbyPlaces.slice(0, requestedMetroLine ? MAX_LINE_PLACES : MAX_PLACES_PER_TYPE);
+      nearbyPlaces = nearbyPlaces.slice(0, requestedMetroLine ? MAX_LINE_PLACES : KEPT_PLACES_PER_TYPE);
     }
 
     // B2. Transit distances (airport always, groceries as fallback)
@@ -800,7 +1052,7 @@ export async function findNearbyAmenities(
                 const existing = nearbyPlaces.find(p => p.name === (placesArr[i].displayName?.text ?? 'Unknown'));
                 if (existing) {
                   existing.transitMinutes = transitMins;
-                } else if (nearbyPlaces.length < MAX_PLACES_PER_TYPE) {
+                } else if (nearbyPlaces.length < KEPT_PLACES_PER_TYPE) {
                   nearbyPlaces.push({
                     name: placesArr[i].displayName?.text ?? 'Unknown',
                     walkingMinutes: -1,
@@ -857,7 +1109,7 @@ export async function findNearbyAmenities(
     if (!tc.walking) {
       nearbyPlaces.sort((a, b) => (a.transitMinutes ?? 999) - (b.transitMinutes ?? 999));
     }
-    nearbyPlaces = nearbyPlaces.slice(0, requestedMetroLine ? MAX_LINE_PLACES : MAX_PLACES_PER_TYPE);
+    nearbyPlaces = nearbyPlaces.slice(0, requestedMetroLine ? MAX_LINE_PLACES : KEPT_PLACES_PER_TYPE);
 
     // ---- C. Transit frequency for nearest stop (metro/tram/bus) ----
     if (tc.checkFrequency && nearbyPlaces.length > 0) {
@@ -953,35 +1205,29 @@ export async function calculateCommute(
 // scoreLocation — orchestrates amenity search + commute, computes score
 // ---------------------------------------------------------------------------
 
-/** Expand point-based Google distances by the uncertainty of a description-derived anchor. */
+/**
+ * Expand point-based Google distances into honest ranges for a loosely localized flat.
+ *
+ * The `min` of each range is the OPTIMISTIC EDGE — the closest the flat could possibly be — and
+ * the gates hard-reject when even that violates the user's limit. So this function decides
+ * deletions: `min` must be a true lower bound (all the geometry lives in geo/uncertainty.ts,
+ * in one unit), and `uncertain` must mean "the range straddles the limit", never "the evidence
+ * was coarse". Coarseness is what the range already expresses.
+ */
 export function applyLocationUncertainty(
   amenities: AmenityResult[],
   amenityPrefs: AmenityPreference[],
-  uncertaintyMeters: number,
+  outerRadiusMeters: number,
   anchorDistanceMeters = 0,
 ): AmenityResult[] {
-  if (uncertaintyMeters <= 0 && anchorDistanceMeters <= 0) return amenities;
-  const radiusMin = Math.max(0, anchorDistanceMeters - uncertaintyMeters);
-  const radiusMax = anchorDistanceMeters + uncertaintyMeters;
-  const anchorTooBroadForStrictVerdict = anchorDistanceMeters > MAX_DIRECTIONLESS_ANCHOR_FOR_STRICT_METERS;
+  const band = bandFor(anchorDistanceMeters, outerRadiusMeters);
+  if (bandIsEmpty(band)) return amenities;
 
   return amenities.map((amenity) => {
     const places = amenity.places.map((place) => {
       if (place.walkingMinutes < 0) return place;
-      const baseMeters = place.distanceMeters ?? place.walkingMinutes * 75;
-      const minMeters = baseMeters < radiusMin
-        ? radiusMin - baseMeters
-        : baseMeters > radiusMax ? baseMeters - radiusMax : 0;
-      const maxMeters = baseMeters + radiusMax;
-      const observedMetersPerMinute = place.walkingMinutes > 0 && baseMeters > 0
-        ? baseMeters / place.walkingMinutes
-        : 75;
-      const walkingMinutesRange = {
-        min: Math.max(0, Math.floor(minMeters / observedMetersPerMinute)),
-        max: Math.max(1, Math.ceil(maxMeters / observedMetersPerMinute)),
-      };
-      const distanceMetersRange = { min: minMeters, max: maxMeters };
-      return { ...place, walkingMinutesRange, distanceMetersRange, approximate: true };
+      const baseMeters = place.distanceMeters ?? place.walkingMinutes * WALK_METERS_PER_MINUTE;
+      return { ...place, ...widenPlace(baseMeters, place.walkingMinutes, band), approximate: true };
     }).sort((a, b) => {
       const aRange = a.distanceMetersRange;
       const bRange = b.distanceMetersRange;
@@ -990,9 +1236,7 @@ export function applyLocationUncertainty(
       }
       return a.walkingMinutes - b.walkingMinutes;
     });
-    const pref = amenityPrefs.find((candidate) =>
-      candidate.type === amenity.type &&
-      (candidate.type !== 'metro' || candidate.line === amenity.requestedLine));
+    const pref = amenityPrefs.find((candidate) => matchesAmenityRequest(candidate, amenity));
     const ranges = places
       .map((place) => place.walkingMinutesRange)
       .filter((range): range is { min: number; max: number } => range != null);
@@ -1002,8 +1246,22 @@ export function applyLocationUncertainty(
       // not a confirmed absence. (A confirmed exact-location empty scores 0 in the non-anchored path.)
       return { ...amenity, places, nearest: null, withinLimit: false, uncertain: true };
     }
-    if (!pref || ranges.length === 0) {
+    if (!pref) {
       return { ...amenity, places, nearest: places[0] ?? null };
+    }
+    if (ranges.length === 0) {
+      // Transit/driving-only types (airport) carry no walking range, so there is nothing to widen
+      // and the point measurement survives. That point sits at the anchor, not at the flat, so an
+      // over-limit verdict here is not evidence about the flat — keep it UNKNOWN rather than let a
+      // coarse anchor hard-reject on an un-widened number.
+      const pointWithin = computeWithinLimit(places[0] ?? null, getTransportConfig(amenity.type), pref.maxMinutes);
+      return {
+        ...amenity,
+        places,
+        nearest: places[0] ?? null,
+        withinLimit: pointWithin,
+        uncertain: pointWithin ? undefined : true,
+      };
     }
     // Transit fallback (groceries): a place reachable by transit within the limit is within-limit
     // regardless of the widened WALKING range — mirrors computeWithinLimit on the point-based path.
@@ -1020,13 +1278,26 @@ export function applyLocationUncertainty(
     const withinLimit = ranges.some((range) => range.max <= pref.maxMinutes) || transitPlace != null || transitWithinLimit;
     // `uncertain` must be MUTUALLY EXCLUSIVE with `withinLimit` — the amenities score counts them as
     // separate buckets (within=1, uncertain=0.5), so an amenity in both double-counts (>1.0). Gate the
-    // whole expression on !withinLimit. Also fold in an ALREADY-SET amenity.uncertain (e.g. an
-    // out-of-service-area metro flagged by offlineMetroAmenity) so it survives this recompute as
-    // keep-with-flag instead of collapsing to a false hard reject.
+    // whole expression on !withinLimit.
+    //
+    // The ONLY reasons to withhold a verdict are: the measurement itself failed or was incomplete
+    // (`error`), the criterion we measured isn't the one requested (`amenity.uncertain` from
+    // offlineMetroAmenity — out-of-service-area or an unresolvable whitelist), or the range genuinely
+    // straddles the limit. A merely COARSE anchor is not a reason: the range already carries the
+    // coarseness, and its optimistic edge is a real lower bound. (A `MAX_DIRECTIONLESS_ANCHOR`
+    // override used to force uncertainty here for large anchors, which kept flats whose closest
+    // possible position was still far outside the limit.)
+    //
+    // One more genuine unknown: for an ANNULUS (`band.minMeters > 0`, i.e. localized only as "N m
+    // from X"), a Google-searched pool was collected AROUND THE ANCHOR and capped by distance from
+    // it, so the amenity nearest where the flat could actually be was never measured. Rejecting on
+    // that pool would be rejecting on the wrong search centre. Metro is exempt: its pool is the
+    // complete offline station table, already ranked by the optimistic edge.
+    const poolCentredOnWrongPoint = band.minMeters > 0 && amenity.type !== 'metro';
     const uncertain = !withinLimit && (
       amenity.error === true
       || amenity.uncertain === true
-      || anchorTooBroadForStrictVerdict
+      || poolCentredOnWrongPoint
       || ranges.some((range) => range.min <= pref.maxMinutes)
     );
     const representative = withinLimit
@@ -1064,7 +1335,10 @@ export function createUnknownLocationScore(
   return {
     amenities: amenityPrefs.map((pref) => ({
       type: pref.type,
+      // Mirror the full request identity (line AND whitelist) so matchesAmenityRequest can pair a
+      // pref with its placeholder result — otherwise the gate reads it as "criterion not measured".
       requestedLine: pref.type === 'metro' ? pref.line : undefined,
+      requestedStations: pref.type === 'metro' ? pref.stations : undefined,
       places: [],
       nearest: null,
       withinLimit: false,
@@ -1092,24 +1366,24 @@ export async function scoreLocation(
 ): Promise<LocationScore> {
   console.log(`[maps] Scoring location ${lat},${lng} for ${amenityPrefs.length} amenities`);
 
-  const pointAmenities = await findNearbyAmenities(lat, lng, amenityPrefs);
-  const amenities = estimate && (estimate.uncertaintyMeters > 0 || estimate.anchorDistanceMeters > 0)
+  const pointAmenities = await findNearbyAmenities(lat, lng, amenityPrefs, estimate);
+  const amenities = estimateNeedsWidening(estimate)
     ? applyLocationUncertainty(
         pointAmenities,
         amenityPrefs,
-        estimate.uncertaintyMeters,
-        estimate.anchorDistanceMeters,
+        estimate!.outerRadiusMeters,
+        estimate!.anchorDistanceMeters,
       )
     : pointAmenities;
 
   const approximate = !!estimate && estimate.precision !== 'exact' && estimate.precision !== 'street';
   // The center-time widening must follow the SAME positional uncertainty the amenity gate + metro
-  // card use (any uncertaintyMeters/anchorDistanceMeters > 0, INCLUDING street precision's ±50-200 m),
-  // not the coarser `approximate` flag. Otherwise a street-precision flat gets lenient amenity gates
-  // but a firm, un-widened center gate for the identical uncertainty — inconsistently hard-rejecting a
+  // card use (any non-empty region, INCLUDING street precision's ±50-200 m), not the coarser
+  // `approximate` flag. Otherwise a street-precision flat gets lenient amenity gates but a firm,
+  // un-widened center gate for the identical uncertainty — inconsistently hard-rejecting a
   // borderline flat whose true transit time to Centralna is within the limit. (The triangle warning
   // stays on `approximate` so a street flat isn't labelled "примерная локация".)
-  const widenCenter = !!estimate && (estimate.uncertaintyMeters > 0 || estimate.anchorDistanceMeters > 0);
+  const widenCenter = estimateNeedsWidening(estimate);
 
   // Always-present card content: 2 nearest stations + transit time to Warszawa Centralna — but
   // only inside the Warsaw metro service area. For a listing in another city (multi-city search),
@@ -1119,7 +1393,7 @@ export async function scoreLocation(
   const inMetroArea = nearestStation != null && nearestStation.crowMeters <= METRO_SERVICE_RADIUS_M;
   const metroNearest = inMetroArea ? metroNearestWithUncertainty(lat, lng, estimate) : [];
   const centralStation = inMetroArea
-    ? await centralStationEstimate(lat, lng, widenCenter, estimate?.uncertaintyMeters ?? 0, estimate?.anchorDistanceMeters ?? 0)
+    ? await centralStationEstimate(lat, lng, widenCenter, estimate?.outerRadiusMeters ?? 0, estimate?.anchorDistanceMeters ?? 0)
     : null;
 
   let commute: CommuteResult | null = null;
@@ -1135,9 +1409,10 @@ export async function scoreLocation(
   const uncertain = amenities.filter(a => a.uncertain && !a.withinLimit).length;
   const overallScore = total === 0 ? 100 : Math.min(100, Math.round(((met + uncertain * 0.5) / total) * 100));
 
-  const uncertaintyText = estimate && estimate.uncertaintyMeters >= 1000
-    ? `${(estimate.uncertaintyMeters / 1000).toLocaleString('ru-RU', { maximumFractionDigits: 1 })} км`
-    : `${estimate?.uncertaintyMeters ?? 0} м`;
+  // Show the radius the GATES enforce against (the containing outer bound), not the tighter ~1σ —
+  // otherwise the card advertises a precision the reject reasons don't use.
+  const shownRadius = estimate?.outerRadiusMeters ?? 0;
+  const uncertaintyText = formatRuRadius(shownRadius);
   const locationWarning = approximate
     ? `примерная локация: ${estimate!.source}, погрешность ±${uncertaintyText}`
     : undefined;
@@ -1152,5 +1427,6 @@ export async function scoreLocation(
     precision: estimate?.precision,
     locationWarning,
     locationEvidence: estimate?.evidence ?? undefined,
+    locationOuterRadiusMeters: estimate?.outerRadiusMeters,
   };
 }

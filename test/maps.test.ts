@@ -179,7 +179,7 @@ test('metroNearestWithUncertainty keeps the truly-nearest station first when anc
   // (Politechnika range-min 900 > Pole Mokotowskie range-min 0), which previously reordered
   // the display. The nearest station must still be shown first.
   const places = metroNearestWithUncertainty(52.21866, 21.01530, {
-    precision: 'approximate', anchorDistanceMeters: 1500, uncertaintyMeters: 600, source: 't',
+    precision: 'approximate', anchorDistanceMeters: 1500, uncertaintyMeters: 600, outerRadiusMeters: 600, source: 't',
   });
   assert.equal(places[0]!.name, 'Politechnika');
   assert.ok(places[0]!.distanceMetersRange, 'ranges applied when approximate');
@@ -257,7 +257,9 @@ test('description-anchor uncertainty produces conservative distance and time ran
     withinLimit: true,
   }], [{ type: 'metro', maxMinutes: 7 }], 150, 1000);
   assert.deepEqual(result.nearest?.distanceMetersRange, { min: 849, max: 1151 });
-  assert.deepEqual(result.nearest?.walkingMinutesRange, { min: 11, max: 16 });
+  // A 1 m / 0 min measurement carries no usable pace, so the shared walk model (78 m/min) converts
+  // the widened distances — not the 75 m/min literal this file used to hardcode.
+  assert.deepEqual(result.nearest?.walkingMinutesRange, { min: 10, max: 15 });
   assert.equal(result.withinLimit, false);
   assert.equal(result.uncertain, false);
 });
@@ -271,7 +273,10 @@ test('uncertainty time range preserves Google measured route pace', () => {
     withinLimit: false,
   }], [{ type: 'metro', maxMinutes: 15, line: 'M1' }], 300);
 
-  assert.deepEqual(result.nearest?.walkingMinutesRange, { min: 6, max: 18 });
+  // The two ends bracket the pace: `max` keeps the slow measured route (600 m in 12 min = 50 m/min),
+  // while `min` uses the walk model — the closest possible position is a different, shorter route
+  // that has no reason to inherit this one's detours.
+  assert.deepEqual(result.nearest?.walkingMinutesRange, { min: 3, max: 18 });
   assert.equal(result.uncertain, true);
 });
 
@@ -336,17 +341,21 @@ test('any plausible station crossing the limit keeps the result uncertain', () =
 });
 
 test('displayed station is the candidate that proves a certain within-limit verdict', () => {
+  // 'Ambiguous' sorts first (smaller optimistic edge) but its range straddles the 7-min limit;
+  // 'Reliably close' is farther yet walks faster, so its whole range fits — that is the candidate
+  // the verdict rests on, so it must be the one displayed.
   const [result] = applyLocationUncertainty([{
     type: 'metro',
     requestedLine: 'M1',
     places: [
-      { name: 'Ambiguous', walkingMinutes: 10, distance: '500 m', distanceMeters: 500, lineName: 'M1' },
-      { name: 'Reliably close', walkingMinutes: 3, distance: '1 km', distanceMeters: 1000, lineName: 'M1' },
+      { name: 'Ambiguous', walkingMinutes: 5, distance: '250 m', distanceMeters: 250, lineName: 'M1' },
+      { name: 'Reliably close', walkingMinutes: 4, distance: '300 m', distanceMeters: 300, lineName: 'M1' },
     ],
-    nearest: { name: 'Ambiguous', walkingMinutes: 10, distance: '500 m', distanceMeters: 500, lineName: 'M1' },
+    nearest: { name: 'Ambiguous', walkingMinutes: 5, distance: '250 m', distanceMeters: 250, lineName: 'M1' },
     withinLimit: true,
-  }], [{ type: 'metro', maxMinutes: 7, line: 'M1' }], 500);
+  }], [{ type: 'metro', maxMinutes: 7, line: 'M1' }], 200);
 
+  assert.deepEqual(result.places.find((p) => p.name === 'Ambiguous')?.walkingMinutesRange, { min: 0, max: 9 });
   assert.equal(result.withinLimit, true);
   assert.equal(result.uncertain, false);
   assert.equal(result.nearest?.name, 'Reliably close');
@@ -396,7 +405,10 @@ test('location ranges preserve uncertainty from incomplete Maps evidence', () =>
   assert.equal(result.nearest?.name, 'Measured far station');
 });
 
-test('large directionless anchor offset cannot produce a strict rejection', () => {
+test('a large anchor offset still rejects when the optimistic edge is far outside the limit', () => {
+  // "12 km from X" puts the flat on a wide ring around X. The only measured station sits 350 m from
+  // X — i.e. ~11 km from the closest point the flat could occupy. Directionlessness does not make
+  // that unknown: no position on the ring is 7 minutes from this station, so it is a hard fail.
   const [result] = applyLocationUncertainty([{
     type: 'metro',
     requestedLine: 'M1',
@@ -406,5 +418,6 @@ test('large directionless anchor offset cannot produce a strict rejection', () =
   }], [{ type: 'metro', maxMinutes: 7, line: 'M1' }], 500, 12_000);
 
   assert.equal(result.withinLimit, false);
-  assert.equal(result.uncertain, true);
+  assert.equal(result.uncertain, false);
+  assert.ok((result.nearest?.walkingMinutesRange?.min ?? 0) > 7);
 });

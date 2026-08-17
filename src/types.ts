@@ -169,6 +169,13 @@ export interface AmenityResult {
   type: string;
   /** Requested Warsaw metro line, when this result is line-specific. */
   requestedLine?: 'M1' | 'M2';
+  /** Requested station whitelist, when this result is whitelist-specific. Part of result
+   *  IDENTITY: two metro prefs that differ only by whitelist must not resolve to each other,
+   *  or the strict one gets judged against the loose one's measurement. */
+  requestedStations?: string[];
+  /** The requested criterion could not be honoured (e.g. a station whitelist that matched no
+   *  real station) and a different one was measured instead. Never hard-reject on this. */
+  criterionSubstituted?: boolean;
   places: NearbyPlace[];          // closest candidates, sorted by expected/reachable distance
   nearest: NearbyPlace | null;    // shortcut to places[0]
   withinLimit: boolean;           // true if nearest <= maxMinutes
@@ -188,8 +195,10 @@ export interface CommuteResult {
   mode: string;
 }
 
-/** Public-transport estimate to Warszawa Centralna (weekday 11:00). Time is a min-based range;
- *  null time means the routing API failed (distance is still an offline straight-line fallback). */
+/** Public-transport estimate to Warszawa Centralna (weekday 11:00). Time is a min-based range whose
+ *  `min` is the optimistic edge of the location's uncertainty region. A null time means the routing
+ *  API failed — a measurement gap, not evidence that the listing is far, so the center gate keeps
+ *  the listing with a flag rather than rejecting (distance is an offline straight-line fallback). */
 export interface CentralStationEstimate {
   distanceText: string;
   durationMinRange: { min: number; max: number } | null;
@@ -210,4 +219,7 @@ export interface LocationScore {
   locationUnknown?: boolean;
   locationWarning?: string;
   locationEvidence?: string;
+  /** Outer radius (route metres) of the region the verdicts were computed from. Rejection reasons
+   *  quote it so an inferred verdict can't be read as a surveyed distance. */
+  locationOuterRadiusMeters?: number;
 }
