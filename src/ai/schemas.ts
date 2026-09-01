@@ -49,6 +49,16 @@ export const ParsedRentalDataSchema = z.looseObject({
     uncertaintyMeters: z.number().min(0).max(20_000).nullable().default(null).catch(null),
     evidence: z.string().nullable().default(null).catch(null),
   }).default(DEFAULT_LOCATION_HINT).catch(() => ({ ...DEFAULT_LOCATION_HINT })),
+  // Further distance claims beyond the best anchor. Rings intersect, so the ad's second and third
+  // clues are worth keeping. Capped so a chatty ad cannot turn one parse into a dozen geocodes,
+  // and .catch([]) because losing the extras must never fail the whole listing parse.
+  extraLocationHints: z.array(z.object({
+    query: z.string().nullable().default(null).catch(null),
+    kind: z.enum(['address', 'intersection', 'building', 'estate', 'transit_stop', 'landmark', 'neighborhood', 'none']).default('none').catch('landmark'),
+    anchorDistanceMeters: z.number().min(0).max(50_000).nullable().default(null).catch(null),
+    uncertaintyMeters: z.number().min(0).max(20_000).nullable().default(null).catch(null),
+    evidence: z.string().nullable().default(null).catch(null),
+  })).max(4).default([]).catch([]),
   isConcreteApartment: z.boolean().nullable().default(true).catch(true),
   estimatedMedia: z.object({
     water: nnum,

@@ -21,12 +21,12 @@ import {
   MIN_OBSERVED_PACE,
   MAX_OBSERVED_PACE,
 } from '../src/geo/uncertainty.js';
-import { WALK_METERS_PER_MINUTE, haversineMeters } from '../src/geo/metro.js';
+import { WALK_METERS_PER_MINUTE, findMetroStation, haversineMeters } from '../src/geo/metro.js';
 import { crowMetersFromRoute } from '../src/geo/uncertainty.js';
 import { applyLocationUncertainty, findNearbyAmenities, matchesAmenityRequest, modelledOptimisticCenter, pointToward } from '../src/ai/maps.js';
 import { checkAmenityGate, checkCenterGate, isCoarsePrecision } from '../src/search/amenity-gate.js';
-import { fuseLocationCandidates } from '../src/ai/location.js';
-import type { AreaConstraint, LocCandidate } from '../src/ai/location.js';
+import { fuseLocationCandidates, intersectRings } from '../src/ai/location.js';
+import type { AreaConstraint, LocCandidate, MetroConstraint } from '../src/ai/location.js';
 import type { AmenityResult } from '../src/types.js';
 import { mkScore } from './helpers.js';
 
@@ -559,4 +559,60 @@ test('a merely overlapping area never moves the point', () => {
   };
   const refined = fuseLocationCandidates([WILNO_PIN], null, [tightDistrict]);
   assert.equal(refined.outerRadiusMeters, Math.round(routeMetersFromCrow(1200)));
+});
+
+// ---------------------------------------------------------------------------
+// Rings intersect: a second quoted station is evidence, not a spare anchor
+// ---------------------------------------------------------------------------
+
+test('two quoted stations cross at the flat, and the crossing tightens the estimate', () => {
+  // "5 min do metra Zacisze, 10 min do Trockiej". Each claim alone leaves a whole circle; together
+  // they cross at a point. Clamping sigma per ring cannot find this — two rings with equal margins
+  // clamp to the same value, so the second claim would otherwise contribute nothing at all.
+  const zacisze = findMetroStation('Zacisze')!;
+  const trocka = findMetroStation('Trocka')!;
+  const ringZ: MetroConstraint = { station: zacisze, distance: 598, margin: 250, evidence: null };
+  const ringT: MetroConstraint = { station: trocka, distance: 826, margin: 250, evidence: null };
+
+  const cross = intersectRings(ringZ, ringT, { lat: WILNO_PIN.lat, lng: WILNO_PIN.lng });
+  assert.ok(cross, 'the rings must meet');
+  assert.ok(haversineMeters(cross!.lat, cross!.lng, WILNO_PIN.lat, WILNO_PIN.lng) < 120,
+    'the crossing should land on the flat the distances were measured from');
+
+  const oneRing = fuseLocationCandidates([WILNO_PIN], ringZ);
+  const twoRings = fuseLocationCandidates([WILNO_PIN], ringZ, [], [ringT]);
+  assert.ok(twoRings.outerRadiusMeters < oneRing.outerRadiusMeters,
+    `two rings must beat one: ${twoRings.outerRadiusMeters} vs ${oneRing.outerRadiusMeters}`);
+  assert.match(twoRings.source, /Zacisze ∩ Trocka/);
+});
+
+test('rings that cannot both be true do not cross', () => {
+  const zacisze = findMetroStation('Zacisze')!;
+  const trocka = findMetroStation('Trocka')!;
+  // Separated circles: 100 m from one and 100 m from the other, ~1.1 km apart. No flat satisfies
+  // both, so there is no crossing to invent.
+  assert.equal(intersectRings(
+    { station: zacisze, distance: 100, margin: 250, evidence: null },
+    { station: trocka, distance: 100, margin: 250, evidence: null },
+    { lat: WILNO_PIN.lat, lng: WILNO_PIN.lng },
+  ), null);
+  // The same station twice is not two pieces of evidence.
+  assert.equal(intersectRings(
+    { station: zacisze, distance: 598, margin: 250, evidence: null },
+    { station: zacisze, distance: 598, margin: 250, evidence: null },
+    { lat: WILNO_PIN.lat, lng: WILNO_PIN.lng },
+  ), null);
+});
+
+test('a crossing the point cannot reach is ignored, never teleports the flat', () => {
+  const zacisze = findMetroStation('Zacisze')!;
+  const kabaty = findMetroStation('Kabaty')!;
+  // A parse that attached a Kabaty distance to a Targówek flat: any crossing is ~10 km from the
+  // pin, far outside its region, so containment must reject it and leave the estimate alone.
+  const bogus: MetroConstraint = { station: kabaty, distance: 400, margin: 250, evidence: null };
+  const pinOnly = fuseLocationCandidates([WILNO_PIN], null);
+  const withBogus = fuseLocationCandidates([WILNO_PIN], null, [], [bogus]);
+  assert.equal(withBogus.lat, pinOnly.lat);
+  assert.equal(withBogus.outerRadiusMeters, pinOnly.outerRadiusMeters);
+  void zacisze;
 });

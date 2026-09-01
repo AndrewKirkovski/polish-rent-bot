@@ -106,6 +106,20 @@ export interface ParsedRentalData {
     /** Short source phrase or explanation grounded in the listing description. */
     evidence: string | null;
   };
+  /**
+   * FURTHER distance claims the ad makes ("10 min do Trockiej", "300 m do Bródna") beyond the one
+   * best anchor in `locationHint`. Each is a ring the flat must sit on, and rings INTERSECT — two
+   * independent claims localize a flat far more tightly than the best single one, which is why the
+   * ad's "second-best" clue is worth keeping instead of discarding. Optional, so parses cached
+   * before this field existed still validate.
+   */
+  extraLocationHints?: Array<{
+    query: string | null;
+    kind: 'address' | 'intersection' | 'building' | 'estate' | 'transit_stop' | 'landmark' | 'neighborhood' | 'none';
+    anchorDistanceMeters: number | null;
+    uncertaintyMeters: number | null;
+    evidence: string | null;
+  }>;
   isConcreteApartment: boolean | null;
   estimatedMedia: {
     water: number | null;

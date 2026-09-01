@@ -246,6 +246,11 @@ Extraction notes:
   • uncertaintyMeters is the conservative ± margin around anchorDistanceMeters: address 50-100m; intersection/building 100-250m; estate 500-1200m; exact stated metric distance ±100-250m; "next to stop" ±200-400m; vague landmark ±400-800m; neighborhood ±1200-2500m. If only "nearby" is stated, use a broad margin, not false precision.
   • If the ad only gives a district with no better clue, set query null/kind none; the platform district pin is handled separately.
   • evidence is one short quote-like source phrase from the ad, not an inference.
+- extraLocationHints: EVERY OTHER distance claim the ad makes, one entry each, same field meanings as locationHint. Never repeat the anchor already used above.
+  • These are not "worse" anchors to be thrown away. Each is a ring the apartment sits on, and two rings pin it far more tightly than the best one alone: "5 min do metra Zacisze, 10 min do Trockiej" → locationHint takes one, extraLocationHints takes the other.
+  • Include a claim only when it names a place Google can find AND the ad states or clearly implies a distance or walking time to it. Convert a stated walking time at 80 m/min (5 min → 400).
+  • Never invent a distance for a place merely mentioned as nearby, and never list the same place twice.
+  • [] when the ad makes no further claim. Never more than 4.
 - isConcreteApartment: FALSE for agency/portfolio posts, investment/new-build sales, price ranges ("od X zł"), generic "we have flats" ads, or scams; TRUE for one real, specific flat.
 - separateRooms: number of CLOSABLE separate rooms (exclude a walk-through/przechodni room and the kitchen). layoutType: "rozkladowy" (rooms off a hall), "przechodni" (walk-through), or "open" (studio/open-plan).
 - twoOfficeCapable: true if the flat plausibly fits TWO private desks/offices with doors for calls (needs ≥2 separable rooms, not przechodni).
@@ -266,6 +271,7 @@ JSON schema:
     "uncertaintyMeters": number|null,
     "evidence": "short source phrase from the listing" | null
   },
+  "extraLocationHints": [ { "query": string|null, "kind": "address"|"intersection"|"building"|"estate"|"transit_stop"|"landmark"|"neighborhood"|"none", "anchorDistanceMeters": number|null, "uncertaintyMeters": number|null, "evidence": string|null } ],
   "isConcreteApartment": true|false,
   "estimatedMedia": { "water": number|null, "electricity": number|null, "gas": number|null, "internet": number|null, "heating": number|null, "other": number|null },
   "contractType": "najem_okazjonalny"|"najem_zwykly"|"najem_instytucjonalny"|null,
@@ -355,6 +361,9 @@ export async function parseRentalListing(listing: Listing, ctx: AiCallCtx = {}):
       if (!parsed?.locationHint) {
         parsed.locationHint = { query: null, kind: 'none', anchorDistanceMeters: null, uncertaintyMeters: null, evidence: null };
       }
+      // Rows cached before extraLocationHints existed simply carry no extra rings; they keep
+      // working at their old precision rather than being re-parsed for a field they never had.
+      if (!Array.isArray(parsed.extraLocationHints)) parsed.extraLocationHints = [];
       recordLocalCacheHit({ feature: 'parse_rental', ...ctx }, PARSE_MODEL);
       return parsed;
     } catch {
@@ -423,6 +432,13 @@ ${(listing.description || 'No description provided').slice(0, 8000)}`;
     const raw = JSON.parse(jsonStr);
     parsed = ParsedRentalDataSchema.parse(raw) as ParsedRentalData;
     parsed.locationHint = normalizeLocationHint(parsed.locationHint);
+    // Same evidence discipline for the extras: a remote anchor with a distance the ad does not
+    // actually support collapses to 'none'. Those, and any echo of the primary anchor, are dropped
+    // rather than carried as rings the flat does not really sit on.
+    parsed.extraLocationHints = (parsed.extraLocationHints ?? [])
+      .map((h) => normalizeLocationHint(h))
+      .filter((h) => h.kind !== 'none' && h.query != null
+        && h.query.trim().toLowerCase() !== (parsed.locationHint.query ?? '').trim().toLowerCase());
   } catch (parseErr) {
     console.error('[parse-listing] Failed to parse/validate AI JSON:', jsonStr.slice(0, 200));
     throw new Error('AI returned invalid JSON');

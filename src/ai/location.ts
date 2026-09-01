@@ -143,6 +143,66 @@ export function isUsableDescriptionLocationHint(
   return !claimsWarsawMetro || warsawMetroLinesForStation(stationQuery).length > 0;
 }
 
+/** Two rings cross at a shallow angle when the stations are nearly co-linear with the flat; the
+ *  crossing is then smeared along the rings and localizes almost nothing. Below this separation
+ *  the geometry is not worth trusting. */
+const RING_PAIR_MIN_SEPARATION_M = 300;
+
+/**
+ * Where two ad-quoted rings CROSS — the actual payoff of parsing more than one distance claim.
+ * "5 min do Zacisza" alone leaves a whole circle; add "10 min do Trockiej" and the flat is at one
+ * of two points. Clamping sigma against each ring in turn cannot find this: two rings with similar
+ * margins clamp to the same value, so the second claim would contribute nothing.
+ *
+ * Both radii are ad-quoted WALKING metres and the station separation is crow, so the radii are
+ * converted before the circles are solved. Returns the crossing nearer to `near` (the flat is on
+ * one side, and every other signal already says which), or null when the circles do not meet.
+ */
+export function intersectRings(
+  a: MetroConstraint,
+  b: MetroConstraint,
+  near: { lat: number; lng: number },
+): { lat: number; lng: number; radiusCrowMeters: number } | null {
+  const r1 = a.distance / WALK_DETOUR_FACTOR;
+  const r2 = b.distance / WALK_DETOUR_FACTOR;
+  const d = haversineMeters(a.station.lat, a.station.lng, b.station.lat, b.station.lng);
+  if (d < RING_PAIR_MIN_SEPARATION_M) return null;
+  // Separated or nested: the two claims cannot both be true, so they are not corroborating.
+  if (d > r1 + r2 || d < Math.abs(r1 - r2)) return null;
+
+  // Local metric frame on station A, the same equirectangular projection the fusion uses.
+  const cosLat = Math.cos((a.station.lat * Math.PI) / 180);
+  const toXY = (lat: number, lng: number) => ({
+    x: (lng - a.station.lng) * cosLat * 111_320,
+    y: (lat - a.station.lat) * 110_540,
+  });
+  const B = toXY(b.station.lat, b.station.lng);
+  const N = toXY(near.lat, near.lng);
+
+  const ux = B.x / d, uy = B.y / d;
+  const t = (d * d + r1 * r1 - r2 * r2) / (2 * d);
+  const hSq = r1 * r1 - t * t;
+  if (hSq <= 0) return null;
+  const h = Math.sqrt(hSq);
+  const mx = ux * t, my = uy * t;
+  const options = [
+    { x: mx + -uy * h, y: my + ux * h },
+    { x: mx - -uy * h, y: my - ux * h },
+  ];
+  // The flat is on ONE side; every other signal already says which, so take the nearer crossing.
+  const pick = options.reduce((best, o) =>
+    (o.x - N.x) ** 2 + (o.y - N.y) ** 2 < (best.x - N.x) ** 2 + (best.y - N.y) ** 2 ? o : best);
+
+  return {
+    lat: a.station.lat + pick.y / 110_540,
+    lng: a.station.lng + pick.x / (cosLat * 111_320),
+    // The crossing is only as sharp as the sloppier ring, and a shallow crossing angle smears it
+    // further — `h/r1` is the sine of that angle, so dividing by it widens exactly when it should.
+    radiusCrowMeters: clampMeters(
+      (Math.max(a.margin, b.margin) / WALK_DETOUR_FACTOR) / Math.max(0.34, h / r1), 80, 5_000),
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Multi-source fusion — combine every available signal into the tightest honest point.
 // ---------------------------------------------------------------------------
@@ -200,10 +260,11 @@ const clampMeters = (v: number, lo: number, hi: number) => Math.max(lo, Math.min
  *  an optional metro annulus. A transit_stop naming a known station is a CONSTRAINT, not a point. */
 async function gatherLocationCandidates(
   listing: Listing,
-  parsed?: Pick<ParsedRentalData, 'addressHint' | 'locationHint'> | null,
-): Promise<{ candidates: LocCandidate[]; constraint: MetroConstraint | null; areas: AreaConstraint[]; unverifiedEvidence: string | null }> {
+  parsed?: Pick<ParsedRentalData, 'addressHint' | 'locationHint' | 'extraLocationHints'> | null,
+): Promise<{ candidates: LocCandidate[]; constraint: MetroConstraint | null; extraConstraints: MetroConstraint[]; areas: AreaConstraint[]; unverifiedEvidence: string | null }> {
   const candidates: LocCandidate[] = [];
   const areas: AreaConstraint[] = [];
+  const extraConstraints: MetroConstraint[] = [];
   let constraint: MetroConstraint | null = null;
   let unverifiedEvidence: string | null = null;
 
@@ -313,6 +374,29 @@ async function gatherLocationCandidates(
     unverifiedEvidence ??= hint.evidence ?? hint.query;
   }
 
+  // FURTHER rings. Every other distance claim in the ad is another circle the flat sits on, and
+  // circles intersect: a second "N min do X" cuts the region down far more than any single anchor
+  // can. Only station claims are taken here — they resolve offline against the verified table, so
+  // an extra ring costs nothing and cannot invent a place. Non-station extras are left alone
+  // rather than turned into more geocodes per listing.
+  const cityLcExtra = (listing.city ?? '').toLowerCase();
+  const inWarsawExtra = cityLcExtra.includes('warszaw') || cityLcExtra.includes('warsaw');
+  for (const extra of parsed?.extraLocationHints ?? []) {
+    if (!inWarsawExtra || extra.kind !== 'transit_stop' || !extra.query) continue;
+    if (!isUsableDescriptionLocationHint(extra, listing.city, listing.district)) continue;
+    const station = findMetroStation(extra.query.split(',')[0]?.trim() ?? extra.query);
+    // Never the same ring twice: a duplicate would masquerade as independent corroboration and
+    // tighten sigma on evidence already counted.
+    if (!station || station.name === constraint?.station.name) continue;
+    if (extraConstraints.some((c) => c.station.name === station.name)) continue;
+    extraConstraints.push({
+      station,
+      distance: clampMeters(extra.anchorDistanceMeters ?? 0, 0, 50_000),
+      margin: clampMeters(Math.max(STATION_FOOTPRINT_ROUTE_M, extra.uncertaintyMeters ?? 400), STATION_FOOTPRINT_ROUTE_M, 20_000),
+      evidence: extra.evidence,
+    });
+  }
+
   // Fall back to the point an earlier pass derived only if this pass found nothing text-derived —
   // otherwise it would double-count the evidence that produced it (see `derivedPin` above).
   if (derivedPin && candidates.length === 0) candidates.push(derivedPin);
@@ -334,7 +418,7 @@ async function gatherLocationCandidates(
     }
   }
 
-  return { candidates, constraint, areas, unverifiedEvidence };
+  return { candidates, constraint, extraConstraints, areas, unverifiedEvidence };
 }
 
 /** Fuse agreeing candidates (inverse-variance weighted) and apply the metro annulus constraint.
@@ -343,6 +427,7 @@ export function fuseLocationCandidates(
   candidates: LocCandidate[],
   constraint: MetroConstraint | null,
   areas: AreaConstraint[] = [],
+  extraConstraints: MetroConstraint[] = [],
 ): EnrichedLocation {
   const primary = [...candidates].sort((a, b) => b.reliability / b.sigma - a.reliability / a.sigma)[0]!;
   const cluster = candidates.filter((c) =>
@@ -378,37 +463,47 @@ export function fuseLocationCandidates(
     // distance to a place, `optimisticMeters` returns 0 for every candidate, every range reads
     // "0 – something", and the distance gates lose the lower bound they judge on.
     if (spread > OUTER_SIGMA_K * primary.sigma) {
-      const alone = fuseLocationCandidates([primary], constraint, areas);
+      const alone = fuseLocationCandidates([primary], constraint, areas, extraConstraints);
       return { ...alone, source: `${alone.source}; расхождение ${Math.round(spread)} м отброшено` };
     }
     sigma = Math.max(sigma, spread);
   }
   let note = '';
 
-  // Metro station as a radial CONSTRAINT: does the fused point genuinely sit on the claimed annulus?
-  if (constraint) {
-    const crowToStation = haversineMeters(lat, lng, constraint.station.lat, constraint.station.lng);
+  // Metro stations as radial CONSTRAINTS: does the fused point genuinely sit on each claimed ring?
+  // Rings intersect, so every corroborating one tightens further — "5 min do Zacisza" and "10 min
+  // do Trockiej" together localize a flat far better than either alone, which is the whole reason
+  // the extras are parsed instead of discarded as second-best anchors.
+  //
+  // The PRIMARY ring keeps its original disagree-and-widen behaviour; a contradicting EXTRA is
+  // dropped instead. An extra is bonus evidence, and one bad parse among several must not be able
+  // to degrade an estimate the other evidence already established.
+  for (const [index, ring] of [constraint, ...extraConstraints].filter((c): c is MetroConstraint => c != null).entries()) {
+    const isPrimary = index === 0 && constraint != null;
+    const crowToStation = haversineMeters(lat, lng, ring.station.lat, ring.station.lng);
     // `constraint.distance` and `.margin` are ad-quoted WALKING metres, so the separation has to be
     // converted before they can be compared. Comparing a crow distance against a route one made a
     // perfectly corroborating candidate look ~23% off — enough to flag agreeing evidence as
     // "расхождение" on the card once the stated distance passed ~2.5 km.
     const d = walkMetersFromCrow(crowToStation);
-    const discrepancy = Math.abs(d - constraint.distance);
+    const discrepancy = Math.abs(d - ring.distance);
     // Corroborate only when the point is really near the annulus — the point's own sigma must NOT
     // buy agreement — and never tighten below the actual positional discrepancy. Corroboration can
     // only hold-or-tighten, never inflate: the 120 m "don't over-trust a metro hint" floor is
     // capped at the incoming sigma (Math.min(120, sigma)), so a point already tighter than 120 m
     // from independent evidence (precise pin + rooftop street) is preserved, not widened back to 120.
     // σ is a CROW radius, so the route-metre discrepancy converts back before it can size σ.
-    const agreementBandRoute = constraint.margin + STATION_FOOTPRINT_ROUTE_M;
+    const agreementBandRoute = ring.margin + STATION_FOOTPRINT_ROUTE_M;
     const discrepancyCrow = discrepancy / WALK_DETOUR_FACTOR;
     const agreementBandCrow = agreementBandRoute / WALK_DETOUR_FACTOR;
     if (discrepancy <= agreementBandRoute) {
       sigma = clampMeters(Math.max(discrepancyCrow, Math.min(sigma, agreementBandCrow)), Math.min(120, sigma), sigma);
-      note = `; ~${Math.round(d)} м до ${constraint.station.name}`;
+      note += `; ~${Math.round(d)} м до ${ring.station.name}`;
+    } else if (isPrimary) {
+      sigma = Math.max(sigma, discrepancyCrow); // the chosen anchor disagrees → widen + flag
+      note += `; расхождение с ${ring.station.name}`;
     } else {
-      sigma = Math.max(sigma, discrepancyCrow); // sources disagree → widen + flag
-      note = `; расхождение с ${constraint.station.name}`;
+      note += `; ${ring.station.name} не подтвердилась`;
     }
   }
 
@@ -433,8 +528,22 @@ export function fuseLocationCandidates(
   // Collapsing those two cases moved the point to the district centroid and changed which metro
   // stations came out nearest — a strictly worse answer built from strictly more evidence.
   // Tightest first, so the smallest refinement binds and later areas measure from the new centre.
+  // Every PAIR of rings crosses somewhere, and that crossing is a far tighter region than either
+  // ring's own margin. Folded in as ordinary containment so the same consistency rule governs it:
+  // a crossing the fused point cannot reach is ignored rather than allowed to teleport the flat.
+  const ringAreas: AreaConstraint[] = [];
+  const rings = [constraint, ...extraConstraints].filter((c): c is MetroConstraint => c != null);
+  for (let i = 0; i < rings.length; i++) {
+    for (let j = i + 1; j < rings.length; j++) {
+      const cross = intersectRings(rings[i]!, rings[j]!, { lat, lng });
+      if (cross) {
+        ringAreas.push({ ...cross, source: `${rings[i]!.station.name} ∩ ${rings[j]!.station.name}` });
+      }
+    }
+  }
+
   let best = { lat, lng, radiusCrow: OUTER_SIGMA_K * sigma, source: null as string | null };
-  for (const area of [...areas].sort((a, b) => a.radiusCrowMeters - b.radiusCrowMeters)) {
+  for (const area of [...areas, ...ringAreas].sort((a, b) => a.radiusCrowMeters - b.radiusCrowMeters)) {
     const d = haversineMeters(best.lat, best.lng, area.lat, area.lng);
     // Disjoint: the area cannot be describing the same flat. Widening to cover both is what
     // produced the kilometre-scale regions, so it is IGNORED, never absorbed.
@@ -511,11 +620,17 @@ export async function enrichListingLocation(
   // tightest honest point. A named metro station acts as a radial CONSTRAINT that confirms/tightens
   // the point rather than replacing it — so a precise OLX pin + street + "70 m from Metro X" collapse
   // to the building, not the station centroid.
-  const { candidates, constraint, areas, unverifiedEvidence: unverifiedDescriptionEvidence } =
+  const { candidates, constraint, extraConstraints, areas, unverifiedEvidence: unverifiedDescriptionEvidence } =
     await gatherLocationCandidates(listing, parsed);
   if (candidates.length > 0) {
-    return fuseLocationCandidates(candidates, constraint, areas);
+    return fuseLocationCandidates(candidates, constraint, areas, extraConstraints);
   }
+
+  // NOT DONE HERE: with no point candidate, two rings cross at TWO points — mirror images across
+  // the line joining the stations, often a kilometre apart. Nothing in this branch says which side
+  // the flat is on, so picking one would be a coin flip dressed as precision. The crossing is used
+  // only in `fuseLocationCandidates`, where an existing point disambiguates it. Wiring it here
+  // needs a real tiebreaker (the district polygon the flat sits in).
 
   // 4. No point candidate, but a "N m from Metro X" claim still localizes the flat to a ring near the
   // station — keep the annulus (point = station, anchorDistanceMeters = the claimed distance).
