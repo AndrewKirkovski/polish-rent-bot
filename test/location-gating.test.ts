@@ -25,7 +25,7 @@ import { WALK_METERS_PER_MINUTE, findMetroStation, haversineMeters } from '../sr
 import { crowMetersFromRoute } from '../src/geo/uncertainty.js';
 import { applyLocationUncertainty, findNearbyAmenities, matchesAmenityRequest, modelledOptimisticCenter, pointToward } from '../src/ai/maps.js';
 import { checkAmenityGate, checkCenterGate, isCoarsePrecision } from '../src/search/amenity-gate.js';
-import { fuseLocationCandidates } from '../src/ai/location.js';
+import { classifyGeocodePrecision, fuseLocationCandidates } from '../src/ai/location.js';
 import type { AreaConstraint, LocCandidate, MetroConstraint } from '../src/ai/location.js';
 import type { AmenityResult } from '../src/types.js';
 import { mkScore } from './helpers.js';
@@ -571,4 +571,74 @@ test('an ad ring is inherently wide, and is never allowed to widen the estimate'
   assert.ok(withRings.outerRadiusMeters <= pinOnly.outerRadiusMeters);
   assert.match(withRings.source, /Zacisze/);
   assert.match(withRings.source, /Trocka/);
+});
+
+// ---------------------------------------------------------------------------
+// A contradicted claim is false evidence — not a bigger search area
+// ---------------------------------------------------------------------------
+
+test('a station claim the point cannot reach never widens the estimate', () => {
+  // The real NCVVYE card. The ad said "5 minut do stacji metra Dworzec Wileński" for a flat in
+  // Targówek, 3.3 km away. Widening sigma to that discrepancy is what produced "~0 м–11,4 км ·
+  // ~0–146 мин": adding evidence made the answer five times worse.
+  const dw = findMetroStation('Dworzec Wileński')!;
+  const ring: MetroConstraint = { station: dw, distance: 300, margin: 200, evidence: '5 minut' };
+  const pinOnly = fuseLocationCandidates([WILNO_PIN], null);
+  const withFalseClaim = fuseLocationCandidates([WILNO_PIN], ring);
+
+  assert.equal(withFalseClaim.outerRadiusMeters, pinOnly.outerRadiusMeters,
+    'a contradicted claim must leave the estimate exactly as it was');
+  assert.match(withFalseClaim.source, /расхожден/, 'and it still has to be surfaced');
+});
+
+test('a contradicted claim does not drag the point onto its station either', () => {
+  // The containment pass maximises satisfied evidence, so a ring left in its input made moving the
+  // point 3.3 km the highest-scoring answer — it reported Dworzec Wileński as the nearest station,
+  // at 695 m "precision", for a flat in Targówek. Only corroborated rings may reach that pass.
+  const dw = findMetroStation('Dworzec Wileński')!;
+  const district: AreaConstraint = {
+    lat: 52.28238, lng: 21.06537, radiusCrowMeters: 4306, reliability: 0.95, source: 'граница района',
+  };
+  const fused = fuseLocationCandidates(
+    [WILNO_PIN],
+    { station: dw, distance: 300, margin: 200, evidence: null },
+    [district],
+  );
+  assert.ok(haversineMeters(fused.lat!, fused.lng!, WILNO_PIN.lat, WILNO_PIN.lng) < 50,
+    `the point must stay on the pin, moved ${Math.round(haversineMeters(fused.lat!, fused.lng!, WILNO_PIN.lat, WILNO_PIN.lng))} m`);
+});
+
+test('the estimate is never vaguer than a containing area, whatever else happens', () => {
+  // The floor. A listing filed under a district is in that district, so no estimate for it may be
+  // wider — the shipped card was 2.5x wider than the district's own extent.
+  const tightDistrict: AreaConstraint = {
+    lat: WILNO_PIN.lat, lng: WILNO_PIN.lng, radiusCrowMeters: 1500,
+    reliability: 0.95, source: 'граница района',
+  };
+  const dw = findMetroStation('Dworzec Wileński')!;
+  const fused = fuseLocationCandidates(
+    [WILNO_PIN],
+    { station: dw, distance: 300, margin: 200, evidence: null },  // false claim
+    [tightDistrict],
+  );
+  assert.ok(fused.outerRadiusMeters <= Math.round(routeMetersFromCrow(1500)),
+    `expected the district floor, got ${fused.outerRadiusMeters} m`);
+});
+
+test('an establishment match is not a position candidate', () => {
+  // "Osiedle Wilno, Warszawa" geocodes to `Wierna 24 — real_estate_agency`: an agency named after
+  // the estate, 1.8 km from it. Classified weak so the address branch records it as unverified
+  // instead of believing it — de-weighting alone was not enough, because fusion weights by
+  // reliability/σ² and an establishment's tight σ beats a fuzzy pin's 1800 m regardless.
+  const agency = classifyGeocodePrecision({
+    locationType: 'ROOFTOP', partialMatch: false,
+    resultTypes: ['establishment', 'point_of_interest', 'real_estate_agency'],
+  });
+  assert.equal(agency.weak, true);
+  // A genuine street address is untouched by the new class.
+  const street = classifyGeocodePrecision({
+    locationType: 'ROOFTOP', partialMatch: false, resultTypes: ['street_address'],
+  });
+  assert.equal(street.weak, undefined);
+  assert.equal(street.precision, 'street');
 });

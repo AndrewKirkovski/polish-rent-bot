@@ -89,7 +89,7 @@ function geocodeOuterRadius(geo: GeocodedLocation, classifiedUncertainty: number
 
 export function classifyGeocodePrecision(
   geo: Pick<GeocodedLocation, 'locationType' | 'partialMatch' | 'resultTypes'>,
-): { precision: 'street' | 'approximate'; uncertaintyMeters: number } {
+): { precision: 'street' | 'approximate'; uncertaintyMeters: number; weak?: true } {
   const types = new Set(geo.resultTypes);
   const addressType = ['street_address', 'premise', 'subpremise', 'intersection']
     .some((type) => types.has(type));
@@ -105,6 +105,16 @@ export function classifyGeocodePrecision(
   }
   if (types.has('locality') || types.has('administrative_area_level_2')) {
     return { precision: 'approximate', uncertaintyMeters: 2500 };
+  }
+  // A BUSINESS, not a place the flat can be in. "Osiedle Wilno, Warszawa" resolves to
+  // `Wierna 24 — real_estate_agency`: an agency that named itself after the estate, 1.8 km from
+  // the estate itself. Estate/agency name collisions are systematic in this market.
+  //
+  // The problem is RELEVANCE, not precision — the office is pinpointed, it just says nothing about
+  // the flat — so this is flagged `weak` for the caller to de-weight, rather than being handed a
+  // large sigma it does not deserve. It must never outrank the platform's own map pin.
+  if (types.has('establishment') || types.has('point_of_interest')) {
+    return { precision: 'approximate', uncertaintyMeters: 1000, weak: true };
   }
   return { precision: 'approximate', uncertaintyMeters: 1000 };
 }
@@ -262,16 +272,34 @@ async function gatherLocationCandidates(
     const geo = await geocodeAddress(streetQuery);
     if (geo) {
       const q = classifyGeocodePrecision(geo);
+      // This branch asked for a STREET ADDRESS. An establishment answer means the geocoder did not
+      // find one and matched a business instead — "Osiedle Wilno, Warszawa" returns `Wierna 24,
+      // real_estate_agency`, an agency named after the estate and 1.8 km from it. That is a
+      // non-answer, not a coarse answer, so it is recorded as unverified rather than believed.
+      //
+      // De-weighting it is not enough: fusion weights by reliability/σ², and an establishment's
+      // tight σ beats a fuzzy pin's 1800 m however far its reliability is cut. At 0.3 it still
+      // dragged the point 1.2 km and the card still misreported every metro distance.
+      //
+      // A landmark with a stated distance ("300 m od Galerii Północnej") is genuinely useful and is
+      // handled in the locationHint branch below; it is not affected by this.
+      if (q.weak) {
+        unverifiedEvidence ??= parsed?.addressHint ?? listing.street ?? null;
+      } else {
       candidates.push({
         lat: geo.lat, lng: geo.lng, sigma: candidateSigma(geo, q.uncertaintyMeters),
-        reliability: listing.street ? 0.75 : 0.7, precisionFloor: q.precision,
+        reliability: listing.street ? 0.75 : 0.7,
+        precisionFloor: q.precision,
         source: listing.street ? 'улица из объявления' : 'адрес из описания',
         evidence: listing.street ?? parsed?.addressHint ?? null,
       });
+      }
       // The same match ALSO bounds the flat: the geocoder measured the area it matched, and the
       // flat is inside it. Kept as a containment constraint so it can tighten the fused point
       // instead of only inflating this candidate's σ.
-      if (geo.areaRadiusMeters != null && geo.areaRadiusMeters > 0) {
+      // Containment asserts "the flat is INSIDE this". True of a neighbourhood or a street, false
+      // of an office, so a weak match contributes no area however tidy its bounds box looks.
+      if (!q.weak && geo.areaRadiusMeters != null && geo.areaRadiusMeters > 0) {
         areas.push({
           lat: geo.lat, lng: geo.lng, radiusCrowMeters: geo.areaRadiusMeters,
           reliability: GEOCODED_AREA_RELIABILITY,
@@ -366,13 +394,25 @@ async function gatherLocationCandidates(
   // by the district it sits in — evidence we already had, thrown away. Skipped when it cannot pay
   // for itself: with no candidate the fallback handles it, and a district box (Warsaw dzielnice run
   // 2–5 km) cannot tighten an area we already hold below DISTRICT_AREA_USEFUL_BELOW_M.
+  // The district is a FLOOR, not an optimization: a listing filed under Targówek is in Targówek,
+  // so no estimate for it may ever be vaguer than Targówek. The 10.8 km card was 2.5x wider than
+  // the district's own 4.3 km extent — an answer less certain than free structured data we already
+  // held. Gathering it here makes that impossible by construction, whatever the next bug is.
+  //
+  // Skipped only when it cannot bind: a tighter area already holds a smaller bound, so the district
+  // could not narrow anything and the geocode would be spent for nothing. Cached, and district
+  // strings repeat across nearly every listing.
   const tightestArea = Math.min(Infinity, ...areas.map((a) => a.radiusCrowMeters));
-  if (candidates.length > 0 && tightestArea > DISTRICT_AREA_USEFUL_BELOW_M && (listing.district || listing.city)) {
+  if (tightestArea > DISTRICT_AREA_USEFUL_BELOW_M && (listing.district || listing.city)) {
     const geo = await geocodeAddress(
       buildAddressFromListing({ street: null, district: listing.district, city: listing.city }));
-    if (geo?.areaRadiusMeters != null && geo.areaRadiusMeters > 0) {
+    if (geo) {
       areas.push({
-        lat: geo.lat, lng: geo.lng, radiusCrowMeters: geo.areaRadiusMeters,
+        lat: geo.lat, lng: geo.lng,
+        // A geocoder that returns no bounds box must not silently drop the floor; fall back to the
+        // same assumed extent the last-resort district branch uses.
+        radiusCrowMeters: geo.areaRadiusMeters && geo.areaRadiusMeters > 0
+          ? geo.areaRadiusMeters : ASSUMED_AREA_RADIUS_M,
         reliability: PLATFORM_AREA_RELIABILITY,
         source: listing.district ? 'граница района' : 'граница города',
       });
@@ -439,6 +479,12 @@ export function fuseLocationCandidates(
   // The PRIMARY ring keeps its original disagree-and-widen behaviour; a contradicting EXTRA is
   // dropped instead. An extra is bonus evidence, and one bad parse among several must not be able
   // to degrade an estimate the other evidence already established.
+  // Rings the fused point actually sits on. A contradicted ring is a FALSE CLAIM, and the
+  // containment pass below must never see it: that pass maximises satisfied evidence, so offering
+  // it a ring the point cannot reach makes moving the point 3 km the highest-scoring answer. It did
+  // exactly that — reporting Dworzec Wileński as the nearest station, at 695 m "precision", for a
+  // flat in Targówek. Layer 1 decides what is credible; layer 2 only intersects what survived.
+  const credibleRings: MetroConstraint[] = [];
   for (const [index, ring] of [constraint, ...extraConstraints].filter((c): c is MetroConstraint => c != null).entries()) {
     const isPrimary = index === 0 && constraint != null;
     const crowToStation = haversineMeters(lat, lng, ring.station.lat, ring.station.lng);
@@ -459,9 +505,21 @@ export function fuseLocationCandidates(
     const agreementBandCrow = agreementBandRoute / WALK_DETOUR_FACTOR;
     if (discrepancy <= agreementBandRoute) {
       sigma = clampMeters(Math.max(discrepancyCrow, Math.min(sigma, agreementBandCrow)), Math.min(120, sigma), sigma);
+      credibleRings.push(ring);
       note += `; ~${Math.round(d)} м до ${ring.station.name}`;
     } else if (isPrimary) {
-      sigma = Math.max(sigma, discrepancyCrow); // the chosen anchor disagrees → widen + flag
+      // CONTRADICTED, so distrust it — do not widen to cover it. The old behaviour set sigma to the
+      // discrepancy, which is how "5 minut do stacji metra Dworzec Wileński" (a station 3.4 km
+      // away, i.e. marketing) turned a ~900 m estimate into 10.8 km: adding evidence made the
+      // answer five times worse, and the card became "~0 м–11,4 км".
+      //
+      // Widening was never the right shape anyway. A contradiction means two MUTUALLY EXCLUSIVE
+      // possibilities — near the pin, or near the station — and the truth is the union of two small
+      // areas, not one disc covering both and everything between, which is mostly places the flat
+      // certainly is not. So the point is kept, the claim is flagged, and the gate's existing
+      // `uncertain` path keeps the listing with a warning instead of deleting it.
+      //
+      // The contract this has to honour is "not falsely TIGHTENED" — and nothing here tightens.
       note += `; расхождение с ${ring.station.name}`;
     } else {
       note += `; ${ring.station.name} не подтвердилась`;
@@ -489,7 +547,7 @@ export function fuseLocationCandidates(
   // AND consistent with it, so this can never widen an answer or move it somewhere the fused point
   // cannot reach.
   let bestLat = lat, bestLng = lng, bestRadiusCrow = OUTER_SIGMA_K * sigma, refinedBy: string[] = [];
-  const rings = [constraint, ...extraConstraints].filter((c): c is MetroConstraint => c != null);
+  const rings = credibleRings;
   if (bestRadiusCrow > REFINE_ONLY_ABOVE_M && (areas.length > 0 || rings.length > 1)) {
     const FUSED = 'оценка по точкам';
     const regions: Region[] = [
@@ -514,6 +572,18 @@ export function fuseLocationCandidates(
       bestLng = solved.lng;
       bestRadiusCrow = solved.radiusCrowMeters;
       refinedBy = solved.satisfied.filter((x) => x !== FUSED);
+    }
+  }
+
+  // THE FLOOR, stated once and unconditionally. The flat is inside every area that contains the
+  // point we are reporting, so the answer can never be wider than the smallest of them. The solver
+  // above usually gets there first, but it is an optimization that only runs under conditions;
+  // this is the invariant, and it holds whether or not the solver ran or was accepted.
+  for (const area of areas) {
+    if (haversineMeters(bestLat, bestLng, area.lat, area.lng) <= area.radiusCrowMeters
+      && area.radiusCrowMeters < bestRadiusCrow) {
+      bestRadiusCrow = area.radiusCrowMeters;
+      if (!refinedBy.includes(area.source)) refinedBy = [...refinedBy, area.source];
     }
   }
 
@@ -606,7 +676,14 @@ export async function enrichListingLocation(
       uncertaintyMeters: Math.round(constraint.margin / WALK_DETOUR_FACTOR),
       // A station spans ~STATION_FOOTPRINT_M of entrances, so the honest ring is margin + that,
       // in route metres.
-      outerRadiusMeters: capOuter(constraint.margin + STATION_FOOTPRINT_ROUTE_M),
+      outerRadiusMeters: capOuter(Math.min(
+        constraint.margin + STATION_FOOTPRINT_ROUTE_M,
+        // Same floor: a ring-only estimate may not spill outside the district the listing is filed
+        // under either. Without this the invariant would hold on the fused path and nowhere else.
+        ...areas.filter((a) => haversineMeters(constraint.station.lat, constraint.station.lng, a.lat, a.lng)
+          <= a.radiusCrowMeters + constraint.distance / WALK_DETOUR_FACTOR)
+          .map((a) => walkMetersFromCrow(a.radiusCrowMeters)),
+      )),
       source: `ориентир из описания (остановка) ~${constraint.distance} м до ${constraint.station.name}`,
       evidence: constraint.evidence,
     };
