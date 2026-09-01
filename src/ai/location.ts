@@ -70,6 +70,13 @@ function geocodeOuterRadius(geo: GeocodedLocation, classifiedUncertainty: number
   )));
 }
 
+/** Google place types that identify a BUSINESS PREMISES nobody rents a flat in. A geocode landing
+ *  on one of these answered a different question than the one asked, so it is not a position
+ *  candidate at all. Kept deliberately narrow: a park, a mall or a converted factory is a landmark
+ *  an ad can legitimately place a flat at, and treating every `establishment` as weak measurably
+ *  threw those away. */
+const WEAK_BUSINESS_TYPES = ['real_estate_agency', 'insurance_agency', 'lawyer', 'accounting'];
+
 export function classifyGeocodePrecision(
   geo: Pick<GeocodedLocation, 'locationType' | 'partialMatch' | 'resultTypes'>,
 ): { precision: 'street' | 'approximate'; uncertaintyMeters: number; weak?: true } {
@@ -81,12 +88,15 @@ export function classifyGeocodePrecision(
   if (!geo.partialMatch && (intersection || (addressType && addressGeometry))) {
     return { precision: 'street', uncertaintyMeters: geo.locationType === 'ROOFTOP' ? 50 : 125 };
   }
-  // PARTIAL means the geocoder did not find what was asked for and answered with something else.
-  // That is not a coarse answer, it is a different place: "przystanek Warszawa Zacisze-Wilno" comes
-  // back partial and lands 1.5 km from the flat. Weak, so it cannot outrank the platform's own pin —
-  // at sigma 1500 and reliability 0.5 it otherwise still outweighs a fuzzy pin (0.4/1800) and drags
-  // the point across the district. Checked BEFORE the establishment case below, which is why that
-  // one alone did not catch this.
+  // PARTIAL means the geocoder could not match the whole query and answered with its closest
+  // guess. Weak: it is not a position we can stand behind, and it must not become a candidate.
+  //
+  // Softening this to "a candidate at sigma 2500" was measured and rejected. It improved the
+  // corpus-wide radius metric, but on the one listing with known ground truth it let a partial
+  // match for a rail station become the primary anchor (it quotes distance 0, so anchor promotion
+  // picks it up) and pulled the point 998 m off the map pin, reporting the metro at 1.1 km instead
+  // of 550 m. Tighter radius, wronger answer — a reminder that the harm users see is the DISTANCE,
+  // not the radius, and an aggregate that only scores radius will happily trade one for the other.
   if (geo.partialMatch) return { precision: 'approximate', uncertaintyMeters: 1500, weak: true };
   if (types.has('route')) return { precision: 'approximate', uncertaintyMeters: 600 };
   if (types.has('neighborhood') || types.has('sublocality')) {
@@ -95,14 +105,21 @@ export function classifyGeocodePrecision(
   if (types.has('locality') || types.has('administrative_area_level_2')) {
     return { precision: 'approximate', uncertaintyMeters: 2500 };
   }
-  // A BUSINESS, not a place the flat can be in. "Osiedle Wilno, Warszawa" resolves to
-  // `Wierna 24 — real_estate_agency`: an agency that named itself after the estate, 1.8 km from
-  // the estate itself. Estate/agency name collisions are systematic in this market.
+  // A BUSINESS THAT CANNOT BE SOMEONE'S HOME. "Osiedle Wilno, Warszawa" resolves to
+  // `Wierna 24 — real_estate_agency`: an agency that named itself after the estate, 1.8 km from the
+  // estate itself. Estate/agency name collisions are systematic in this market.
+  //
+  // Deliberately NOT all of `establishment`/`point_of_interest`. Measured over 500 real listings,
+  // that wider rule discarded anchors the ads genuinely give — "Soho Factory", "Park Cietrzewia",
+  // "Osiedle Forma" — each quoted at distance 0, i.e. the ad saying the flat IS there, and each
+  // costing real precision when dropped (one went 644 m -> 4680 m). A park or a converted factory
+  // is a landmark you can live at; an estate agent's office is not.
   //
   // The problem is RELEVANCE, not precision — the office is pinpointed, it just says nothing about
-  // the flat — so this is flagged `weak` for the caller to de-weight, rather than being handed a
-  // large sigma it does not deserve. It must never outrank the platform's own map pin.
-  if (types.has('establishment') || types.has('point_of_interest')) {
+  // the flat — so this is flagged `weak` for the caller to reject outright rather than being handed
+  // a large sigma it does not deserve. De-weighting alone does not work: fusion weights by
+  // reliability/σ², so a tight σ beats a fuzzy pin's 1800 m at any reliability.
+  if (WEAK_BUSINESS_TYPES.some((t) => types.has(t))) {
     return { precision: 'approximate', uncertaintyMeters: 1000, weak: true };
   }
   return { precision: 'approximate', uncertaintyMeters: 1000 };
