@@ -27,6 +27,10 @@ const MAX_OUTER_RADIUS_M = 25_000;
 /** Fallback extent for a district/city centroid when the geocoder returned no bounds box. */
 const ASSUMED_AREA_RADIUS_M = 2500;
 
+/** Below this the district lookup cannot tighten anything we already hold (dzielnice run 2–5 km),
+ *  so the geocode is skipped rather than paid for. */
+const DISTRICT_AREA_USEFUL_BELOW_M = 1500;
+
 export interface EnrichedLocation {
   lat: number | null;
   lng: number | null;
@@ -313,6 +317,23 @@ async function gatherLocationCandidates(
   // otherwise it would double-count the evidence that produced it (see `derivedPin` above).
   if (derivedPin && candidates.length === 0) candidates.push(derivedPin);
 
+  // The district is CONTAINMENT evidence, and it holds whether or not a pin exists. It used to be
+  // consulted only as a last-resort fallback (step 7), so a listing WITH a pin was never narrowed
+  // by the district it sits in — evidence we already had, thrown away. Skipped when it cannot pay
+  // for itself: with no candidate the fallback handles it, and a district box (Warsaw dzielnice run
+  // 2–5 km) cannot tighten an area we already hold below DISTRICT_AREA_USEFUL_BELOW_M.
+  const tightestArea = Math.min(Infinity, ...areas.map((a) => a.radiusCrowMeters));
+  if (candidates.length > 0 && tightestArea > DISTRICT_AREA_USEFUL_BELOW_M && (listing.district || listing.city)) {
+    const geo = await geocodeAddress(
+      buildAddressFromListing({ street: null, district: listing.district, city: listing.city }));
+    if (geo?.areaRadiusMeters != null && geo.areaRadiusMeters > 0) {
+      areas.push({
+        lat: geo.lat, lng: geo.lng, radiusCrowMeters: geo.areaRadiusMeters,
+        source: listing.district ? 'граница района' : 'граница города',
+      });
+    }
+  }
+
   return { candidates, constraint, areas, unverifiedEvidence };
 }
 
@@ -399,31 +420,52 @@ export function fuseLocationCandidates(
   else precision = 'district';
 
   // INTERSECT. Every area says "the flat is inside this box", so the answer is the intersection of
-  // the fused disc with each of them — an operation that can only ever tighten. If P is within
-  // `outerCrow` of the fused point and within `radius` of an area centre `d` away, it is also
-  // within `d + radius` of the fused point, so that is the clipped bound.
-  let outerCrow = OUTER_SIGMA_K * sigma;
-  const clipped: string[] = [];
-  for (const area of areas) {
-    const d = haversineMeters(lat, lng, area.lat, area.lng);
-    // Disjoint: the area cannot be describing the same flat as the point. Widening to cover both
-    // is what produced the 10 km regions, so an inconsistent area is IGNORED, never absorbed.
-    if (d > outerCrow + area.radiusCrowMeters) continue;
-    const bound = d + area.radiusCrowMeters;
-    if (bound < outerCrow) {
-      outerCrow = bound;
-      clipped.push(area.source);
+  // the fused disc with all of them — an operation that can only ever tighten.
+  //
+  // Two different things can be true of an area, and they license different moves:
+  //
+  //   * CONTAINED in the fused disc (d + r <= R) — the intersection IS the area disc, so its
+  //     centre and radius are exactly the answer. Adopting them loses nothing.
+  //   * merely OVERLAPPING — the intersection is a lens, and the area's centre is NOT a better
+  //     position than the fused point. A district centroid is not evidence about where the flat
+  //     is; the pin is. Here the area may only tighten the RADIUS, to d + r.
+  //
+  // Collapsing those two cases moved the point to the district centroid and changed which metro
+  // stations came out nearest — a strictly worse answer built from strictly more evidence.
+  // Tightest first, so the smallest refinement binds and later areas measure from the new centre.
+  let best = { lat, lng, radiusCrow: OUTER_SIGMA_K * sigma, source: null as string | null };
+  for (const area of [...areas].sort((a, b) => a.radiusCrowMeters - b.radiusCrowMeters)) {
+    const d = haversineMeters(best.lat, best.lng, area.lat, area.lng);
+    // Disjoint: the area cannot be describing the same flat. Widening to cover both is what
+    // produced the kilometre-scale regions, so it is IGNORED, never absorbed.
+    if (d > best.radiusCrow + area.radiusCrowMeters) continue;
+    // Only containment refines. An overlapping area cannot tighten the radius AROUND THIS POINT
+    // either: the bound would be d + r, which in that case is already larger than the radius we
+    // hold. The true intersection is a smaller lens, but summarising it needs a centre between the
+    // two — and that reintroduces exactly the point-quality problem above, so it is left for later.
+    if (d + area.radiusCrowMeters <= best.radiusCrow) {
+      best = { lat: area.lat, lng: area.lng, radiusCrow: area.radiusCrowMeters, source: area.source };
     }
+  }
+
+  // A tighter region is also a tighter σ. The radius is a CONTAINING bound, so the equivalent σ is
+  // it divided back by OUTER_SIGMA_K — keeping `precision` consistent with the region we report.
+  const finalSigma = Math.min(sigma, best.radiusCrow / OUTER_SIGMA_K);
+  if (finalSigma < sigma) {
+    precision = cluster.some((c) => c.precisionFloor === 'exact') ? 'exact'
+      : finalSigma <= 200 ? 'street'
+      : finalSigma <= 800 ? 'approximate'
+      : 'district';
   }
 
   const evidence = cluster.map((c) => c.evidence).find((e) => e != null) ?? constraint?.evidence ?? null;
   return {
-    lat, lng, precision,
+    lat: best.lat, lng: best.lng, precision,
     anchorDistanceMeters: 0,
-    uncertaintyMeters: Math.round(sigma),
-    outerRadiusMeters: capOuter(walkMetersFromCrow(outerCrow)),
+    uncertaintyMeters: Math.round(finalSigma),
+    outerRadiusMeters: capOuter(walkMetersFromCrow(best.radiusCrow)),
     source: [...new Set(cluster.map((c) => c.source))].join(' + ') + note
-      + (clipped.length > 0 ? `; сужено по ${[...new Set(clipped)].join(', ')}` : ''),
+      + (best.source ? `; сужено по «${best.source}»` : ''),
     evidence,
   };
 }

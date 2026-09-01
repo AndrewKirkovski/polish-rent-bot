@@ -518,3 +518,45 @@ test('an area disjoint from the point is ignored, not absorbed', () => {
   assert.equal(withBadArea.outerRadiusMeters, pinOnly.outerRadiusMeters);
   assert.doesNotMatch(withBadArea.source, /сужено по/);
 });
+
+test('the tightest consistent region wins outright — point and radius', () => {
+  // The intersection lies inside EVERY constraint disc, so the smallest of them is both valid and
+  // the tightest summary. Reporting the district pin with a `d + r` radius would be correct but
+  // loose: when a 600 m estate box binds, the answer IS that box, centre included.
+  const estate: AreaConstraint = {
+    lat: 52.28300, lng: 21.06100, radiusCrowMeters: 600, source: 'граница участка из описания',
+  };
+  const fused = fuseLocationCandidates([WILNO_PIN], null, [estate]);
+
+  assert.equal(fused.lat, estate.lat, 'the point moves to the binding region');
+  assert.equal(fused.lng, estate.lng);
+  assert.equal(fused.outerRadiusMeters, Math.round(routeMetersFromCrow(600)));
+  // A `d + r` bound around the pin would have been looser than the box itself.
+  const d = haversineMeters(WILNO_PIN.lat, WILNO_PIN.lng, estate.lat, estate.lng);
+  assert.ok(fused.outerRadiusMeters < Math.round(routeMetersFromCrow(d + 600)));
+  // A tighter region is a tighter sigma, so precision must follow it rather than stay 'district'.
+  assert.equal(fused.precision, 'approximate');
+});
+
+test('a merely overlapping area never moves the point', () => {
+  // Regression: taking the smallest disc outright moved the point to the DISTRICT centroid, which
+  // changed which metro stations came out nearest — more evidence producing a worse answer. A
+  // district box overlaps the pin's disc without containing it, and its centre is not evidence
+  // about the flat, so it may not displace a real pin.
+  const district: AreaConstraint = {
+    lat: 52.29200, lng: 21.04500, radiusCrowMeters: 2600, source: 'граница района',
+  };
+  const pinOnly = fuseLocationCandidates([WILNO_PIN], null);
+  const withDistrict = fuseLocationCandidates([WILNO_PIN], null, [district]);
+
+  assert.equal(withDistrict.lat, pinOnly.lat, 'the pin stays the point');
+  assert.equal(withDistrict.lng, pinOnly.lng);
+  assert.equal(withDistrict.outerRadiusMeters, pinOnly.outerRadiusMeters);
+
+  // …but a district that DOES contain the pin's disc is a real refinement and binds.
+  const tightDistrict: AreaConstraint = {
+    lat: WILNO_PIN.lat, lng: WILNO_PIN.lng, radiusCrowMeters: 1200, source: 'граница района',
+  };
+  const refined = fuseLocationCandidates([WILNO_PIN], null, [tightDistrict]);
+  assert.equal(refined.outerRadiusMeters, Math.round(routeMetersFromCrow(1200)));
+});
