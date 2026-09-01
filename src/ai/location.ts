@@ -12,8 +12,6 @@ import { geocodeAddress, buildAddressFromListing, warsawMetroLinesForStation } f
 import type { GeocodedLocation } from './maps.js';
 import { findMetroStation, haversineMeters, walkMetersFromCrow, WALK_DETOUR_FACTOR } from '../geo/metro.js';
 import { fetchOtodomDetail } from '../crawlers/otodom.js';
-import { solveRegions } from '../geo/region.js';
-import type { Region } from '../geo/region.js';
 
 /**
  * σ is a ~1σ radius, which covers only ~39% of a 2D Gaussian's mass. The gates hard-reject on
@@ -33,20 +31,12 @@ const ASSUMED_AREA_RADIUS_M = 2500;
  *  so the geocode is skipped rather than paid for. */
 const DISTRICT_AREA_USEFUL_BELOW_M = 1500;
 
-/** An ad's own distance claim: usually honest, sometimes rounded or lifted from a template, so it
- *  is trusted less than a measured administrative boundary and more than nothing. */
-const RING_RELIABILITY = 0.6;
-
 /** The platform's structured district/city. Near-certain containment — a listing filed under
  *  Targówek is in Targówek — which is what lets it overrule a confidently mis-geocoded hint. */
 const PLATFORM_AREA_RELIABILITY = 0.95;
 
 /** A geocoded bounds box from the ad's own text: only as trustworthy as the geocode behind it. */
 const GEOCODED_AREA_RELIABILITY = 0.7;
-
-/** Below this the statistical estimate is already tighter than the containment pass could resolve,
- *  so the solver is skipped — an exact Otodom coordinate must keep its radius of exactly 0. */
-const REFINE_ONLY_ABOVE_M = 60;
 
 export interface EnrichedLocation {
   lat: number | null;
@@ -336,8 +326,15 @@ async function gatherLocationCandidates(
       };
     } else {
       const geo = await geocodeAddress(`${hint.query}, ${listing.city}, Polska`);
-      if (geo) {
-        const q = classifyGeocodePrecision(geo);
+      const q0 = geo ? classifyGeocodePrecision(geo) : null;
+      // An establishment answer here is the SAME trap the street branch guards, on the branch that
+      // actually receives estate and landmark names — "Osiedle Wilno" is an `estate` hint, and the
+      // agency that shares its name is what this geocode returns. Guarding only the street branch
+      // left the motivating example itself reachable through a path that was never patched.
+      if (geo && q0?.weak) {
+        unverifiedEvidence ??= hint.evidence ?? hint.query;
+      } else if (geo) {
+        const q = q0!;
         const pointLike = hint.kind === 'address' || hint.kind === 'intersection';
         // A stated distance to a non-station anchor (a landmark N m away) widens it into an annulus;
         // fold that distance into sigma so it stays a usable — if coarse — point candidate.
@@ -402,7 +399,14 @@ async function gatherLocationCandidates(
   // Skipped only when it cannot bind: a tighter area already holds a smaller bound, so the district
   // could not narrow anything and the geocode would be spent for nothing. Cached, and district
   // strings repeat across nearly every listing.
-  const tightestArea = Math.min(Infinity, ...areas.map((a) => a.radiusCrowMeters));
+  // Point evidence counts too. A precise platform pin is ~120 m sigma, so its containing bound is
+  // already far tighter than any dzielnica — geocoding the district for such a listing buys
+  // nothing and was firing on every OLX listing that had a pin but no usable street text.
+  const tightestArea = Math.min(
+    Infinity,
+    ...areas.map((a) => a.radiusCrowMeters),
+    ...candidates.map((c) => OUTER_SIGMA_K * c.sigma),
+  );
   if (tightestArea > DISTRICT_AREA_USEFUL_BELOW_M && (listing.district || listing.city)) {
     const geo = await geocodeAddress(
       buildAddressFromListing({ street: null, district: listing.district, city: listing.city }));
@@ -430,6 +434,13 @@ export function fuseLocationCandidates(
   areas: AreaConstraint[] = [],
   extraConstraints: MetroConstraint[] = [],
 ): EnrichedLocation {
+  // Exported for direct unit testing, so it cannot rely on its production caller's guard.
+  if (candidates.length === 0) {
+    return {
+      lat: null, lng: null, precision: 'none', anchorDistanceMeters: 0,
+      uncertaintyMeters: 0, outerRadiusMeters: 0, source: 'нет данных о месте', evidence: null,
+    };
+  }
   const primary = [...candidates].sort((a, b) => b.reliability / b.sigma - a.reliability / a.sigma)[0]!;
   const cluster = candidates.filter((c) =>
     c === primary || haversineMeters(primary.lat, primary.lng, c.lat, c.lng) <= AGREE_K * (primary.sigma + c.sigma));
@@ -533,55 +544,28 @@ export function fuseLocationCandidates(
   else if (sigma <= 800) precision = 'approximate';
   else precision = 'district';
 
-  // CONTAINMENT PASS. The fusion above is STATISTICAL: sigmas are ~1σ estimates, and 2σ covers only
-  // ~86% of a 2D error, so those discs are not hard bounds. Intersecting them as if they were
-  // manufactures precision — two sources 350 m apart would report a thin lens rather than the
-  // honest "they disagree, so widen". That is why point evidence is fused, not intersected.
-  //
-  // Measured extents are different in kind. A geocoder's bounds box and the platform's own district
-  // genuinely CONTAIN the flat, and an ad's "5 min do Zacisza" is a ring it sits on. Those do
-  // intersect, and the solver finds the shapes closed-form rules kept missing: the lens where two
-  // discs overlap without either containing the other, and the two points where two rings cross.
-  //
-  // Refinement only. The result is accepted solely when it is tighter than the statistical estimate
-  // AND consistent with it, so this can never widen an answer or move it somewhere the fused point
-  // cannot reach.
   let bestLat = lat, bestLng = lng, bestRadiusCrow = OUTER_SIGMA_K * sigma, refinedBy: string[] = [];
-  const rings = credibleRings;
-  if (bestRadiusCrow > REFINE_ONLY_ABOVE_M && (areas.length > 0 || rings.length > 1)) {
-    const FUSED = 'оценка по точкам';
-    const regions: Region[] = [
-      { lat, lng, minRadius: 0, maxRadius: bestRadiusCrow, reliability: 1, source: FUSED },
-      ...areas.map((a) => ({
-        lat: a.lat, lng: a.lng, minRadius: 0, maxRadius: a.radiusCrowMeters,
-        reliability: a.reliability ?? GEOCODED_AREA_RELIABILITY, source: a.source,
-      })),
-      ...rings.map((r) => ({
-        lat: r.station.lat, lng: r.station.lng,
-        // Ad-quoted WALKING metres in, crow metres out — the unit rule this module opens with. The
-        // station footprint widens both edges: "300 m from Zacisze" is measured from whichever
-        // entrance the writer had in mind.
-        minRadius: Math.max(0, r.distance - r.margin - STATION_FOOTPRINT_ROUTE_M) / WALK_DETOUR_FACTOR,
-        maxRadius: (r.distance + r.margin + STATION_FOOTPRINT_ROUTE_M) / WALK_DETOUR_FACTOR,
-        reliability: RING_RELIABILITY, source: `~${r.distance} м до ${r.station.name}`,
-      })),
-    ];
-    const solved = solveRegions(regions, { lat, lng });
-    if (solved && solved.satisfied.includes(FUSED) && solved.radiusCrowMeters < bestRadiusCrow) {
-      bestLat = solved.lat;
-      bestLng = solved.lng;
-      bestRadiusCrow = solved.radiusCrowMeters;
-      refinedBy = solved.satisfied.filter((x) => x !== FUSED);
-    }
-  }
 
-  // THE FLOOR, stated once and unconditionally. The flat is inside every area that contains the
-  // point we are reporting, so the answer can never be wider than the smallest of them. The solver
-  // above usually gets there first, but it is an optimization that only runs under conditions;
-  // this is the invariant, and it holds whether or not the solver ran or was accepted.
-  for (const area of areas) {
-    if (haversineMeters(bestLat, bestLng, area.lat, area.lng) <= area.radiusCrowMeters
-      && area.radiusCrowMeters < bestRadiusCrow) {
+  // CONTAINMENT. An area is evidence of the form "the flat is inside this", and there are exactly
+  // two cases:
+  //
+  //   * CONTAINED (d + r <= R) — the area disc lies wholly inside the disc we hold, so the
+  //     intersection IS that area. Its centre and radius are the answer, and adopting both is
+  //     sound: nothing outside it was ever possible.
+  //   * merely OVERLAPPING — the lens reaches the far edge of our own disc (that edge point is
+  //     still inside the area), so NO disc centred where we are can be smaller than R. There is
+  //     nothing to win here without moving the point onto a synthetic centre, and a district
+  //     centroid is not evidence about where the flat is.
+  //
+  // A grid solver used to sit here and reported tighter numbers for the overlapping case — 3380 m
+  // where 4680 m is the true bound. It was not finding a better answer; it was clamping the radius
+  // to the area's own `r` about a point `d` away, the same unsound `r`-instead-of-`d + r` step this
+  // loop had. Tighter-looking and wrong, on the number that gates deletion.
+  for (const area of [...areas].sort((a, b) => a.radiusCrowMeters - b.radiusCrowMeters)) {
+    const d = haversineMeters(bestLat, bestLng, area.lat, area.lng);
+    if (d + area.radiusCrowMeters <= bestRadiusCrow) {
+      bestLat = area.lat;
+      bestLng = area.lng;
       bestRadiusCrow = area.radiusCrowMeters;
       if (!refinedBy.includes(area.source)) refinedBy = [...refinedBy, area.source];
     }
@@ -622,8 +606,12 @@ export async function enrichListingLocation(
       }
       if (detail?.street) {
         const geo = await geocodeAddress(buildAddressFromListing(detail));
-        if (geo) {
-          const quality = classifyGeocodePrecision(geo);
+        const quality0 = geo ? classifyGeocodePrecision(geo) : null;
+        // A weak match must not take this early return: it bypasses the fusion pipeline entirely,
+        // so there is no pin, no district and no contradiction check left to catch a business that
+        // merely shares the street's name. Falling through lets the normal path judge it.
+        if (geo && quality0 && !quality0.weak) {
+          const quality = quality0;
           return {
             lat: geo.lat,
             lng: geo.lng,
@@ -676,14 +664,15 @@ export async function enrichListingLocation(
       uncertaintyMeters: Math.round(constraint.margin / WALK_DETOUR_FACTOR),
       // A station spans ~STATION_FOOTPRINT_M of entrances, so the honest ring is margin + that,
       // in route metres.
-      outerRadiusMeters: capOuter(Math.min(
-        constraint.margin + STATION_FOOTPRINT_ROUTE_M,
-        // Same floor: a ring-only estimate may not spill outside the district the listing is filed
-        // under either. Without this the invariant would hold on the fused path and nowhere else.
-        ...areas.filter((a) => haversineMeters(constraint.station.lat, constraint.station.lng, a.lat, a.lng)
-          <= a.radiusCrowMeters + constraint.distance / WALK_DETOUR_FACTOR)
-          .map((a) => walkMetersFromCrow(a.radiusCrowMeters)),
-      )),
+      //
+      // NO DISTRICT FLOOR HERE, deliberately. On this branch the pair (anchorDistanceMeters,
+      // outerRadiusMeters) is an ANNULUS: `bandFor` reads it as `distance ± outer`, so `outer` is a
+      // band half-width, not a radius from a point. Clamping it with a district's disc radius is a
+      // category error — the two measure different things — and an earlier attempt here did exactly
+      // that, shrinking the half-width to an unrelated quantity and reporting the flat as far
+      // closer to the station than any evidence said. Bounding a ring by an area needs the area to
+      // clip the ring's own edges, which this representation cannot express.
+      outerRadiusMeters: capOuter(constraint.margin + STATION_FOOTPRINT_ROUTE_M),
       source: `ориентир из описания (остановка) ~${constraint.distance} м до ${constraint.station.name}`,
       evidence: constraint.evidence,
     };

@@ -528,32 +528,7 @@ test('an area disjoint from the point is ignored, not absorbed', () => {
 
 
 
-test('an overlapping area now tightens too, without moving the point', () => {
-  // The lens. An area that overlaps the fused disc without containing it used to contribute
-  // NOTHING — the old rule only fired on full containment, so a district left a 4.7 km estimate
-  // untouched. The flat is in the overlap, which is smaller than either, so it must tighten. The
-  // point still may not move: a district centroid is not evidence about where the flat is.
-  const district: AreaConstraint = {
-    lat: 52.29200, lng: 21.04500, radiusCrowMeters: 2600, reliability: 0.95, source: 'граница района',
-  };
-  const pinOnly = fuseLocationCandidates([WILNO_PIN], null);
-  const withDistrict = fuseLocationCandidates([WILNO_PIN], null, [district]);
 
-  assert.ok(withDistrict.outerRadiusMeters < pinOnly.outerRadiusMeters,
-    `overlap must tighten: ${withDistrict.outerRadiusMeters} vs ${pinOnly.outerRadiusMeters}`);
-  assert.equal(withDistrict.lat, pinOnly.lat, 'an overlapping area may not move the point');
-  assert.equal(withDistrict.lng, pinOnly.lng);
-});
-
-test('a tighter area binds to its own radius and keeps the pin as the point', () => {
-  const estate: AreaConstraint = {
-    lat: 52.28300, lng: 21.06100, radiusCrowMeters: 600, reliability: 0.7, source: 'участок',
-  };
-  const fused = fuseLocationCandidates([WILNO_PIN], null, [estate]);
-  assert.equal(fused.outerRadiusMeters, Math.round(routeMetersFromCrow(600)));
-  assert.equal(fused.lat, WILNO_PIN.lat, 'the pin is the position evidence; the box is only a bound');
-  assert.equal(fused.precision, 'approximate');
-});
 
 test('an ad ring is inherently wide, and is never allowed to widen the estimate', () => {
   // A quoted "N m to the metro" carries the ad's own margin PLUS the station footprint on both
@@ -641,4 +616,61 @@ test('an establishment match is not a position candidate', () => {
   });
   assert.equal(street.weak, undefined);
   assert.equal(street.precision, 'street');
+});
+
+test('an overlapping area cannot tighten, and must not pretend to', () => {
+  // The lens between two overlapping discs reaches the FAR EDGE of our own disc — that edge point
+  // is still inside the area — so no disc centred where we are can be smaller than what we hold.
+  // A grid solver here once reported 3380 m for this exact case against a true bound of 4680 m,
+  // by clamping to the area's `r` about a point `d` away. Tighter-looking and wrong, on the number
+  // that gates deletion. Reporting no change is the correct, honest outcome.
+  const district: AreaConstraint = {
+    lat: 52.29200, lng: 21.04500, radiusCrowMeters: 2600, reliability: 0.95, source: 'граница района',
+  };
+  const pinOnly = fuseLocationCandidates([WILNO_PIN], null);
+  const withDistrict = fuseLocationCandidates([WILNO_PIN], null, [district]);
+
+  const d = haversineMeters(WILNO_PIN.lat, WILNO_PIN.lng, district.lat, district.lng);
+  assert.ok(d + district.radiusCrowMeters > 2 * 1800,
+    'precondition: this area overlaps without containing, or the test proves nothing');
+  assert.equal(withDistrict.outerRadiusMeters, pinOnly.outerRadiusMeters);
+  assert.equal(withDistrict.lat, pinOnly.lat, 'and it may not move the point either');
+});
+
+test('a CONTAINED area binds fully — its centre and its radius', () => {
+  // d + r <= R, so the area lies wholly inside what we hold and the intersection IS that area.
+  // Adopting its centre as well as its radius is sound here: nothing outside it was ever possible.
+  // Keeping the old centre would force radius d + r (1229 m), needlessly loose.
+  const estate: AreaConstraint = {
+    lat: 52.28300, lng: 21.06100, radiusCrowMeters: 600, reliability: 0.7, source: 'участок',
+  };
+  const d = haversineMeters(WILNO_PIN.lat, WILNO_PIN.lng, estate.lat, estate.lng);
+  assert.ok(d + estate.radiusCrowMeters <= 2 * 1800, 'precondition: genuinely contained');
+
+  const fused = fuseLocationCandidates([WILNO_PIN], null, [estate]);
+  assert.equal(fused.outerRadiusMeters, Math.round(routeMetersFromCrow(600)));
+  assert.equal(fused.lat, estate.lat);
+  assert.equal(fused.precision, 'approximate');
+});
+
+test('the reported radius always covers the evidence it claims to satisfy', () => {
+  // The invariant the removed solver broke: whatever centre is reported, every area that the
+  // estimate claims to have been narrowed by must lie within the reported radius of that centre.
+  for (const r of [400, 600, 1200, 2600, 4306]) {
+    for (const [dLat, dLng] of [[0, 0], [0.002, 0.003], [0.01, 0.012]] as const) {
+      const area: AreaConstraint = {
+        lat: WILNO_PIN.lat + dLat, lng: WILNO_PIN.lng + dLng,
+        radiusCrowMeters: r, reliability: 0.9, source: 'area',
+      };
+      const fused = fuseLocationCandidates([WILNO_PIN], null, [area]);
+      const gap = haversineMeters(fused.lat!, fused.lng!, area.lat, area.lng);
+      const reportedCrow = crowMetersFromRoute(fused.outerRadiusMeters);
+      // Either the area was adopted (so it IS the region), or it did not narrow anything and the
+      // original bound stands. Never a radius that fails to reach the area it claims.
+      const adopted = Math.abs(reportedCrow - r) < 2 && gap < 2;
+      const unchanged = Math.abs(fused.outerRadiusMeters - Math.round(routeMetersFromCrow(2 * 1800))) < 2;
+      assert.ok(adopted || unchanged,
+        `r=${r} offset=${dLat},${dLng}: got ${fused.outerRadiusMeters} m at gap ${Math.round(gap)} m`);
+    }
+  }
 });

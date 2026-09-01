@@ -108,10 +108,17 @@ export interface ParsedRentalData {
   };
   /**
    * FURTHER distance claims the ad makes ("10 min do Trockiej", "300 m do Bródna") beyond the one
-   * best anchor in `locationHint`. Each is a ring the flat must sit on, and rings INTERSECT — two
-   * independent claims localize a flat far more tightly than the best single one, which is why the
-   * ad's "second-best" clue is worth keeping instead of discarding. Optional, so parses cached
-   * before this field existed still validate.
+   * best anchor in `locationHint`. Each is a ring the flat must sit on, and rings INTERSECT, so a
+   * second claim can localize a flat more tightly than the best single one.
+   *
+   * ONLY WARSAW METRO CLAIMS ARE ACTUALLY FUSED. `gatherLocationCandidates` takes an entry only
+   * when `kind === 'transit_stop'` and the station resolves against the offline Warsaw table —
+   * those cost nothing to verify and cannot invent a place. Every other kind, and every non-Warsaw
+   * listing, is parsed and stored but does NOT move the estimate: consuming them means a geocode
+   * per extra claim per listing, which has not been paid for. Do not assume a stored entry here is
+   * load-bearing.
+   *
+   * Optional, so parses cached before this field existed still validate.
    */
   extraLocationHints?: Array<{
     query: string | null;

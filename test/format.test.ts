@@ -145,3 +145,48 @@ test('a range that still bounds the walk is kept as a range', () => {
   const card = formatRentalCard(mkListing(), mkParsed(), score, 'ABC234');
   assert.match(card, /Bemowo \(M2\) ~0 м–1,5 км · ~0–20 мин/);
 });
+
+test('a small but non-zero optimistic edge is still degenerate — the reader sees "0 м"', () => {
+  // An annulus ("N m from station X") yields edges like 15 m, which metricRangeDistance floors to
+  // "0 м". A strict min === 0 test let those through and reprinted "~0 м–11,4 км".
+  const score = mkScore([], {
+    precision: 'district',
+    metroNearest: [{
+      name: 'Zacisze', lineName: 'M2', walkingMinutes: 8, distance: '598 м', distanceMeters: 598,
+      walkingMinutesRange: { min: 0, max: 146 }, distanceMetersRange: { min: 15, max: 11498 },
+      approximate: true,
+    }],
+  });
+  const card = formatRentalCard(mkListing(), mkParsed(), score, 'NCVVYE');
+  assert.match(card, /Zacisze \(M2\) ~550 м ⚠️ место неточно/);
+  assert.doesNotMatch(card, /0 м–/);
+});
+
+test('the degenerate threshold is a boundary, not a cliff either side of it', () => {
+  const at = (max: number) => formatRentalCard(mkListing(), mkParsed(), mkScore([], {
+    precision: 'approximate',
+    metroNearest: [{
+      name: 'Bemowo', lineName: 'M2', walkingMinutes: 5, distance: '400 м', distanceMeters: 400,
+      walkingMinutesRange: { min: 0, max: 40 }, distanceMetersRange: { min: 0, max },
+      approximate: true,
+    }],
+  }), 'ABC234');
+  // Exactly at the threshold the range is still a range; one metre past it, it is not.
+  assert.match(at(3000), /Bemowo \(M2\) ~0 м–3,0 км/);
+  assert.match(at(3001), /Bemowo \(M2\) ~400 м ⚠️ место неточно/);
+});
+
+test('a degenerate range with no measured distance falls back to the raw string', () => {
+  // Defensive: offlineMetroPlace always sets distanceMeters today, so this pins intended behaviour
+  // rather than a live path — the card must not print "undefined".
+  const card = formatRentalCard(mkListing(), mkParsed(), mkScore([], {
+    precision: 'district',
+    metroNearest: [{
+      name: 'Zacisze', lineName: 'M2', walkingMinutes: 8, distance: 'около 600 м',
+      walkingMinutesRange: { min: 0, max: 146 }, distanceMetersRange: { min: 0, max: 11498 },
+      approximate: true,
+    }],
+  }), 'NCVVYE');
+  assert.match(card, /Zacisze \(M2\) около 600 м ⚠️ место неточно/);
+  assert.doesNotMatch(card, /undefined/);
+});

@@ -32,9 +32,15 @@ function trunc(text: string, max: number): string {
   return text.slice(0, max - 1).trimEnd() + '\u2026';
 }
 
-/** Above this, a range whose optimistic edge is 0 spans more than any walk the card is about, so
- *  it describes the uncertainty region rather than the distance. See renderMetroPlace. */
+/** Above this, a range whose optimistic edge reads as zero spans more than any walk the card is
+ *  about, so it describes the uncertainty region rather than the distance. See renderMetroPlace. */
 const DEGENERATE_RANGE_MAX_M = 3000;
+
+/** What the reader SEES as the optimistic edge. `metricRangeDistance` floors to 50 m, so anything
+ *  under this renders as "0 м" — an exact `min === 0` test would let a 15 m edge through and print
+ *  "~0 м–11,4 км" all over again. An annulus produces exactly those small non-zero edges, so this
+ *  is the real case, not a hypothetical one. */
+const DEGENERATE_RANGE_MIN_M = 50;
 
 function metricRangeDistance(meters: number, bound: 'lower' | 'upper'): string {
   const round = bound === 'lower' ? Math.floor : Math.ceil;
@@ -113,7 +119,7 @@ function renderMetroPlace(p: NearbyPlace): string {
   // measurement — it is the size of the uncertainty region. "~0 м–11,4 км · ~0–146 мин" told the
   // reader nothing except that the position is unknown, while looking like a real figure. Show the
   // measured distance from the anchor (still the best estimate) and mark it approximate instead.
-  if (p.distanceMetersRange && p.distanceMetersRange.min === 0
+  if (p.distanceMetersRange && p.distanceMetersRange.min < DEGENERATE_RANGE_MIN_M
       && p.distanceMetersRange.max > DEGENERATE_RANGE_MAX_M) {
     const measured = p.distanceMeters != null
       ? `~${metricRangeDistance(p.distanceMeters, 'lower')}`

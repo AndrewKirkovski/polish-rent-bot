@@ -20,6 +20,9 @@ const nstrarr = z.preprocess(
   (v) => (Array.isArray(v) ? v.filter((x) => typeof x === 'string') : typeof v === 'string' ? [v] : []),
   z.array(z.string()).catch([]),
 );
+/** Extra distance claims kept per listing. Enough for a chatty ad, few enough that one parse
+ *  cannot fan out into a dozen lookups. Enforced by slicing, never by failing the array. */
+const MAX_EXTRA_LOCATION_HINTS = 4;
 const DEFAULT_LOCATION_HINT = { query: null, kind: 'none' as const, anchorDistanceMeters: null, uncertaintyMeters: null, evidence: null };
 const DEFAULT_MEDIA = { water: null, electricity: null, gas: null, internet: null, heating: null, other: null };
 
@@ -50,15 +53,26 @@ export const ParsedRentalDataSchema = z.looseObject({
     evidence: z.string().nullable().default(null).catch(null),
   }).default(DEFAULT_LOCATION_HINT).catch(() => ({ ...DEFAULT_LOCATION_HINT })),
   // Further distance claims beyond the best anchor. Rings intersect, so the ad's second and third
-  // clues are worth keeping. Capped so a chatty ad cannot turn one parse into a dozen geocodes,
-  // and .catch([]) because losing the extras must never fail the whole listing parse.
-  extraLocationHints: z.array(z.object({
-    query: z.string().nullable().default(null).catch(null),
-    kind: z.enum(['address', 'intersection', 'building', 'estate', 'transit_stop', 'landmark', 'neighborhood', 'none']).default('none').catch('landmark'),
-    anchorDistanceMeters: z.number().min(0).max(50_000).nullable().default(null).catch(null),
-    uncertaintyMeters: z.number().min(0).max(20_000).nullable().default(null).catch(null),
-    evidence: z.string().nullable().default(null).catch(null),
-  })).max(4).default([]).catch([]),
+  // clues are worth keeping.
+  //
+  // Capped by PREPROCESS, not by `.max()`. Zod's `.max()` is a check, not a truncation: a fifth
+  // entry fails the array, and an outer `.catch([])` then swallows all four good ones — the exact
+  // all-or-nothing trap `nstrarr` above exists to avoid, and indistinguishable in the output from
+  // "this ad made no further claims". "Never more than 4" is a soft instruction to a model, so an
+  // over-count is a normal event, not a bug to fail on. Slicing keeps the first four; non-objects
+  // are dropped per element rather than costing the whole array.
+  extraLocationHints: z.preprocess(
+    (v) => (Array.isArray(v)
+      ? v.filter((x) => x != null && typeof x === 'object' && !Array.isArray(x)).slice(0, MAX_EXTRA_LOCATION_HINTS)
+      : []),
+    z.array(z.object({
+      query: z.string().nullable().default(null).catch(null),
+      kind: z.enum(['address', 'intersection', 'building', 'estate', 'transit_stop', 'landmark', 'neighborhood', 'none']).default('none').catch('landmark'),
+      anchorDistanceMeters: z.number().min(0).max(50_000).nullable().default(null).catch(null),
+      uncertaintyMeters: z.number().min(0).max(20_000).nullable().default(null).catch(null),
+      evidence: z.string().nullable().default(null).catch(null),
+    })).default([]).catch([]),
+  ),
   isConcreteApartment: z.boolean().nullable().default(true).catch(true),
   estimatedMedia: z.object({
     water: nnum,
