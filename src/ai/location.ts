@@ -318,7 +318,18 @@ export function fuseLocationCandidates(candidates: LocCandidate[], constraint: M
       const dm = haversineMeters(lat, lng, c.lat, c.lng);
       sse += (c.reliability / (c.sigma * c.sigma)) * dm * dm;
     }
-    sigma = Math.max(sigma, Math.sqrt(sse / sw));
+    const spread = Math.sqrt(sse / sw);
+    // A spread the BEST source's own containing bound cannot explain does not mean the flat is
+    // smeared across the gap — it means one of these fixes is wrong (a mis-geocoded addressHint
+    // sitting kilometres from a real platform pin). Covering both leaves us vaguer than simply
+    // trusting the best source, and that inflated radius is not harmless: once it exceeds the
+    // distance to a place, `optimisticMeters` returns 0 for every candidate, every range reads
+    // "0 – something", and the distance gates lose the lower bound they judge on.
+    if (spread > OUTER_SIGMA_K * primary.sigma) {
+      const alone = fuseLocationCandidates([primary], constraint);
+      return { ...alone, source: `${alone.source}; расхождение ${Math.round(spread)} м отброшено` };
+    }
+    sigma = Math.max(sigma, spread);
   }
   let note = '';
 

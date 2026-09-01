@@ -428,3 +428,48 @@ test('the center gate needs a time: a routing failure is never a rejection', () 
   });
   assert.equal(checkCenterGate(score, 25, 'district').pass, true);
 });
+
+// ---------------------------------------------------------------------------
+// The estimate must not degrade — a vague listing is KEPT, not deleted
+// ---------------------------------------------------------------------------
+
+test('a loosely localized listing still slips through the metro gate', () => {
+  // Deliberate: uncertainty may not delete a flat. A wide region collapses every optimistic edge
+  // to 0, and that keeps the listing with a warning rather than rejecting it — losing a real
+  // apartment to a bad geocode is the worse failure. The fix for a useless region belongs
+  // upstream, in the estimate (see the fusion test below), not in this gate.
+  const place = { name: 'Zacisze', walkingMinutes: 8, distance: '598 m', distanceMeters: 598 };
+  const amenity: AmenityResult = {
+    type: 'metro', places: [place], nearest: place, withinLimit: false,
+  };
+  const [widened] = applyLocationUncertainty([amenity], [{ type: 'metro', maxMinutes: 7 }], 4680, 0);
+
+  assert.equal(widened.uncertain, true);
+  assert.equal(
+    checkAmenityGate(mkScore([widened], { precision: 'district' }), [{ type: 'metro', maxMinutes: 7 }], 'district', true).pass,
+    true,
+    'a vaguely located flat must be kept with a warning, never deleted',
+  );
+});
+
+test('a candidate its own bound cannot explain is dropped, not absorbed as radius', () => {
+  // A district pin plus a mis-geocoded addressHint ~8.4 km away. Fusing them reported the flat as
+  // "somewhere in ~10 km", which is VAGUER than simply trusting the pin — and that inflated radius
+  // is what collapsed every optimistic edge. Prefer the best source and say the other was dropped.
+  const pin: LocCandidate = {
+    lat: 52.28055, lng: 21.05787, sigma: 1800, reliability: 0.4,
+    precisionFloor: 'district', source: 'метка района с площадки', evidence: null,
+  };
+  const misGeocoded: LocCandidate = {
+    lat: 52.28055, lng: 20.93447, sigma: 3800, reliability: 0.7,
+    precisionFloor: 'approximate', source: 'адрес из описания', evidence: 'Osiedle Wilno',
+  };
+  const fused = fuseLocationCandidates([pin, misGeocoded], null);
+
+  const pinAlone = fuseLocationCandidates([pin], null);
+  assert.equal(fused.outerRadiusMeters, pinAlone.outerRadiusMeters,
+    'the estimate must be no vaguer than trusting the pin on its own');
+  assert.ok(fused.outerRadiusMeters < 6000, `expected the pin's own bound, got ${fused.outerRadiusMeters} m`);
+  assert.match(fused.source, /отброшено/, 'the discard has to be visible in the source trail');
+  assert.equal(fused.lat, pin.lat);
+});

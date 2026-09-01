@@ -32,6 +32,10 @@ function trunc(text: string, max: number): string {
   return text.slice(0, max - 1).trimEnd() + '\u2026';
 }
 
+/** Above this, a range whose optimistic edge is 0 spans more than any walk the card is about, so
+ *  it describes the uncertainty region rather than the distance. See renderMetroPlace. */
+const DEGENERATE_RANGE_MAX_M = 3000;
+
 function metricRangeDistance(meters: number, bound: 'lower' | 'upper'): string {
   const round = bound === 'lower' ? Math.floor : Math.ceil;
   if (meters < 1000) return `${round(meters / 50) * 50} м`;
@@ -105,6 +109,17 @@ const CE = {
 /** Render one nearby metro station: "Politechnika (M1) ~450 м · 6 мин" (ranges when approximate). */
 function renderMetroPlace(p: NearbyPlace): string {
   const station = `${esc(p.name)}${p.lineName ? ` (${esc(p.lineName)})` : ''}`;
+  // A range pinned to 0 at the optimistic end and kilometres away at the other is not a
+  // measurement — it is the size of the uncertainty region. "~0 м–11,4 км · ~0–146 мин" told the
+  // reader nothing except that the position is unknown, while looking like a real figure. Show the
+  // measured distance from the anchor (still the best estimate) and mark it approximate instead.
+  if (p.distanceMetersRange && p.distanceMetersRange.min === 0
+      && p.distanceMetersRange.max > DEGENERATE_RANGE_MAX_M) {
+    const measured = p.distanceMeters != null
+      ? `~${metricRangeDistance(p.distanceMeters, 'lower')}`
+      : esc(p.distance);
+    return `${station} ${measured} ⚠️ место неточно`;
+  }
   const distance = p.distanceMetersRange
     ? `~${metricRangeDistance(p.distanceMetersRange.min, 'lower')}–${metricRangeDistance(p.distanceMetersRange.max, 'upper')}`
     : esc(p.distance);

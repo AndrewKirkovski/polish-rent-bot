@@ -51,6 +51,9 @@ function nearestMinutes(result: AmenityResult): number | null {
   return null;
 }
 
+/** Mirrors the card's threshold: past this a 0-floored range is the uncertainty region, not a walk. */
+const DEGENERATE_RANGE_MAX_M = 3000;
+
 function metricDistance(meters: number, bound: 'lower' | 'upper'): string {
   const round = bound === 'lower' ? Math.floor : Math.ceil;
   if (meters < 1000) return `${round(meters / 50) * 50} м`;
@@ -61,10 +64,18 @@ function metroRejectionReason(result: AmenityResult, pref: AmenityPreference): s
   const nearest = result.nearest ?? result.places[0];
   if (!nearest) return null;
   const station = nearest.name;
-  const distance = nearest.distanceMetersRange
+  // A 0-floored, kilometres-wide range describes the uncertainty region, not the walk — and it is
+  // exactly the case the gate now judges on the measured distance, so report that number instead
+  // of "~0–146 мин", which reads as though the limit was applied to a range containing it.
+  const degenerate = nearest.distanceMetersRange != null
+    && nearest.distanceMetersRange.min === 0
+    && nearest.distanceMetersRange.max > DEGENERATE_RANGE_MAX_M;
+  const distance = nearest.distanceMetersRange && !degenerate
     ? `~${metricDistance(nearest.distanceMetersRange.min, 'lower')}–${metricDistance(nearest.distanceMetersRange.max, 'upper')}`
-    : nearest.distance;
-  const minutes = nearest.walkingMinutesRange
+    : degenerate && nearest.distanceMeters != null
+      ? `~${metricDistance(nearest.distanceMeters, 'lower')} (место неточно)`
+      : nearest.distance;
+  const minutes = nearest.walkingMinutesRange && !degenerate
     ? `~${nearest.walkingMinutesRange.min}–${nearest.walkingMinutesRange.max}`
     : String(nearest.walkingMinutes);
   const line = pref.line ? ` ${pref.line}` : '';

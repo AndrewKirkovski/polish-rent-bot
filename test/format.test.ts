@@ -114,3 +114,34 @@ test('over-budget card is trimmed under the caption budget, essentials kept', ()
   assert.match(card, /Kaucja/);                           // contract/deposit kept
   assert.equal(card.split('\n').at(-1), 'http://example.com/x'); // link stays last
 });
+
+test('a 0-floored, kilometres-wide range renders the measured distance, not "0 м–11,4 км"', () => {
+  // The Osiedle Wilno card. The station really is ~600 m away; the range only described the size
+  // of the uncertainty region, so "~0 м–11,4 км · ~0–146 мин" read as a measurement and was not one.
+  const score = mkScore([], {
+    precision: 'district',
+    metroNearest: [{
+      name: 'Zacisze', lineName: 'M2', walkingMinutes: 8, distance: '598 м', distanceMeters: 598,
+      walkingMinutesRange: { min: 0, max: 146 }, distanceMetersRange: { min: 0, max: 11498 },
+      approximate: true,
+    }],
+  });
+  const card = formatRentalCard(mkListing(), mkParsed(), score, 'NCVVYE');
+  assert.match(card, /Zacisze \(M2\) ~550 м ⚠️ место неточно/);
+  assert.doesNotMatch(card, /0 м–/);
+  assert.doesNotMatch(card, /0–146/);
+});
+
+test('a range that still bounds the walk is kept as a range', () => {
+  // Guard against over-reach: only the degenerate 0-floored kilometres-wide case is replaced.
+  const score = mkScore([], {
+    precision: 'approximate',
+    metroNearest: [{
+      name: 'Bemowo', lineName: 'M2', walkingMinutes: 0, distance: '',
+      walkingMinutesRange: { min: 0, max: 20 }, distanceMetersRange: { min: 0, max: 1500 },
+      approximate: true,
+    }],
+  });
+  const card = formatRentalCard(mkListing(), mkParsed(), score, 'ABC234');
+  assert.match(card, /Bemowo \(M2\) ~0 м–1,5 км · ~0–20 мин/);
+});
