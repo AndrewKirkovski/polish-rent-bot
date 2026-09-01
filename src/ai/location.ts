@@ -173,6 +173,23 @@ export interface MetroConstraint {
   evidence: string | null;
 }
 
+/**
+ * A region the flat is CONTAINED IN — a geocoder's measured bounds box for a named area ("Osiedle
+ * Wilno", "Targówek"). Unlike a candidate it is not a guess at the position, so it never moves the
+ * point and never widens the estimate; it can only CLIP it. Evidence that says "inside this box"
+ * intersects with everything else, and intersection is monotone: more of it is always tighter.
+ *
+ * This is the difference between averaging evidence and intersecting it. Fed through
+ * `candidateSigma` a 600 m estate box becomes a 600 m σ, which OUTER_SIGMA_K then doubles to a
+ * 1200 m radius — the box made the answer VAGUER than the box itself.
+ */
+export interface AreaConstraint {
+  lat: number; lng: number;
+  /** Measured containing radius, CROW metres — already a bound, so never OUTER_SIGMA_K-inflated. */
+  radiusCrowMeters: number;
+  source: string;
+}
+
 const clampMeters = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
 
 /** Collect every candidate point (platform pin, geocoded street, geocoded description anchor) plus
@@ -180,8 +197,9 @@ const clampMeters = (v: number, lo: number, hi: number) => Math.max(lo, Math.min
 async function gatherLocationCandidates(
   listing: Listing,
   parsed?: Pick<ParsedRentalData, 'addressHint' | 'locationHint'> | null,
-): Promise<{ candidates: LocCandidate[]; constraint: MetroConstraint | null; unverifiedEvidence: string | null }> {
+): Promise<{ candidates: LocCandidate[]; constraint: MetroConstraint | null; areas: AreaConstraint[]; unverifiedEvidence: string | null }> {
   const candidates: LocCandidate[] = [];
+  const areas: AreaConstraint[] = [];
   let constraint: MetroConstraint | null = null;
   let unverifiedEvidence: string | null = null;
 
@@ -226,6 +244,15 @@ async function gatherLocationCandidates(
         source: listing.street ? 'улица из объявления' : 'адрес из описания',
         evidence: listing.street ?? parsed?.addressHint ?? null,
       });
+      // The same match ALSO bounds the flat: the geocoder measured the area it matched, and the
+      // flat is inside it. Kept as a containment constraint so it can tighten the fused point
+      // instead of only inflating this candidate's σ.
+      if (geo.areaRadiusMeters != null && geo.areaRadiusMeters > 0) {
+        areas.push({
+          lat: geo.lat, lng: geo.lng, radiusCrowMeters: geo.areaRadiusMeters,
+          source: listing.street ? 'граница улицы' : 'граница участка из описания',
+        });
+      }
     } else {
       unverifiedEvidence ??= parsed?.addressHint ?? null;
     }
@@ -286,12 +313,16 @@ async function gatherLocationCandidates(
   // otherwise it would double-count the evidence that produced it (see `derivedPin` above).
   if (derivedPin && candidates.length === 0) candidates.push(derivedPin);
 
-  return { candidates, constraint, unverifiedEvidence };
+  return { candidates, constraint, areas, unverifiedEvidence };
 }
 
 /** Fuse agreeing candidates (inverse-variance weighted) and apply the metro annulus constraint.
  *  Exported (pure) so the clustering/combine/constraint math can be unit-tested directly. */
-export function fuseLocationCandidates(candidates: LocCandidate[], constraint: MetroConstraint | null): EnrichedLocation {
+export function fuseLocationCandidates(
+  candidates: LocCandidate[],
+  constraint: MetroConstraint | null,
+  areas: AreaConstraint[] = [],
+): EnrichedLocation {
   const primary = [...candidates].sort((a, b) => b.reliability / b.sigma - a.reliability / a.sigma)[0]!;
   const cluster = candidates.filter((c) =>
     c === primary || haversineMeters(primary.lat, primary.lng, c.lat, c.lng) <= AGREE_K * (primary.sigma + c.sigma));
@@ -326,7 +357,7 @@ export function fuseLocationCandidates(candidates: LocCandidate[], constraint: M
     // distance to a place, `optimisticMeters` returns 0 for every candidate, every range reads
     // "0 – something", and the distance gates lose the lower bound they judge on.
     if (spread > OUTER_SIGMA_K * primary.sigma) {
-      const alone = fuseLocationCandidates([primary], constraint);
+      const alone = fuseLocationCandidates([primary], constraint, areas);
       return { ...alone, source: `${alone.source}; расхождение ${Math.round(spread)} м отброшено` };
     }
     sigma = Math.max(sigma, spread);
@@ -367,13 +398,32 @@ export function fuseLocationCandidates(candidates: LocCandidate[], constraint: M
   else if (sigma <= 800) precision = 'approximate';
   else precision = 'district';
 
+  // INTERSECT. Every area says "the flat is inside this box", so the answer is the intersection of
+  // the fused disc with each of them — an operation that can only ever tighten. If P is within
+  // `outerCrow` of the fused point and within `radius` of an area centre `d` away, it is also
+  // within `d + radius` of the fused point, so that is the clipped bound.
+  let outerCrow = OUTER_SIGMA_K * sigma;
+  const clipped: string[] = [];
+  for (const area of areas) {
+    const d = haversineMeters(lat, lng, area.lat, area.lng);
+    // Disjoint: the area cannot be describing the same flat as the point. Widening to cover both
+    // is what produced the 10 km regions, so an inconsistent area is IGNORED, never absorbed.
+    if (d > outerCrow + area.radiusCrowMeters) continue;
+    const bound = d + area.radiusCrowMeters;
+    if (bound < outerCrow) {
+      outerCrow = bound;
+      clipped.push(area.source);
+    }
+  }
+
   const evidence = cluster.map((c) => c.evidence).find((e) => e != null) ?? constraint?.evidence ?? null;
   return {
     lat, lng, precision,
     anchorDistanceMeters: 0,
     uncertaintyMeters: Math.round(sigma),
-    outerRadiusMeters: capOuter(walkMetersFromCrow(OUTER_SIGMA_K * sigma)),
-    source: [...new Set(cluster.map((c) => c.source))].join(' + ') + note,
+    outerRadiusMeters: capOuter(walkMetersFromCrow(outerCrow)),
+    source: [...new Set(cluster.map((c) => c.source))].join(' + ') + note
+      + (clipped.length > 0 ? `; сужено по ${[...new Set(clipped)].join(', ')}` : ''),
     evidence,
   };
 }
@@ -419,10 +469,10 @@ export async function enrichListingLocation(
   // tightest honest point. A named metro station acts as a radial CONSTRAINT that confirms/tightens
   // the point rather than replacing it — so a precise OLX pin + street + "70 m from Metro X" collapse
   // to the building, not the station centroid.
-  const { candidates, constraint, unverifiedEvidence: unverifiedDescriptionEvidence } =
+  const { candidates, constraint, areas, unverifiedEvidence: unverifiedDescriptionEvidence } =
     await gatherLocationCandidates(listing, parsed);
   if (candidates.length > 0) {
-    return fuseLocationCandidates(candidates, constraint);
+    return fuseLocationCandidates(candidates, constraint, areas);
   }
 
   // 4. No point candidate, but a "N m from Metro X" claim still localizes the flat to a ring near the

@@ -26,7 +26,7 @@ import { crowMetersFromRoute } from '../src/geo/uncertainty.js';
 import { applyLocationUncertainty, findNearbyAmenities, matchesAmenityRequest, modelledOptimisticCenter, pointToward } from '../src/ai/maps.js';
 import { checkAmenityGate, checkCenterGate, isCoarsePrecision } from '../src/search/amenity-gate.js';
 import { fuseLocationCandidates } from '../src/ai/location.js';
-import type { LocCandidate } from '../src/ai/location.js';
+import type { AreaConstraint, LocCandidate } from '../src/ai/location.js';
 import type { AmenityResult } from '../src/types.js';
 import { mkScore } from './helpers.js';
 
@@ -472,4 +472,49 @@ test('a candidate its own bound cannot explain is dropped, not absorbed as radiu
   assert.ok(fused.outerRadiusMeters < 6000, `expected the pin's own bound, got ${fused.outerRadiusMeters} m`);
   assert.match(fused.source, /отброшено/, 'the discard has to be visible in the source trail');
   assert.equal(fused.lat, pin.lat);
+});
+
+// ---------------------------------------------------------------------------
+// Intersecting evidence: a measured area CLIPS the estimate, never widens it
+// ---------------------------------------------------------------------------
+
+const WILNO_PIN: LocCandidate = {
+  lat: 52.28055, lng: 21.05787, sigma: 1800, reliability: 0.4,
+  precisionFloor: 'district', source: 'метка района с площадки', evidence: null,
+};
+
+test('a named area the flat sits in tightens the estimate', () => {
+  // "Osiedle Wilno" geocodes to a ~600 m estate box around the pin. The flat is INSIDE it, so the
+  // answer is the intersection — 600 m crow, not the pin's own 2σ 3600 m. Averaging the two (what
+  // candidateSigma did with an extent) could only ever make the answer wider than the box itself.
+  const estate: AreaConstraint = {
+    lat: 52.28055, lng: 21.05787, radiusCrowMeters: 600, source: 'граница участка из описания',
+  };
+  const pinOnly = fuseLocationCandidates([WILNO_PIN], null);
+  const clipped = fuseLocationCandidates([WILNO_PIN], null, [estate]);
+
+  assert.ok(clipped.outerRadiusMeters < pinOnly.outerRadiusMeters,
+    `expected a tighter bound than ${pinOnly.outerRadiusMeters} m, got ${clipped.outerRadiusMeters} m`);
+  assert.equal(clipped.outerRadiusMeters, Math.round(routeMetersFromCrow(600)));
+  assert.match(clipped.source, /сужено по/);
+});
+
+test('more evidence is never worse: intersecting areas is monotone', () => {
+  const wide: AreaConstraint = { lat: 52.28055, lng: 21.05787, radiusCrowMeters: 2500, source: 'район' };
+  const tight: AreaConstraint = { lat: 52.28055, lng: 21.05787, radiusCrowMeters: 600, source: 'участок' };
+  const one = fuseLocationCandidates([WILNO_PIN], null, [tight]);
+  const both = fuseLocationCandidates([WILNO_PIN], null, [tight, wide]);
+  assert.equal(both.outerRadiusMeters, one.outerRadiusMeters, 'adding a wider area must not loosen the bound');
+});
+
+test('an area disjoint from the point is ignored, not absorbed', () => {
+  // The Osiedle Wilno failure in area form: a box 8 km away cannot describe the same flat. Covering
+  // both is what produced a 10 km region, so a disjoint constraint contributes nothing.
+  const elsewhere: AreaConstraint = {
+    lat: 52.28055, lng: 20.93447, radiusCrowMeters: 600, source: 'ошибочный геокод',
+  };
+  const pinOnly = fuseLocationCandidates([WILNO_PIN], null);
+  const withBadArea = fuseLocationCandidates([WILNO_PIN], null, [elsewhere]);
+  assert.equal(withBadArea.outerRadiusMeters, pinOnly.outerRadiusMeters);
+  assert.doesNotMatch(withBadArea.source, /сужено по/);
 });
