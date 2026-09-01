@@ -88,7 +88,13 @@ export function classifyGeocodePrecision(
   if (!geo.partialMatch && (intersection || (addressType && addressGeometry))) {
     return { precision: 'street', uncertaintyMeters: geo.locationType === 'ROOFTOP' ? 50 : 125 };
   }
-  if (geo.partialMatch) return { precision: 'approximate', uncertaintyMeters: 1500 };
+  // PARTIAL means the geocoder did not find what was asked for and answered with something else.
+  // That is not a coarse answer, it is a different place: "przystanek Warszawa Zacisze-Wilno" comes
+  // back partial and lands 1.5 km from the flat. Weak, so it cannot outrank the platform's own pin —
+  // at sigma 1500 and reliability 0.5 it otherwise still outweighs a fuzzy pin (0.4/1800) and drags
+  // the point across the district. Checked BEFORE the establishment case below, which is why that
+  // one alone did not catch this.
+  if (geo.partialMatch) return { precision: 'approximate', uncertaintyMeters: 1500, weak: true };
   if (types.has('route')) return { precision: 'approximate', uncertaintyMeters: 600 };
   if (types.has('neighborhood') || types.has('sublocality')) {
     return { precision: 'approximate', uncertaintyMeters: 1500 };
@@ -215,6 +221,41 @@ export interface AreaConstraint {
 
 const clampMeters = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
 
+
+type AnyHint = ParsedRentalData['locationHint'];
+
+/**
+ * Choose which of the ad's anchors leads, by DISTANCE rather than by the order the model emitted.
+ *
+ * A claim of "at/under the building" (anchorDistanceMeters 0) pins the flat outright; "N minutes to
+ * a station across town" only draws a ring around that station. The parse prompt already ranks them
+ * that way and the model does not reliably comply: on the ad that prompted this work it led with
+ * "5 minut do stacji metra Dworzec Wileński" — a TRAIN time to a station 3.3 km away, which then
+ * contradicted the map pin — and demoted "Osiedle ma własny przystanek kolejowy Warszawa
+ * Zacisze-Wilno", distance 0 and the single most informative line in the ad.
+ *
+ * Promoting is what makes that line usable at all. The primary anchor is geocoded when it is not a
+ * known metro station; an extra is only ever matched offline against the metro table, so a RAIL
+ * stop like Zacisze-Wilno is silently dropped while it stays an extra.
+ *
+ * Whatever is displaced is returned in `demoted` and still becomes a ring, so reordering never
+ * loses evidence — it only changes which claim gets the geocode.
+ */
+export function pickPrimaryAnchor(
+  primary: AnyHint | undefined,
+  extras: AnyHint[] | undefined,
+  city: string,
+  district?: string | null,
+): { hint: AnyHint | undefined; demoted: AnyHint[] } {
+  const atBuilding = (h: AnyHint) => (h.anchorDistanceMeters ?? 0) === 0;
+  // Only displace a primary that is genuinely worse: one quoting a real distance to somewhere else.
+  if (!primary || atBuilding(primary)) return { hint: primary, demoted: [] };
+
+  const promoted = (extras ?? []).find((h) =>
+    h != null && atBuilding(h) && isUsableDescriptionLocationHint(h, city, district));
+  return promoted ? { hint: promoted, demoted: [primary] } : { hint: primary, demoted: [] };
+}
+
 /** Collect every candidate point (platform pin, geocoded street, geocoded description anchor) plus
  *  an optional metro annulus. A transit_stop naming a known station is a CONSTRAINT, not a point. */
 async function gatherLocationCandidates(
@@ -303,7 +344,19 @@ async function gatherLocationCandidates(
 
   // AI description anchor. A transit_stop naming a known station → radial constraint (below);
   // any other geocodable anchor → a point candidate.
-  const hint = parsed?.locationHint;
+  //
+  // PICK THE ANCHOR BY DISTANCE, not by the order the model happened to emit. A claim of "at/under
+  // the building" (anchorDistanceMeters 0) pins the flat outright; a claim of "N minutes to a
+  // station across town" only draws a ring. The prompt already ranks them that way, and the model
+  // does not always comply — on the ad that prompted this work it made "5 minut do stacji metra
+  // Dworzec Wileński" primary (a TRAIN time, 3.3 km away, which then contradicted the pin) and
+  // demoted "Osiedle ma własny przystanek kolejowy Warszawa Zacisze-Wilno" — distance 0, the single
+  // most informative line in the ad — into the extras, where it was dropped for not being a metro.
+  //
+  // Promoting costs nothing extra: the primary path already geocodes a non-metro anchor, whereas
+  // extras are only ever matched offline against the metro table.
+  const { hint, demoted } = pickPrimaryAnchor(
+    parsed?.locationHint, parsed?.extraLocationHints, listing.city, listing.district);
   if (hint && isUsableDescriptionLocationHint(hint, listing.city, listing.district)) {
     // findMetroStation's table is WARSAW-ONLY and matches on a bare name, so several ordinary Polish
     // words (Centrum, Politechnika, Bemowo…) collide with real Warsaw stations. Only treat a
@@ -366,7 +419,8 @@ async function gatherLocationCandidates(
   // rather than turned into more geocodes per listing.
   const cityLcExtra = (listing.city ?? '').toLowerCase();
   const inWarsawExtra = cityLcExtra.includes('warszaw') || cityLcExtra.includes('warsaw');
-  for (const extra of parsed?.extraLocationHints ?? []) {
+  for (const extra of [...demoted, ...(parsed?.extraLocationHints ?? [])]) {
+    if (extra === hint) continue;   // promoted to primary; not independent corroboration
     if (!inWarsawExtra || extra.kind !== 'transit_stop' || !extra.query) continue;
     if (!isUsableDescriptionLocationHint(extra, listing.city, listing.district)) continue;
     const station = findMetroStation(extra.query.split(',')[0]?.trim() ?? extra.query);

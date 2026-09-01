@@ -259,11 +259,13 @@ test('geocoder only treats address-grade matches as street precision', () => {
     partialMatch: false,
     resultTypes: ['route'],
   }), { precision: 'approximate', uncertaintyMeters: 600 });
+  // A partial match is the geocoder saying it did not find the query — flagged weak so it cannot
+  // outrank a platform pin.
   assert.deepEqual(classifyGeocodePrecision({
     locationType: 'APPROXIMATE',
     partialMatch: true,
     resultTypes: ['locality'],
-  }), { precision: 'approximate', uncertaintyMeters: 1500 });
+  }), { precision: 'approximate', uncertaintyMeters: 1500, weak: true });
   assert.deepEqual(classifyGeocodePrecision({
     locationType: 'ROOFTOP',
     partialMatch: false,

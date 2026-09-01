@@ -25,7 +25,7 @@ import { WALK_METERS_PER_MINUTE, findMetroStation, haversineMeters } from '../sr
 import { crowMetersFromRoute } from '../src/geo/uncertainty.js';
 import { applyLocationUncertainty, findNearbyAmenities, matchesAmenityRequest, modelledOptimisticCenter, pointToward } from '../src/ai/maps.js';
 import { checkAmenityGate, checkCenterGate, isCoarsePrecision } from '../src/search/amenity-gate.js';
-import { classifyGeocodePrecision, fuseLocationCandidates } from '../src/ai/location.js';
+import { classifyGeocodePrecision, fuseLocationCandidates, pickPrimaryAnchor } from '../src/ai/location.js';
 import type { AreaConstraint, LocCandidate, MetroConstraint } from '../src/ai/location.js';
 import type { AmenityResult } from '../src/types.js';
 import { mkScore } from './helpers.js';
@@ -673,4 +673,52 @@ test('the reported radius always covers the evidence it claims to satisfy', () =
         `r=${r} offset=${dLat},${dLng}: got ${fused.outerRadiusMeters} m at gap ${Math.round(gap)} m`);
     }
   }
+});
+
+// ---------------------------------------------------------------------------
+// Which of the ad's anchors leads
+// ---------------------------------------------------------------------------
+
+const anchor = (query: string, anchorDistanceMeters: number, kind = 'transit_stop') =>
+  ({ query, kind, anchorDistanceMeters, uncertaintyMeters: 200, evidence: 'e' }) as never;
+
+test('an "at the building" anchor outranks a distance to somewhere else', () => {
+  // The real ad: the model led with "5 minut do stacji metra Dworzec Wileński" — a TRAIN time to a
+  // station 3.3 km away, which then contradicted the map pin — and demoted "Osiedle ma własny
+  // przystanek kolejowy Warszawa Zacisze-Wilno", distance 0 and the most informative line in it.
+  // Promotion is what makes that line usable: the primary anchor gets geocoded, an extra is only
+  // matched offline against the metro table, so a RAIL stop is dropped while it stays an extra.
+  const { hint, demoted } = pickPrimaryAnchor(
+    anchor('metro Dworzec Wileński, Warszawa', 400),
+    [anchor('przystanek Warszawa Zacisze-Wilno, Warszawa', 0)],
+    'Warszawa', 'Targówek',
+  );
+  assert.equal(hint?.query, 'przystanek Warszawa Zacisze-Wilno, Warszawa');
+  assert.equal(demoted.length, 1, 'the displaced claim is kept, not discarded');
+  assert.equal(demoted[0]?.query, 'metro Dworzec Wileński, Warszawa');
+});
+
+test('a primary that is already at the building is left alone', () => {
+  const primary = anchor('Osiedle Wilno, Warszawa', 0, 'estate');
+  const { hint, demoted } = pickPrimaryAnchor(
+    primary, [anchor('metro Trocka, Warszawa', 0)], 'Warszawa', 'Targówek');
+  assert.equal(hint, primary, 'no reordering when the model already led with a 0-distance anchor');
+  assert.deepEqual(demoted, []);
+});
+
+test('nothing is promoted when every extra quotes a real distance', () => {
+  const primary = anchor('metro Dworzec Wileński, Warszawa', 400);
+  const { hint, demoted } = pickPrimaryAnchor(
+    primary, [anchor('metro Trocka, Warszawa', 800)], 'Warszawa', 'Targówek');
+  assert.equal(hint, primary);
+  assert.deepEqual(demoted, []);
+});
+
+test('an unusable extra is never promoted', () => {
+  // isUsableDescriptionLocationHint rejects an anchor that merely echoes the district — promoting
+  // one would replace a real claim with the area we already knew.
+  const primary = anchor('metro Dworzec Wileński, Warszawa', 400);
+  const { hint } = pickPrimaryAnchor(
+    primary, [anchor('Targówek, Warszawa', 0, 'neighborhood')], 'Warszawa', 'Targówek');
+  assert.equal(hint, primary);
 });
