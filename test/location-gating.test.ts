@@ -572,7 +572,7 @@ test('a contradicted claim does not drag the point onto its station either', () 
   // at 695 m "precision", for a flat in Targówek. Only corroborated rings may reach that pass.
   const dw = findMetroStation('Dworzec Wileński')!;
   const district: AreaConstraint = {
-    lat: 52.28238, lng: 21.06537, radiusCrowMeters: 4306, reliability: 0.95, source: 'граница района',
+    lat: 52.28238, lng: 21.06537, radiusCrowMeters: 4306, source: 'граница района',
   };
   const fused = fuseLocationCandidates(
     [WILNO_PIN],
@@ -587,8 +587,7 @@ test('the estimate is never vaguer than a containing area, whatever else happens
   // The floor. A listing filed under a district is in that district, so no estimate for it may be
   // wider — the shipped card was 2.5x wider than the district's own extent.
   const tightDistrict: AreaConstraint = {
-    lat: WILNO_PIN.lat, lng: WILNO_PIN.lng, radiusCrowMeters: 1500,
-    reliability: 0.95, source: 'граница района',
+    lat: WILNO_PIN.lat, lng: WILNO_PIN.lng, radiusCrowMeters: 1500, source: 'граница района',
   };
   const dw = findMetroStation('Dworzec Wileński')!;
   const fused = fuseLocationCandidates(
@@ -625,7 +624,7 @@ test('an overlapping area cannot tighten, and must not pretend to', () => {
   // by clamping to the area's `r` about a point `d` away. Tighter-looking and wrong, on the number
   // that gates deletion. Reporting no change is the correct, honest outcome.
   const district: AreaConstraint = {
-    lat: 52.29200, lng: 21.04500, radiusCrowMeters: 2600, reliability: 0.95, source: 'граница района',
+    lat: 52.29200, lng: 21.04500, radiusCrowMeters: 2600, source: 'граница района',
   };
   const pinOnly = fuseLocationCandidates([WILNO_PIN], null);
   const withDistrict = fuseLocationCandidates([WILNO_PIN], null, [district]);
@@ -642,7 +641,7 @@ test('a CONTAINED area binds fully — its centre and its radius', () => {
   // Adopting its centre as well as its radius is sound here: nothing outside it was ever possible.
   // Keeping the old centre would force radius d + r (1229 m), needlessly loose.
   const estate: AreaConstraint = {
-    lat: 52.28300, lng: 21.06100, radiusCrowMeters: 600, reliability: 0.7, source: 'участок',
+    lat: 52.28300, lng: 21.06100, radiusCrowMeters: 600, source: 'участок',
   };
   const d = haversineMeters(WILNO_PIN.lat, WILNO_PIN.lng, estate.lat, estate.lng);
   assert.ok(d + estate.radiusCrowMeters <= 2 * 1800, 'precondition: genuinely contained');
@@ -660,7 +659,7 @@ test('the reported radius always covers the evidence it claims to satisfy', () =
     for (const [dLat, dLng] of [[0, 0], [0.002, 0.003], [0.01, 0.012]] as const) {
       const area: AreaConstraint = {
         lat: WILNO_PIN.lat + dLat, lng: WILNO_PIN.lng + dLng,
-        radiusCrowMeters: r, reliability: 0.9, source: 'area',
+        radiusCrowMeters: r, source: 'area',
       };
       const fused = fuseLocationCandidates([WILNO_PIN], null, [area]);
       const gap = haversineMeters(fused.lat!, fused.lng!, area.lat, area.lng);
@@ -721,4 +720,31 @@ test('an unusable extra is never promoted', () => {
   const { hint } = pickPrimaryAnchor(
     primary, [anchor('Targówek, Warszawa', 0, 'neighborhood')], 'Warszawa', 'Targówek');
   assert.equal(hint, primary);
+});
+
+test('adoption cannot chain across several qualifying areas', () => {
+  // Areas are sorted ascending by radius, so after one adoption every later area has
+  // r_later >= r_adopted and d >= 0, making `d + r_later <= r_adopted` impossible. At most one
+  // adoption can ever fire. This pins that: the answer must be exactly ONE area's own disc (or the
+  // untouched baseline), never a blend of two, which is how the deleted solver went wrong.
+  const near: AreaConstraint = {
+    lat: WILNO_PIN.lat + 0.001, lng: WILNO_PIN.lng, radiusCrowMeters: 500, source: 'ближняя',
+  };
+  const far: AreaConstraint = {
+    lat: WILNO_PIN.lat, lng: WILNO_PIN.lng + 0.001, radiusCrowMeters: 800, source: 'дальняя',
+  };
+  const fused = fuseLocationCandidates([WILNO_PIN], null, [near, far]);
+
+  const baseline = fuseLocationCandidates([WILNO_PIN], null).outerRadiusMeters;
+  const candidates = [near, far].map((a) => Math.round(routeMetersFromCrow(a.radiusCrowMeters)));
+  assert.ok(candidates.includes(fused.outerRadiusMeters) || fused.outerRadiusMeters === baseline,
+    `must be one area's own disc or the baseline, got ${fused.outerRadiusMeters}`);
+
+  // Whichever disc is reported, it must actually cover the area it names as having narrowed it.
+  const named = [near, far].find((a) => fused.source.includes(a.source));
+  if (named) {
+    const gap = haversineMeters(fused.lat!, fused.lng!, named.lat, named.lng);
+    assert.ok(gap < 2 && Math.abs(crowMetersFromRoute(fused.outerRadiusMeters) - named.radiusCrowMeters) < 2,
+      'the named area must be adopted wholesale, not blended');
+  }
 });

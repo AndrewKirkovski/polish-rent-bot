@@ -31,13 +31,6 @@ const ASSUMED_AREA_RADIUS_M = 2500;
  *  so the geocode is skipped rather than paid for. */
 const DISTRICT_AREA_USEFUL_BELOW_M = 1500;
 
-/** The platform's structured district/city. Near-certain containment — a listing filed under
- *  Targówek is in Targówek — which is what lets it overrule a confidently mis-geocoded hint. */
-const PLATFORM_AREA_RELIABILITY = 0.95;
-
-/** A geocoded bounds box from the ad's own text: only as trustworthy as the geocode behind it. */
-const GEOCODED_AREA_RELIABILITY = 0.7;
-
 export interface EnrichedLocation {
   lat: number | null;
   lng: number | null;
@@ -206,6 +199,11 @@ export interface MetroConstraint {
  * point and never widens the estimate; it can only CLIP it. Evidence that says "inside this box"
  * intersects with everything else, and intersection is monotone: more of it is always tighter.
  *
+ * There is deliberately NO reliability weight here. Containment is a hard geometric fact, not a
+ * score to be traded off: either the flat is inside the box or the box is wrong. A weight field
+ * existed while a solver combined areas by weighted corroboration; that solver is gone, and leaving
+ * the field would invite the next reader to assume containment is negotiable.
+ *
  * This is the difference between averaging evidence and intersecting it. Fed through
  * `candidateSigma` a 600 m estate box becomes a 600 m σ, which OUTER_SIGMA_K then doubles to a
  * 1200 m radius — the box made the answer VAGUER than the box itself.
@@ -214,8 +212,6 @@ export interface AreaConstraint {
   lat: number; lng: number;
   /** Measured containing radius, CROW metres — already a bound, so never OUTER_SIGMA_K-inflated. */
   radiusCrowMeters: number;
-  /** Defaults to a geocoded box's trust; the platform's own district is far more certain. */
-  reliability?: number;
   source: string;
 }
 
@@ -333,7 +329,6 @@ async function gatherLocationCandidates(
       if (!q.weak && geo.areaRadiusMeters != null && geo.areaRadiusMeters > 0) {
         areas.push({
           lat: geo.lat, lng: geo.lng, radiusCrowMeters: geo.areaRadiusMeters,
-          reliability: GEOCODED_AREA_RELIABILITY,
           source: listing.street ? 'граница улицы' : 'граница участка из описания',
         });
       }
@@ -471,7 +466,6 @@ async function gatherLocationCandidates(
         // same assumed extent the last-resort district branch uses.
         radiusCrowMeters: geo.areaRadiusMeters && geo.areaRadiusMeters > 0
           ? geo.areaRadiusMeters : ASSUMED_AREA_RADIUS_M,
-        reliability: PLATFORM_AREA_RELIABILITY,
         source: listing.district ? 'граница района' : 'граница города',
       });
     }
