@@ -234,8 +234,11 @@ type AnyHint = ParsedRentalData['locationHint'];
  * known metro station; an extra is only ever matched offline against the metro table, so a RAIL
  * stop like Zacisze-Wilno is silently dropped while it stays an extra.
  *
- * Whatever is displaced is returned in `demoted` and still becomes a ring, so reordering never
- * loses evidence — it only changes which claim gets the geocode.
+ * Whatever is displaced is returned in `demoted` and still becomes a ring — which is why only a
+ * `transit_stop` primary may be displaced at all. The extras loop keeps station claims and drops
+ * every other kind, so demoting a landmark or address anchor would delete it outright rather than
+ * relocate it. Restricted this way, reordering genuinely loses no evidence; it only changes which
+ * claim gets the geocode.
  */
 export function pickPrimaryAnchor(
   primary: AnyHint | undefined,
@@ -246,6 +249,13 @@ export function pickPrimaryAnchor(
   const atBuilding = (h: AnyHint) => (h.anchorDistanceMeters ?? 0) === 0;
   // Only displace a primary that is genuinely worse: one quoting a real distance to somewhere else.
   if (!primary || atBuilding(primary)) return { hint: primary, demoted: [] };
+
+  // Only displace a primary that SURVIVES being displaced. `demoted` is consumed by the extras
+  // loop, which turns transit_stop claims into offline metro rings and drops every other kind — so
+  // promoting over a landmark or address anchor would delete it outright: no candidate, no ring,
+  // not even unverified evidence. The claim that reordering never loses evidence has to be true,
+  // not aspirational, so a non-station primary simply keeps the lead.
+  if (primary.kind !== 'transit_stop') return { hint: primary, demoted: [] };
 
   const promoted = (extras ?? []).find((h) =>
     h != null && atBuilding(h) && isUsableDescriptionLocationHint(h, city, district));
@@ -451,6 +461,11 @@ async function gatherLocationCandidates(
   // Point evidence counts too. A precise platform pin is ~120 m sigma, so its containing bound is
   // already far tighter than any dzielnica — geocoding the district for such a listing buys
   // nothing and was firing on every OLX listing that had a pin but no usable street text.
+  //
+  // This is a per-candidate PROXY, not the true post-fusion radius: two candidates that disagree
+  // enough to spread-inflate can end up wider than either alone, and this guard would still skip
+  // the district. That errs toward a wider estimate and a saved API call, never toward a radius
+  // that is too small, so it is left as the cheap check rather than duplicating the fusion maths.
   const tightestArea = Math.min(
     Infinity,
     ...areas.map((a) => a.radiusCrowMeters),
@@ -645,10 +660,18 @@ export async function enrichListingLocation(
   listing: Listing,
   parsed?: Pick<ParsedRentalData, 'addressHint' | 'locationHint'> | null,
 ): Promise<EnrichedLocation> {
+  // A street the Otodom detail page carried but the search item did not. Hoisted so a WEAK geocode
+  // of it can still reach the fusion path below: `gatherLocationCandidates` reads `listing.street`,
+  // never the detail payload, so without this the address is dropped entirely — no candidate, no
+  // area, not even unverified evidence — which is the opposite of "fall through and let the normal
+  // path judge it".
+  let detailStreet: string | null = null;
+
   // 1. Otodom search results omit coordinates — the detail page has exact ones.
   if (listing.platform === 'otodom' && (listing.lat == null || listing.lng == null)) {
     try {
       const detail = await fetchOtodomDetail(listing.url);
+      detailStreet = detail?.street ?? null;
       if (detail?.lat != null && detail?.lng != null) {
         return { lat: detail.lat, lng: detail.lng, precision: 'exact', anchorDistanceMeters: 0, uncertaintyMeters: 0, outerRadiusMeters: 0, source: 'координаты Otodom', evidence: null };
       }
@@ -687,7 +710,8 @@ export async function enrichListingLocation(
   // the point rather than replacing it — so a precise OLX pin + street + "70 m from Metro X" collapse
   // to the building, not the station centroid.
   const { candidates, constraint, extraConstraints, areas, unverifiedEvidence: unverifiedDescriptionEvidence } =
-    await gatherLocationCandidates(listing, parsed);
+    await gatherLocationCandidates(
+      detailStreet && !listing.street ? { ...listing, street: detailStreet } : listing, parsed);
   if (candidates.length > 0) {
     return fuseLocationCandidates(candidates, constraint, areas, extraConstraints);
   }

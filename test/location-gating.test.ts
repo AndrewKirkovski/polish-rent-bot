@@ -748,3 +748,26 @@ test('adoption cannot chain across several qualifying areas', () => {
       'the named area must be adopted wholesale, not blended');
   }
 });
+
+test('a non-station primary is never displaced, because demotion would delete it', () => {
+  // `demoted` is consumed by the extras loop, which keeps transit_stop claims and drops every other
+  // kind. Promoting over a landmark would therefore not relocate it but delete it: no candidate, no
+  // ring, not even unverified evidence. So the invariant "reordering loses no evidence" is enforced
+  // by refusing to reorder in the one case where it would not hold.
+  const landmark = anchor('Galeria Północna, Warszawa', 300, 'landmark');
+  const { hint, demoted } = pickPrimaryAnchor(
+    landmark, [anchor('metro Trocka, Warszawa', 0)], 'Warszawa', 'Targówek');
+  assert.equal(hint, landmark, 'a landmark anchor keeps the lead');
+  assert.deepEqual(demoted, []);
+});
+
+test('a displaced station primary really does survive as a ring', () => {
+  // The complement: a transit_stop primary IS displaceable, precisely because the extras loop will
+  // still turn it into a metro ring rather than dropping it.
+  const station = anchor('metro Dworzec Wileński, Warszawa', 400);
+  const { hint, demoted } = pickPrimaryAnchor(
+    station, [anchor('metro Trocka, Warszawa', 0)], 'Warszawa', 'Targówek');
+  assert.equal(hint?.query, 'metro Trocka, Warszawa');
+  assert.deepEqual(demoted, [station]);
+  assert.equal(demoted[0]?.kind, 'transit_stop', 'and the kind the extras loop actually keeps');
+});
