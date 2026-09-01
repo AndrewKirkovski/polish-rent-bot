@@ -25,7 +25,7 @@ import { WALK_METERS_PER_MINUTE, findMetroStation, haversineMeters } from '../sr
 import { crowMetersFromRoute } from '../src/geo/uncertainty.js';
 import { applyLocationUncertainty, findNearbyAmenities, matchesAmenityRequest, modelledOptimisticCenter, pointToward } from '../src/ai/maps.js';
 import { checkAmenityGate, checkCenterGate, isCoarsePrecision } from '../src/search/amenity-gate.js';
-import { fuseLocationCandidates, intersectRings } from '../src/ai/location.js';
+import { fuseLocationCandidates } from '../src/ai/location.js';
 import type { AreaConstraint, LocCandidate, MetroConstraint } from '../src/ai/location.js';
 import type { AmenityResult } from '../src/types.js';
 import { mkScore } from './helpers.js';
@@ -519,100 +519,56 @@ test('an area disjoint from the point is ignored, not absorbed', () => {
   assert.doesNotMatch(withBadArea.source, /сужено по/);
 });
 
-test('the tightest consistent region wins outright — point and radius', () => {
-  // The intersection lies inside EVERY constraint disc, so the smallest of them is both valid and
-  // the tightest summary. Reporting the district pin with a `d + r` radius would be correct but
-  // loose: when a 600 m estate box binds, the answer IS that box, centre included.
-  const estate: AreaConstraint = {
-    lat: 52.28300, lng: 21.06100, radiusCrowMeters: 600, source: 'граница участка из описания',
-  };
-  const fused = fuseLocationCandidates([WILNO_PIN], null, [estate]);
 
-  assert.equal(fused.lat, estate.lat, 'the point moves to the binding region');
-  assert.equal(fused.lng, estate.lng);
-  assert.equal(fused.outerRadiusMeters, Math.round(routeMetersFromCrow(600)));
-  // A `d + r` bound around the pin would have been looser than the box itself.
-  const d = haversineMeters(WILNO_PIN.lat, WILNO_PIN.lng, estate.lat, estate.lng);
-  assert.ok(fused.outerRadiusMeters < Math.round(routeMetersFromCrow(d + 600)));
-  // A tighter region is a tighter sigma, so precision must follow it rather than stay 'district'.
-  assert.equal(fused.precision, 'approximate');
-});
-
-test('a merely overlapping area never moves the point', () => {
-  // Regression: taking the smallest disc outright moved the point to the DISTRICT centroid, which
-  // changed which metro stations came out nearest — more evidence producing a worse answer. A
-  // district box overlaps the pin's disc without containing it, and its centre is not evidence
-  // about the flat, so it may not displace a real pin.
-  const district: AreaConstraint = {
-    lat: 52.29200, lng: 21.04500, radiusCrowMeters: 2600, source: 'граница района',
-  };
-  const pinOnly = fuseLocationCandidates([WILNO_PIN], null);
-  const withDistrict = fuseLocationCandidates([WILNO_PIN], null, [district]);
-
-  assert.equal(withDistrict.lat, pinOnly.lat, 'the pin stays the point');
-  assert.equal(withDistrict.lng, pinOnly.lng);
-  assert.equal(withDistrict.outerRadiusMeters, pinOnly.outerRadiusMeters);
-
-  // …but a district that DOES contain the pin's disc is a real refinement and binds.
-  const tightDistrict: AreaConstraint = {
-    lat: WILNO_PIN.lat, lng: WILNO_PIN.lng, radiusCrowMeters: 1200, source: 'граница района',
-  };
-  const refined = fuseLocationCandidates([WILNO_PIN], null, [tightDistrict]);
-  assert.equal(refined.outerRadiusMeters, Math.round(routeMetersFromCrow(1200)));
-});
 
 // ---------------------------------------------------------------------------
 // Rings intersect: a second quoted station is evidence, not a spare anchor
 // ---------------------------------------------------------------------------
 
-test('two quoted stations cross at the flat, and the crossing tightens the estimate', () => {
-  // "5 min do metra Zacisze, 10 min do Trockiej". Each claim alone leaves a whole circle; together
-  // they cross at a point. Clamping sigma per ring cannot find this — two rings with equal margins
-  // clamp to the same value, so the second claim would otherwise contribute nothing at all.
-  const zacisze = findMetroStation('Zacisze')!;
-  const trocka = findMetroStation('Trocka')!;
-  const ringZ: MetroConstraint = { station: zacisze, distance: 598, margin: 250, evidence: null };
-  const ringT: MetroConstraint = { station: trocka, distance: 826, margin: 250, evidence: null };
 
-  const cross = intersectRings(ringZ, ringT, { lat: WILNO_PIN.lat, lng: WILNO_PIN.lng });
-  assert.ok(cross, 'the rings must meet');
-  assert.ok(haversineMeters(cross!.lat, cross!.lng, WILNO_PIN.lat, WILNO_PIN.lng) < 120,
-    'the crossing should land on the flat the distances were measured from');
 
-  const oneRing = fuseLocationCandidates([WILNO_PIN], ringZ);
-  const twoRings = fuseLocationCandidates([WILNO_PIN], ringZ, [], [ringT]);
-  assert.ok(twoRings.outerRadiusMeters < oneRing.outerRadiusMeters,
-    `two rings must beat one: ${twoRings.outerRadiusMeters} vs ${oneRing.outerRadiusMeters}`);
-  assert.match(twoRings.source, /Zacisze ∩ Trocka/);
-});
 
-test('rings that cannot both be true do not cross', () => {
-  const zacisze = findMetroStation('Zacisze')!;
-  const trocka = findMetroStation('Trocka')!;
-  // Separated circles: 100 m from one and 100 m from the other, ~1.1 km apart. No flat satisfies
-  // both, so there is no crossing to invent.
-  assert.equal(intersectRings(
-    { station: zacisze, distance: 100, margin: 250, evidence: null },
-    { station: trocka, distance: 100, margin: 250, evidence: null },
-    { lat: WILNO_PIN.lat, lng: WILNO_PIN.lng },
-  ), null);
-  // The same station twice is not two pieces of evidence.
-  assert.equal(intersectRings(
-    { station: zacisze, distance: 598, margin: 250, evidence: null },
-    { station: zacisze, distance: 598, margin: 250, evidence: null },
-    { lat: WILNO_PIN.lat, lng: WILNO_PIN.lng },
-  ), null);
-});
-
-test('a crossing the point cannot reach is ignored, never teleports the flat', () => {
-  const zacisze = findMetroStation('Zacisze')!;
-  const kabaty = findMetroStation('Kabaty')!;
-  // A parse that attached a Kabaty distance to a Targówek flat: any crossing is ~10 km from the
-  // pin, far outside its region, so containment must reject it and leave the estimate alone.
-  const bogus: MetroConstraint = { station: kabaty, distance: 400, margin: 250, evidence: null };
+test('an overlapping area now tightens too, without moving the point', () => {
+  // The lens. An area that overlaps the fused disc without containing it used to contribute
+  // NOTHING — the old rule only fired on full containment, so a district left a 4.7 km estimate
+  // untouched. The flat is in the overlap, which is smaller than either, so it must tighten. The
+  // point still may not move: a district centroid is not evidence about where the flat is.
+  const district: AreaConstraint = {
+    lat: 52.29200, lng: 21.04500, radiusCrowMeters: 2600, reliability: 0.95, source: 'граница района',
+  };
   const pinOnly = fuseLocationCandidates([WILNO_PIN], null);
-  const withBogus = fuseLocationCandidates([WILNO_PIN], null, [], [bogus]);
-  assert.equal(withBogus.lat, pinOnly.lat);
-  assert.equal(withBogus.outerRadiusMeters, pinOnly.outerRadiusMeters);
-  void zacisze;
+  const withDistrict = fuseLocationCandidates([WILNO_PIN], null, [district]);
+
+  assert.ok(withDistrict.outerRadiusMeters < pinOnly.outerRadiusMeters,
+    `overlap must tighten: ${withDistrict.outerRadiusMeters} vs ${pinOnly.outerRadiusMeters}`);
+  assert.equal(withDistrict.lat, pinOnly.lat, 'an overlapping area may not move the point');
+  assert.equal(withDistrict.lng, pinOnly.lng);
+});
+
+test('a tighter area binds to its own radius and keeps the pin as the point', () => {
+  const estate: AreaConstraint = {
+    lat: 52.28300, lng: 21.06100, radiusCrowMeters: 600, reliability: 0.7, source: 'участок',
+  };
+  const fused = fuseLocationCandidates([WILNO_PIN], null, [estate]);
+  assert.equal(fused.outerRadiusMeters, Math.round(routeMetersFromCrow(600)));
+  assert.equal(fused.lat, WILNO_PIN.lat, 'the pin is the position evidence; the box is only a bound');
+  assert.equal(fused.precision, 'approximate');
+});
+
+test('an ad ring is inherently wide, and is never allowed to widen the estimate', () => {
+  // A quoted "N m to the metro" carries the ad's own margin PLUS the station footprint on both
+  // edges, so even a tight claim is a band a few hundred metres wide. It may corroborate, and it
+  // may be ignored, but it must never make the answer worse than the point evidence alone.
+  const zacisze = findMetroStation('Zacisze')!;
+  const trocka = findMetroStation('Trocka')!;
+  const pinOnly = fuseLocationCandidates([WILNO_PIN], null);
+  const withRings = fuseLocationCandidates(
+    [WILNO_PIN],
+    { station: zacisze, distance: 598, margin: 100, evidence: null },
+    [],
+    [{ station: trocka, distance: 826, margin: 100, evidence: null }],
+  );
+  assert.ok(withRings.outerRadiusMeters <= pinOnly.outerRadiusMeters);
+  assert.match(withRings.source, /Zacisze/);
+  assert.match(withRings.source, /Trocka/);
 });
