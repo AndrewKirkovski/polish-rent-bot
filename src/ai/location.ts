@@ -48,6 +48,10 @@ export interface EnrichedLocation {
   outerRadiusMeters: number;
   source: string;
   evidence: string | null;
+  /** The ad named an anchor the evidence contradicts. Set so consumers can act on it: `source` is
+   *  prose nothing parses, and `precision` does not track it — a precise pin plus a false "5 min to
+   *  metro X" stays street-precision and would otherwise look fully trustworthy. */
+  contradicted?: boolean;
 }
 
 const capOuter = (meters: number): number => Math.max(0, Math.min(MAX_OUTER_RADIUS_M, Math.round(meters)));
@@ -273,6 +277,12 @@ export function pickPrimaryAnchor(
   // not even unverified evidence. The claim that reordering never loses evidence has to be true,
   // not aspirational, so a non-station primary simply keeps the lead.
   if (primary.kind !== 'transit_stop') return { hint: primary, demoted: [] };
+  // ...and only where a demoted station actually survives. The extras loop is Warsaw-only (it
+  // resolves against the Warsaw metro table), so demoting outside Warsaw drops the primary
+  // entirely — no candidate, no ring, not even unverified evidence — while leaving it in place
+  // would at least have geocoded it. The guarantee has to hold everywhere, not just in Warsaw.
+  const cityLc = (city ?? '').toLowerCase();
+  if (!cityLc.includes('warszaw') && !cityLc.includes('warsaw')) return { hint: primary, demoted: [] };
 
   const promoted = (extras ?? []).find((h) =>
     h != null && atBuilding(h) && isUsableDescriptionLocationHint(h, city, district));
@@ -570,12 +580,10 @@ export function fuseLocationCandidates(
   // The PRIMARY ring keeps its original disagree-and-widen behaviour; a contradicting EXTRA is
   // dropped instead. An extra is bonus evidence, and one bad parse among several must not be able
   // to degrade an estimate the other evidence already established.
-  // Rings the fused point actually sits on. A contradicted ring is a FALSE CLAIM, and the
-  // containment pass below must never see it: that pass maximises satisfied evidence, so offering
-  // it a ring the point cannot reach makes moving the point 3 km the highest-scoring answer. It did
-  // exactly that — reporting Dworzec Wileński as the nearest station, at 695 m "precision", for a
-  // flat in Targówek. Layer 1 decides what is credible; layer 2 only intersects what survived.
-  const credibleRings: MetroConstraint[] = [];
+  // A contradicted ring is a FALSE CLAIM and contributes nothing but a note. There is no longer a
+  // second pass to keep credible rings for: the region solver that consumed them was removed, and
+  // the list it fed went with it rather than lingering as state nothing reads.
+  let contradicted = false;
   for (const [index, ring] of [constraint, ...extraConstraints].filter((c): c is MetroConstraint => c != null).entries()) {
     const isPrimary = index === 0 && constraint != null;
     const crowToStation = haversineMeters(lat, lng, ring.station.lat, ring.station.lng);
@@ -596,7 +604,6 @@ export function fuseLocationCandidates(
     const agreementBandCrow = agreementBandRoute / WALK_DETOUR_FACTOR;
     if (discrepancy <= agreementBandRoute) {
       sigma = clampMeters(Math.max(discrepancyCrow, Math.min(sigma, agreementBandCrow)), Math.min(120, sigma), sigma);
-      credibleRings.push(ring);
       note += `; ~${Math.round(d)} м до ${ring.station.name}`;
     } else if (isPrimary) {
       // CONTRADICTED, so distrust it — do not widen to cover it. The old behaviour set sigma to the
@@ -611,6 +618,13 @@ export function fuseLocationCandidates(
       // `uncertain` path keeps the listing with a warning instead of deleting it.
       //
       // The contract this has to honour is "not falsely TIGHTENED" — and nothing here tightens.
+      //
+      // Flagged, not just noted. `source` is a human string nothing downstream parses, and the
+      // gates judge on `outerRadiusMeters` alone — so for a PRECISE pin the estimate would stay at
+      // street precision, carry no warning, and let a hard gate reject on a radius the reasoning
+      // above admits may not contain the flat. The card's warning also keys off precision, which
+      // does not track this. The flag is what actually reaches either of them.
+      contradicted = true;
       note += `; расхождение с ${ring.station.name}`;
     } else {
       note += `; ${ring.station.name} не подтвердилась`;
@@ -664,6 +678,7 @@ export function fuseLocationCandidates(
   const evidence = cluster.map((c) => c.evidence).find((e) => e != null) ?? constraint?.evidence ?? null;
   return {
     lat: bestLat, lng: bestLng, precision,
+    ...(contradicted ? { contradicted: true } : {}),
     anchorDistanceMeters: 0,
     uncertaintyMeters: Math.round(finalSigma),
     outerRadiusMeters: capOuter(walkMetersFromCrow(bestRadiusCrow)),

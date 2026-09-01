@@ -771,3 +771,38 @@ test('a displaced station primary really does survive as a ring', () => {
   assert.deepEqual(demoted, [station]);
   assert.equal(demoted[0]?.kind, 'transit_stop', 'and the kind the extras loop actually keeps');
 });
+
+test('a contradicted anchor is flagged even when the point stays precise', () => {
+  // The dangerous shape: a PRECISE seller pin plus a false "5 min to metro X". Nothing widens, so
+  // the estimate stays street-precision — and the card's warning keys off precision, while the
+  // gates read only outerRadiusMeters. Without an explicit flag the contradiction reaches neither,
+  // and a confidently tight radius gets hard-gated as if nothing were in dispute.
+  const precise: LocCandidate = {
+    lat: 52.28055, lng: 21.05787, sigma: 120, reliability: 0.85,
+    precisionFloor: 'street', source: 'точная метка с площадки', evidence: null,
+  };
+  const far = findMetroStation('Kabaty')!;
+  const fused = fuseLocationCandidates([precise], { station: far, distance: 300, margin: 200, evidence: null });
+
+  assert.equal(fused.precision, 'street', 'a precise pin is not widened by a false claim');
+  assert.equal(fused.contradicted, true, 'but the dispute must be visible to consumers');
+  assert.match(fused.source, /расхожден/);
+});
+
+test('an uncontradicted estimate carries no flag', () => {
+  const precise: LocCandidate = {
+    lat: 52.28055, lng: 21.05787, sigma: 120, reliability: 0.85,
+    precisionFloor: 'street', source: 'точная метка с площадки', evidence: null,
+  };
+  assert.equal(fuseLocationCandidates([precise], null).contradicted, undefined);
+});
+
+test('a non-Warsaw primary is never demoted, because the extras loop would drop it', () => {
+  // The extras loop resolves against the WARSAW metro table, so a demoted station outside Warsaw
+  // is discarded entirely. Leaving it as primary at least gets it geocoded.
+  const primary = anchor('przystanek Wrocław Stadion, Wrocław', 800);
+  const { hint, demoted } = pickPrimaryAnchor(
+    primary, [anchor('ul. Przykladowa 5, Wroclaw', 0, 'address')], 'Wrocław', null);
+  assert.equal(hint, primary);
+  assert.deepEqual(demoted, []);
+});

@@ -51,6 +51,8 @@ export interface LocationEstimateContext {
   outerRadiusMeters: number;
   source: string;
   evidence?: string | null;
+  /** The ad named an anchor the evidence contradicts — see EnrichedLocation.contradicted. */
+  contradicted?: boolean;
 }
 
 /** The band of possible apartment-to-anchor route distances implied by an estimate. */
@@ -1413,9 +1415,13 @@ export async function scoreLocation(
   // otherwise the card advertises a precision the reject reasons don't use.
   const shownRadius = estimate?.outerRadiusMeters ?? 0;
   const uncertaintyText = formatRuRadius(shownRadius);
+  // A contradicted anchor warrants a warning at ANY precision: the whole point of the flag is that
+  // a precise pin with a false ad claim looks trustworthy and is not.
   const locationWarning = approximate
     ? `примерная локация: ${estimate!.source}, погрешность ±${uncertaintyText}`
-    : undefined;
+    : estimate?.contradicted
+      ? `объявление указывает ориентир, который не подтверждается: ${estimate.source}`
+      : undefined;
 
   return {
     amenities,
